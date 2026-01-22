@@ -1,0 +1,100 @@
+======================================================================
+Beam Search Reduction with Classifier v3
+======================================================================
+Config:
+  integral: 2,0,2,0,1,1,0
+  checkpoint: /home/shih/work/IBPreduction/checkpoints/classifier_v3_filtered/best_model.pt
+  beam_width: 10
+  max_steps: 100
+  prime: 1009
+  device: cuda
+
+IBP environment using PRIME = 1009
+Using PRIME = 1009
+Loading IBP environment...
+Loaded 8 IBP templates, 1 LI templates
+
+Loading model from /home/shih/work/IBPreduction/checkpoints/classifier_v3_filtered/best_model.pt...
+Loaded model from epoch 28 (val acc: 0.9577)
+
+Starting integral: I[2, 0, 2, 0, 1, 1, 0]
+Initial weight: (6, 0, (2, 0, 2, 0, 1, 1, 0))
+
+Running beam search (beam_width=10, max_steps=100)...
+======================================================================
+/home/shih/.local/lib/python3.12/site-packages/torch/nn/modules/transformer.py:508: UserWarning: The PyTorch API of nested tensors is in prototype stage and will change in the near future. We recommend specifying layout=torch.jagged when constructing a nested tensor, as this layout receives active development, has better operator coverage, and works with torch.compile. (Triggered internally at /pytorch/aten/src/ATen/NestedTensorImpl.cpp:178.)
+  output = torch._nested_tensor_from_mask(
+Step 0: beam has 10 states, best has 6 non-masters, max_weight=(6, 1)
+Step 10: beam has 10 states, best has 4 non-masters, max_weight=(6, 0)
+Step 14: NEW BEST WEIGHT (5, 0) (started at (6, 0))
+Step 20: beam has 10 states, best has 3 non-masters, max_weight=(5, 1)
+Step 30: beam has 10 states, best has 2 non-masters, max_weight=(5, 1)
+Step 40: beam has 10 states, best has 3 non-masters, max_weight=(6, 0)
+Step 48: NEW BEST WEIGHT (4, 2) (started at (6, 0))
+Step 49: NEW BEST WEIGHT (4, 1) (started at (6, 0))
+Step 50: beam has 10 states, best has 1 non-masters, max_weight=(4, 1)
+Step 55: NEW BEST WEIGHT (0, 0) (started at (6, 0))
+Found solution in 55 steps!
+======================================================================
+
+Results:
+Best weight achieved: (0, 0)
+
+SUCCESS! Found complete reduction in 55 steps
+
+Reduction path:
+  1. Eliminate I[2, 0, 2, 0, 1, 1, 0] using IBP_6, delta=[0, 0, -1, 0, 0, 0, 0]
+  2. Eliminate I[3, 0, 1, -1, 1, 1, 0] using IBP_6, delta=[-2, 0, 1, 1, 0, 0, 0]
+  3. Eliminate I[2, 0, 2, -1, 1, 1, 0] using IBP_2, delta=[0, 0, -1, 1, 0, 0, 0]
+  4. Eliminate I[2, 0, 2, 0, 1, 1, -1] using IBP_7, delta=[0, 0, -1, 0, 0, 0, 1]
+  5. Eliminate I[2, -1, 2, 0, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  6. Eliminate I[2, -1, 1, 0, 2, 1, 0] using IBP_1, delta=[0, 1, 0, 0, -1, 0, 0]
+  7. Eliminate I[1, -1, 3, 0, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  8. Eliminate I[1, 0, 3, -1, 1, 1, 0] using IBP_7, delta=[0, 0, -1, 1, 0, 0, 0]
+  9. Eliminate I[1, -1, 2, 0, 2, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  10. Eliminate I[1, -1, 2, 0, 1, 2, 0] using IBP_8, delta=[0, 1, 0, 0, 0, -1, 0]
+  11. Eliminate I[2, 0, 1, 0, 1, 2, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  12. Eliminate I[2, 0, 1, 0, 2, 1, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  13. Eliminate I[1, 0, 2, 0, 1, 2, 0] using IBP_0, delta=[0, 0, -1, 0, 0, 0, 0]
+  14. Eliminate I[1, 0, 2, 0, 2, 1, 0] using IBP_5, delta=[0, 0, -1, 0, 0, 0, 0]
+  15. Eliminate I[2, -1, 1, 0, 1, 2, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  16. Eliminate I[2, 0, 1, 0, 1, 1, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  17. Eliminate I[1, 0, 1, 0, 2, 1, 0] using IBP_1, delta=[0, 0, 0, 0, -1, 0, 0]
+  18. Eliminate I[1, -1, 2, 0, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  19. Eliminate I[1, -1, 1, 0, 2, 1, 0] using IBP_8, delta=[0, 1, 0, 0, -1, 0, 0]
+  20. Eliminate I[1, -1, 1, 0, 1, 2, 0] using IBP_3, delta=[0, 1, 0, 0, 0, -1, 0]
+  21. Eliminate I[1, 0, 2, -1, 1, 1, 0] using IBP_2, delta=[0, 0, -1, 1, 0, 0, 0]
+  22. Eliminate I[2, 0, 1, -1, 1, 1, 0] using IBP_3, delta=[0, 0, 0, 1, 0, 0, 0]
+  23. Eliminate I[3, 0, 1, 0, 1, 1, -1] using IBP_4, delta=[-1, 0, 0, 0, 0, 0, 1]
+  24. Eliminate I[2, 0, 1, 0, 2, 1, -1] using IBP_4, delta=[-1, 0, 0, 0, -1, 0, 1]
+  25. Eliminate I[1, 0, 1, 0, 2, 1, -1] using IBP_2, delta=[0, 0, 1, 0, -1, 0, 1]
+  26. Eliminate I[1, 0, 3, 0, 1, 1, -1] using IBP_3, delta=[0, 0, -1, 0, 0, 0, 1]
+  27. Eliminate I[1, 0, 2, 0, 1, 1, 0] using IBP_7, delta=[0, 0, -1, -1, 0, 0, 0]
+  28. Eliminate I[1, -1, 2, -1, 1, 1, 0] using IBP_1, delta=[0, 0, -1, 1, 0, 0, 0]
+  29. Eliminate I[1, -2, 2, 0, 1, 1, 0] using IBP_8, delta=[0, 1, -1, 0, 0, 0, 0]
+  30. Eliminate I[1, -2, 1, 0, 2, 1, 0] using IBP_8, delta=[0, 2, 0, 0, 0, 0, 0]
+  31. Eliminate I[1, -1, 1, 0, 3, 1, 0] using IBP_2, delta=[0, 1, 0, 0, -1, 0, 0]
+  32. Eliminate I[2, 0, 1, -1, 2, 1, 0] using IBP_0, delta=[-1, 0, 0, 0, -1, 0, 0]
+  33. Eliminate I[1, 0, 2, -2, 1, 1, 0] using IBP_3, delta=[0, 0, -1, 2, 0, 0, -1]
+  34. Eliminate I[1, 0, 2, -1, 1, 1, -1] using IBP_1, delta=[0, -2, -1, 1, 0, 0, 1]
+  35. Eliminate I[1, -3, 2, 0, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  36. Eliminate I[1, -3, 1, 0, 2, 1, 0] using IBP_8, delta=[0, 1, 0, 0, -1, 0, 0]
+  37. Eliminate I[1, -3, 1, 0, 1, 2, 0] using IBP_0, delta=[0, 2, 0, 0, 0, 0, 0]
+  38. Eliminate I[1, -2, 2, 0, 1, 2, 0] using IBP_0, delta=[2, 2, -1, 0, 0, -1, 0]
+  39. Eliminate I[3, -1, 2, 0, 1, 1, 0] using IBP_0, delta=[-1, 1, 0, 0, 0, 0, 0]
+  40. Eliminate I[2, -1, 3, 0, 1, 1, 0] using IBP_4, delta=[-1, 1, -1, 0, 0, 0, 0]
+  41. Eliminate I[1, 0, 2, 0, 2, 1, -1] using IBP_8, delta=[0, 0, -1, 0, -1, 1, 1]
+  42. Eliminate I[1, -1, 1, 0, 2, 2, 0] using IBP_5, delta=[1, 1, 0, 0, -1, -1, 0]
+  43. Eliminate I[3, -1, 1, 0, 1, 1, 0] using IBP_0, delta=[-1, 1, 0, -1, 0, 0, 0]
+  44. Eliminate I[2, -1, 2, -1, 1, 1, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  45. Eliminate I[1, -1, 3, -1, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  46. Eliminate I[1, 0, 1, 0, 1, 2, 0] using IBP_3, delta=[0, -2, 0, 0, 0, -1, 0]
+  47. Eliminate I[1, -2, 2, -1, 1, 1, 0] using IBP_0, delta=[0, 1, -1, 0, 0, 0, 0]
+  48. Eliminate I[1, -2, 1, 0, 1, 2, 0] using IBP_2, delta=[0, 1, 0, 0, 0, -1, 0]
+  49. Eliminate I[2, -1, 1, -1, 1, 1, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  50. Eliminate I[2, -1, 1, 0, 1, 1, 0] using IBP_5, delta=[-1, 1, 0, 0, 0, 0, 0]
+  51. Eliminate I[1, -2, 1, 0, 1, 1, 0] using IBP_3, delta=[0, 1, 0, 0, 0, 0, 0]
+  52. Eliminate I[1, 0, 1, -1, 1, 1, 0] using IBP_3, delta=[0, 0, 0, 1, 1, 0, 0]
+  53. Eliminate I[1, 0, 2, -1, 2, 1, 0] using IBP_3, delta=[0, 0, -1, 1, -1, 1, 0]
+  54. Eliminate I[1, -1, 1, 0, 1, 3, 0] using IBP_2, delta=[0, 1, 0, 0, 0, -1, 0]
+  55. Eliminate I[1, 0, 2, -1, 1, 2, 0] using IBP_0, delta=[0, -1, -1, 1, 0, -1, 0]
