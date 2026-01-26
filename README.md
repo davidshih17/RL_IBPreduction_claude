@@ -1,124 +1,153 @@
-# Neural Network Guided IBP Reduction
+# IBP Reduction with ML-Guided Beam Search
 
-This repository contains code for training a neural network to guide Integration-by-Parts (IBP) reduction of Feynman loop integrals.
+This repository contains code for ML-guided Integration-by-Parts (IBP) reduction of Feynman integrals. We train a transformer-based classifier to guide beam search through the space of IBP identities, achieving fast and correct reductions.
 
-## Key Result
+## Key Results
 
-A transformer-based classifier trained on scrambled reduction paths successfully discovers a complete IBP reduction for the integral `I[2,0,2,0,1,1,0]` using beam search, reducing it to master integrals in 55 steps.
+- Reduced the two-loop triangle-box integral `I[2,0,2,0,1,1,0]` (sector 53) to 4 master integrals in **~5 minutes**
+- Results match Kira exactly
+- ~44x faster than AIR (which took ~3.7 hours)
 
-## Background
+## Architecture Overview
 
-IBP reduction is a critical technique in particle physics for simplifying loop integrals. Given an integral, the goal is to express it as a linear combination of simpler "master" integrals using IBP identities.
+The system uses a transformer-based action classifier (V5) with:
 
-**Master integrals for this problem:**
-- `I[1, 0, 1, 0, 1, 1, 0]`
-- `I[1, -1, 1, 0, 1, 1, 0]`
+1. **Expression Encoder**: Self-attention over expression terms with a special [TARGET] token
+2. **Full Substitution Encoder**: Encodes complete substitution history (key + all replacement terms)
+3. **Cross-Attention Scorer**: Actions attend to expression terms for context-aware scoring
 
-## Method
-
-### Training Data Generation
-- Start from master integrals and "scramble" by applying random IBP operations in reverse
-- This generates (state, action) pairs where the action leads toward reduction
-- Filter out actions that introduce "higher sector" integrals (positions 1, 3, or 6 become positive)
-- Use a small prime (p=1009) for modular arithmetic to keep coefficients manageable
-
-### Model Architecture
-- **Classifier v3**: Transformer-based encoder for expressions
-- Input: current expression (list of integrals with coefficients), substitution history, valid actions
-- Output: probability distribution over valid actions
-- Trained with cross-entropy loss to predict the "correct" reverse-scramble action
-
-### Inference
-- Beam search with the trained model
-- At each step, eliminate the highest-weight non-master integral
-- Model scores all valid actions; explore top-k
-- Prioritize states with lower maximum weight
+See [docs/progress_summary_v5_hierarchical.md](docs/progress_summary_v5_hierarchical.md) for detailed architecture documentation.
 
 ## Repository Structure
 
 ```
+IBPreduction/
 ├── models/
-│   ├── ibp_env.py           # IBP environment, action enumeration
-│   ├── classifier_v1.py     # Base classifier components
-│   ├── classifier_v2.py     # Extended encoders
-│   └── classifier_v3.py     # Transformer classifier (main model)
+│   ├── classifier_v5.py          # V5 model architecture
+│   ├── classifier_v2.py          # Base encoder components
+│   └── ibp_env.py                # IBP environment with caching
 ├── scripts/
-│   ├── data_gen/
-│   │   ├── generate_classifier_data_small_prime.py
-│   │   ├── IBP                # IBP equation templates
-│   │   └── LI                 # Lorentz identity templates
 │   ├── training/
-│   │   └── train_classifier_v3.py
+│   │   └── train_classifier_v5.py    # Training script
 │   └── eval/
-│       └── beam_search_classifier_v3.py
-├── reference/
-│   └── reverse_reduction_reordered.log  # AIR's 32-step reference
-├── data/
-│   └── classifier_training_data_p1009_filtered.jsonl.gz
+│       ├── beam_search_classifier_v5.py      # Optimized beam search
+│       └── hierarchical_reduction_v5.py      # Hierarchical reduction
 ├── checkpoints/
-│   └── best_model.pt        # Trained model (95.77% val accuracy)
-└── logs/
-    ├── train_classifier_v3_filtered.log
-    └── beam_search_v3.log   # Successful 55-step reduction
+│   └── classifier_v5/
+│       └── best_model.pt         # Trained model checkpoint
+├── data/
+│   └── multisector_tensors_v2/   # Training data (not included)
+└── docs/
+    └── progress_summary_v5_hierarchical.md   # Technical documentation
+```
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/[username]/IBPreduction.git
+cd IBPreduction
+
+# Install dependencies
+pip install torch numpy
 ```
 
 ## Usage
 
-### Generate Training Data
+### Running Hierarchical Reduction
+
 ```bash
-python -u scripts/data_gen/generate_classifier_data_small_prime.py \
-    --num_scrambles 2000 --max_steps 20 \
-    --output data/classifier_training_data_p1009_filtered.jsonl
+python -u scripts/eval/hierarchical_reduction_v5.py \
+    --integral 2,0,2,0,1,1,0 \
+    --checkpoint checkpoints/classifier_v5/best_model.pt \
+    --beam_width 20 \
+    --max_steps 100 \
+    --filter_mode subsector \
+    --device cuda \
+    -v
 ```
 
-### Train Model
-```bash
-python -u scripts/training/train_classifier_v3.py \
-    --data data/classifier_training_data_p1009_filtered.jsonl \
-    --epochs 30 --batch_size 32 --prime 1009
-```
+**Arguments:**
+- `--integral`: Starting integral indices (comma-separated)
+- `--checkpoint`: Path to model checkpoint
+- `--beam_width`: Beam width for search (default: 20)
+- `--max_steps`: Maximum steps per sector (default: 100)
+- `--filter_mode`: Sector filtering (`subsector`, `higher_only`, `none`)
+- `--device`: `cuda` or `cpu`
+- `-v`: Verbose output
 
-### Run Beam Search Reduction
-```bash
-python -u scripts/eval/beam_search_classifier_v3.py \
-    --checkpoint checkpoints/best_model.pt \
-    --beam_width 10 --max_steps 100
-```
+### Running Single-Sector Beam Search
 
-## Results
+```bash
+python -u scripts/eval/beam_search_classifier_v5.py \
+    --integral 2,0,1,0,2,0,0 \
+    --checkpoint checkpoints/classifier_v5/best_model.pt \
+    --beam_width 20 \
+    --max_steps 100 \
+    --device cuda
+```
 
 ### Training
-- 24,589 training samples from 2000 scrambles
-- Best validation accuracy: 95.77%
-- See `logs/train_classifier_v3_filtered.log`
 
-### Beam Search Reduction
-- Starting integral: `I[2,0,2,0,1,1,0]` (weight 6,0)
-- Successfully reduced to masters in 55 steps
-- Weight progression: (6,0) → (5,0) → (4,1) → complete
-- See `logs/beam_search_v3.log` for full path
+```bash
+python -u scripts/training/train_classifier_v5.py \
+    --data_dir data/multisector_tensors_v2 \
+    --output_dir checkpoints/classifier_v5 \
+    --epochs 30 \
+    --batch_size 256 \
+    --lr 0.0004 \
+    --device cuda
+```
 
-### Comparison to AIR
-- AIR (traditional method): 32 steps
-- Neural-guided beam search: 55 steps
-- The neural approach finds a valid (if longer) reduction path entirely through learned heuristics
+**Training data format:** Packed tensor format with:
+- Expression integrals and coefficients
+- Full substitution structure (key + replacement terms)
+- Target integral
+- Valid actions and labels
 
-## Key Insights
+## Model Details
 
-1. **Training on scrambled paths works**: Even without access to optimal reduction paths, training on random scrambles teaches useful structure
+**IBPActionClassifierV5:**
+- Parameters: 7.7M
+- Embed dim: 256
+- Attention heads: 4
+- Expression encoder layers: 2
+- Substitution encoder layers: 2
+- Cross-attention layers: 2
 
-2. **Higher sector filtering is critical**: Actions that introduce integrals with positive indices at positions 1, 3, or 6 lead to explosion of complexity
+**Training:**
+- Dataset: 946K training samples across all 63 sectors
+- Best validation accuracy: 90.77% (epoch 22)
+- Prime for modular arithmetic: 1009
 
-3. **Weight-based target selection**: Always eliminating the highest-weight non-master integral provides a good greedy heuristic
+## IBP Environment
 
-4. **Beam search enables discovery**: The model alone may not always pick the optimal action, but beam search explores enough to find valid paths
+The IBP environment (`models/ibp_env.py`) handles:
+- Loading IBP and LI equation templates
+- Evaluating IBP equations at specific seeds
+- Applying substitutions to expressions
+- Enumerating valid actions with sector filtering
+- Caching raw equations for performance
 
-## Requirements
+**Key optimization:** Cached `get_raw_equation` results provide 3-10x speedup for action enumeration.
 
-- Python 3.10+
-- PyTorch 2.0+
-- CUDA (optional, for faster training)
+## Hierarchical Reduction Strategy
+
+1. Identify highest-level sector with non-master integrals
+2. Run beam search to eliminate all non-masters in that sector
+3. Move to next highest sector
+4. Repeat until only master integrals remain
+
+This processes sectors in order: 53 → 52 → 49 → 37 → 21 → lower sectors
+
+## Citation
+
+If you use this code, please cite:
+
+```
+[Citation information to be added]
+```
 
 ## License
 
-MIT
+[License information to be added]

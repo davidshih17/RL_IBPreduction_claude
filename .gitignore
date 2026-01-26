@@ -7,3 +7,6 @@ dist/
 build/
 .eggs/
 *.log.bak
+*.log
+data/
+logs/

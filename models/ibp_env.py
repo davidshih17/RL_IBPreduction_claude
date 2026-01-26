@@ -118,10 +118,25 @@ def apply_substitution(expr, sub_int, sol):
 
 
 def apply_all_substitutions(expr, subs):
-    """Apply all substitutions in order."""
+    """Apply all substitutions until fixed point."""
+    if not subs:
+        return dict(expr)
+
     result = dict(expr)
-    for sub_int, sol in subs.items():
-        result = apply_substitution(result, sub_int, sol)
+    changed = True
+    while changed:
+        changed = False
+        for sub_int, sol in subs.items():
+            if sub_int in result and result[sub_int] != 0:
+                coeff = result.pop(sub_int)
+                for k, v in sol.items():
+                    new_coeff = (coeff * v) % PRIME
+                    if k in result:
+                        result[k] = (result[k] + new_coeff) % PRIME
+                    else:
+                        result[k] = new_coeff
+                changed = True
+        result = {k: v for k, v in result.items() if v != 0}
     return result
 
 
@@ -137,11 +152,77 @@ def is_top_sector(i):
     return i[0] >= 1 and i[2] >= 1 and i[4] >= 1 and i[5] >= 1
 
 
+# The 16 master integrals from paper 2502.05121v1.pdf (equation 2.5)
+PAPER_MASTERS = frozenset([
+    (0, 1, 1, 1, 0, 0, 0),
+    (1, 0, 1, 0, 1, 0, 0),
+    (1, 1, 0, 1, 1, 0, 0),
+    (0, 0, 1, 1, 1, 0, 0),
+    (1, 0, 1, 1, 1, 0, 0),
+    (1, -1, 1, 1, 1, 0, 0),
+    (0, 1, 1, 1, 1, 0, 0),
+    (-1, 1, 1, 1, 1, 0, 0),
+    (1, 1, 1, 1, 1, 0, 0),
+    (1, 0, 1, 0, 0, 1, 0),
+    (1, 1, 0, 1, 0, 1, 0),
+    (1, 0, 1, 0, 1, 1, 0),
+    (1, -1, 1, 0, 1, 1, 0),
+    (1, 0, 0, 1, 1, 1, 0),
+    (1, 1, 0, 1, 1, 1, 0),
+    (1, 0, 1, 1, 1, 1, 0),
+])
+
+
+def get_sector(integral):
+    """Get the sector mask for an integral (first 6 indices)."""
+    return tuple(1 if integral[j] > 0 else 0 for j in range(6))
+
+
+# Sectors covered by the paper masters
+PAPER_MASTER_SECTORS = frozenset(get_sector(m) for m in PAPER_MASTERS)
+
+
+def is_corner_integral(integral):
+    """Check if integral is a corner integral.
+
+    A corner integral has:
+    - All positive indices in positions 0-5 equal to exactly 1
+    - No numerator power (position 6 = 0)
+    """
+    for j in range(6):
+        if integral[j] > 1:
+            return False
+        if integral[j] < 0:
+            return False
+    if integral[6] != 0:
+        return False
+    return True
+
+
 def is_master(i):
-    return i in [(1, 0, 1, 0, 1, 1, 0), (1, -1, 1, 0, 1, 1, 0)]
+    """Check if integral is a master integral.
+
+    Masters are:
+    1. The 16 specific integrals from paper 2502.05121v1.pdf (eq. 2.5)
+    2. Corner integrals in sectors NOT covered by the 16 paper masters
+    """
+    # Check if it's one of the 16 paper masters
+    if i in PAPER_MASTERS:
+        return True
+
+    # Check if it's a corner integral in an uncovered sector
+    sector = get_sector(i)
+    if sector not in PAPER_MASTER_SECTORS:
+        return is_corner_integral(i)
+
+    return False
 
 
 def is_higher_sector(i):
+    # TODO: This is hardcoded for sector 53 (top sector = positions 0,2,4,5).
+    # It checks if integral is in top sector AND has extra propagators at 1, 3, or 6.
+    # If used for other sectors, this logic would need to be generalized.
+    # Currently only used by filter_mode='higher_only' which is deprecated.
     return is_top_sector(i) and (i[1] >= 1 or i[3] >= 1 or i[6] >= 1)
 
 
@@ -164,21 +245,102 @@ def get_target(expr):
                key=lambda x: (weight(x)[0], weight(x)[1], [-a for a in weight(x)[2]]))
 
 
-def action_introduces_higher_sector(cached_eq):
-    """Check if an IBP equation (after subs) introduces higher sector integrals."""
+def is_subsector(integral, target):
+    """Check if integral's sector is a subsector of target's sector.
+
+    A sector A is a subsector of B if every propagator that is on in A
+    is also on in B. In other words, A can only have propagators where B has them.
+    This includes the ISP (index 6).
+    """
+    for i in range(7):  # Check all 7 indices including ISP
+        if target[i] <= 0 and integral[i] > 0:
+            return False
+    return True
+
+
+def action_introduces_outside_sector(cached_eq, target):
+    """Check if an IBP equation introduces integrals outside target's sector hierarchy.
+
+    Returns True if any integral is NOT a subsector of target (i.e., has propagators
+    that target doesn't have - either lateral or higher sector).
+    """
     for integral in cached_eq.keys():
-        if is_top_sector(integral) and is_higher_sector(integral):
+        if not is_subsector(integral, target):
             return True
     return False
 
 
-def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_higher_sector=True):
+def action_introduces_higher_sector(cached_eq, target):
+    """DEPRECATED: OLD filtering hardcoded for sector 53.
+
+    Only blocks integrals in 'higher sector' (top sector + extra propagators).
+    This allows lateral sectors (same level, different propagators).
+    Only blocks integrals that are in top sector AND have propagators at positions 1, 3, or 6.
+
+    TODO: This function uses is_higher_sector() which is hardcoded for sector 53.
+    Use action_introduces_outside_sector() with filter_mode='subsector' instead.
     """
-    Enumerate all valid (ibp_op, delta) pairs that can eliminate target.
+    for integral in cached_eq.keys():
+        if is_higher_sector(integral):
+            return True
+    return False
+
+
+def action_introduces_higher_sector_general(cached_eq, target):
+    """Check if action introduces integrals in sectors strictly higher than target's sector.
+
+    A sector is higher if it has ALL the propagators the target has, PLUS extra ones.
+    This allows lateral sectors (same level, different propagators) but blocks
+    sectors with additional propagators on top of what target has.
 
     Args:
-        filter_higher_sector: If True, exclude actions that introduce higher sector integrals.
+        cached_eq: IBP equation after substitutions
+        target: The target integral we're reducing
+
+    Returns:
+        True if any integral is in a strictly higher sector than target
     """
+    # Get target's sector mask (which propagators are >= 1)
+    target_mask = tuple(1 if target[i] >= 1 else 0 for i in range(6))
+
+    for integral in cached_eq.keys():
+        # First check if integral is "in the sector" - has all required propagators
+        in_sector = True
+        for i in range(6):
+            if target_mask[i] == 1 and integral[i] < 1:
+                in_sector = False
+                break
+
+        if not in_sector:
+            continue  # Skip integrals not in sector (lateral sectors are OK)
+
+        # Now check if it's a HIGHER sector (has extra propagators)
+        for i in range(6):
+            if target_mask[i] == 0 and integral[i] >= 1:
+                return True  # Higher sector - has extra propagator
+        # Also check ISP (index 6) - if integral has ISP, it's higher
+        if integral[6] >= 1:
+            return True
+    return False
+
+
+def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_mode='subsector'):
+    """Enumerate all valid (ibp_op, delta) pairs that can eliminate target.
+
+    Args:
+        filter_mode: 'subsector' (default) - strict filtering, no lateral sectors
+                     'higher_only' - blocks only strictly higher sectors, allows lateral
+                     'none' - no sector filtering
+    """
+    # Choose filter function based on mode
+    if filter_mode == 'subsector':
+        should_filter = lambda eq, tgt: action_introduces_outside_sector(eq, tgt)
+    elif filter_mode == 'higher_only':
+        should_filter = lambda eq, tgt: action_introduces_higher_sector_general(eq, tgt)
+    elif filter_mode == 'none':
+        should_filter = lambda eq, tgt: False
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
     valid = []
     seen = set()
 
@@ -192,8 +354,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_higher_sec
             cached = apply_all_substitutions(raw, subs)
             if target not in cached or cached[target] == 0:
                 continue
-            # Filter out actions that introduce higher sector integrals
-            if filter_higher_sector and action_introduces_higher_sector(cached):
+            if should_filter(cached, target):
                 continue
             delta = tuple(seed[i] - target[i] for i in range(7))
             if (ibp_op, delta) not in seen:
@@ -213,8 +374,72 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, filter_higher_sec
                 cached = apply_all_substitutions(raw, subs)
                 if target not in cached or cached[target] == 0:
                     continue
-                # Filter out actions that introduce higher sector integrals
-                if filter_higher_sector and action_introduces_higher_sector(cached):
+                if should_filter(cached, target):
+                    continue
+                delta = tuple(seed[i] - target[i] for i in range(7))
+                if (ibp_op, delta) not in seen:
+                    seen.add((ibp_op, delta))
+                    valid.append((ibp_op, delta))
+
+    return valid
+
+
+def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache):
+    """Enumerate valid actions using a shared cache for raw equations.
+
+    This version uses a cache dict to avoid recomputing get_raw_equation for the same
+    (ibp_op, seed) pairs across multiple calls.
+    """
+    # Choose filter function based on mode
+    if filter_mode == 'subsector':
+        should_filter = lambda eq, tgt: action_introduces_outside_sector(eq, tgt)
+    elif filter_mode == 'higher_only':
+        should_filter = lambda eq, tgt: action_introduces_higher_sector_general(eq, tgt)
+    elif filter_mode == 'none':
+        should_filter = lambda eq, tgt: False
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
+
+    valid = []
+    seen = set()
+
+    def get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Direct actions
+    for ibp_op, shift_list in shifts.items():
+        for shift in shift_list:
+            seed = tuple(target[i] - shift[i] for i in range(7))
+            raw = get_raw_cached(ibp_op, seed)
+            if target not in raw or raw[target] == 0:
+                continue
+            cached = apply_all_substitutions(raw, subs)
+            if target not in cached or cached[target] == 0:
+                continue
+            if should_filter(cached, target):
+                continue
+            delta = tuple(seed[i] - target[i] for i in range(7))
+            if (ibp_op, delta) not in seen:
+                seen.add((ibp_op, delta))
+                valid.append((ibp_op, delta))
+
+    # Indirect actions
+    for sub_int in subs:
+        for ibp_op, shift_list in shifts.items():
+            for shift in shift_list:
+                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                raw = get_raw_cached(ibp_op, seed)
+                if sub_int not in raw or raw[sub_int] == 0:
+                    continue
+                if target in raw and raw[target] != 0:
+                    continue
+                cached = apply_all_substitutions(raw, subs)
+                if target not in cached or cached[target] == 0:
+                    continue
+                if should_filter(cached, target):
                     continue
                 delta = tuple(seed[i] - target[i] for i in range(7))
                 if (ibp_op, delta) not in seen:
@@ -238,6 +463,23 @@ class IBPEnvironment:
                 self.shifts[ibp_op] = [s for s, _ in self.ibp_t[ibp_op]]
         for li_idx in self.li_t:
             self.shifts[8 + li_idx] = [s for s, _ in self.li_t[li_idx]]
+
+        # Cache for get_raw_equation results: (ibp_op, seed) -> equation dict
+        self._raw_eq_cache = {}
+
+    def get_raw_equation_cached(self, ibp_op, seed):
+        """Cached version of get_raw_equation."""
+        key = (ibp_op, seed)
+        if key not in self._raw_eq_cache:
+            self._raw_eq_cache[key] = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        return self._raw_eq_cache[key]
+
+    def get_valid_actions_cached(self, target, subs, filter_mode='subsector'):
+        """Get list of valid actions for target, using cached raw equations."""
+        return enumerate_valid_actions_cached(
+            target, subs, self.ibp_t, self.li_t, self.shifts, filter_mode,
+            self._raw_eq_cache
+        )
 
     def apply_action(self, expr, subs, target, ibp_op, delta):
         """
@@ -263,14 +505,15 @@ class IBPEnvironment:
 
         return new_expr, new_subs, True
 
-    def get_valid_actions(self, target, subs, filter_higher_sector=True):
+    def get_valid_actions(self, target, subs, filter_mode='subsector'):
         """Get list of valid actions for target.
 
         Args:
-            filter_higher_sector: If True (default), exclude actions that introduce higher sector integrals.
+            filter_mode: 'subsector' (default) - strict filtering, no lateral sectors
+                         'higher_only' - old filtering, allows lateral sectors
+                         'none' - no sector filtering
         """
-        return enumerate_valid_actions(target, subs, self.ibp_t, self.li_t, self.shifts,
-                                       filter_higher_sector=filter_higher_sector)
+        return enumerate_valid_actions(target, subs, self.ibp_t, self.li_t, self.shifts, filter_mode)
 
     def is_reduced(self, expr):
         """Check if expression is fully reduced to masters."""
