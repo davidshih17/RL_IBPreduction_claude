@@ -343,6 +343,45 @@ python -u scripts/eval/hierarchical_reduction_v5.py \
 
 ---
 
+## V11-V14: Beam Restart Strategy and Checkpointing
+
+### V11: Beam Restart Innovation
+
+The key insight is that after achieving a weight improvement, the beam often contains many suboptimal states that will never lead to a solution. V11 introduces **beam restart**:
+
+1. Run beam search until max_weight improves
+2. When improvement detected, **stop and restart** with only the best state
+3. This prunes away dead ends and allows much deeper exploration
+
+**Implementation:** `beam_search()` accepts `stop_on_weight_improvement=True` parameter.
+
+### V14: Checkpoint/Resume
+
+For long-running reductions (e.g., 321322m6 took ~20 hours), crashes are a real risk. V14 adds:
+
+1. **Checkpoint after each sector:** Saves current expression, path, stats
+2. **Resume capability:** `--resume checkpoints/dir` continues from saved state
+3. **Human-readable summary:** `checkpoint_summary.txt` for monitoring
+
+### V11-V14 Results
+
+| Version | Integral | Weight | Steps | Sectors | Time |
+|---------|----------|--------|-------|---------|------|
+| V5 | `I[2,0,2,0,1,1,0]` | (6,0) | 176 | 9 | 302s |
+| V14 | `I[1,1,1,1,1,1,-3]` | (6,3) | 1,416 | 45 | ~20 min |
+| V12 | `I[3,2,1,3,2,2,-6]` | (13,6) | 46,345 | 62 | 19.7 hr |
+
+The beam restart strategy enables reduction of much higher-weight integrals that V5 could not handle.
+
+### Key Files
+
+- `scripts/eval/beam_search_classifier_v11.py`: Beam search with restart
+- `scripts/eval/hierarchical_reduction_v14.py`: Hierarchical reduction with checkpointing
+- `scripts/eval/replay_reduction_path.py`: Replay saved reduction paths
+- `results/reduction_111111m3_v14.pkl`: Saved 1416-step reduction path
+
+---
+
 ## Future Work
 
 1. **Fix `is_master()` function** - Currently returns True for corners in "uncovered" sectors, but these may be reducible. Should only return True for the 16 paper masters.
@@ -352,3 +391,5 @@ python -u scripts/eval/hierarchical_reduction_v5.py \
 3. **Other integrals** - Test on more complex starting integrals in sector 53 and beyond
 
 4. **Training data** - Generate more training examples from successful reductions to improve model
+
+5. **Path optimization** - The saved reduction paths could potentially be shortened by post-processing
