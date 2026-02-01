@@ -368,7 +368,7 @@ For long-running reductions (e.g., 321322m6 took ~20 hours), crashes are a real 
 | Version | Integral | Weight | Steps | Sectors | Time |
 |---------|----------|--------|-------|---------|------|
 | V5 | `I[2,0,2,0,1,1,0]` | (6,0) | 176 | 9 | 302s |
-| V14 | `I[1,1,1,1,1,1,-3]` | (6,3) | 1,416 | 45 | ~20 min |
+| V14 | `I[1,1,1,1,1,1,-3]` | (6,3) | 1,416 | 45 | 353s |
 | V12 | `I[3,2,1,3,2,2,-6]` | (13,6) | 46,345 | 62 | 19.7 hr |
 
 The beam restart strategy enables reduction of much higher-weight integrals that V5 could not handle.

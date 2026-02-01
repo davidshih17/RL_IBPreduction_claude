@@ -8,7 +8,7 @@ This repository contains code for ML-guided Integration-by-Parts (IBP) reduction
 
 | Integral | Weight | Sectors | Steps | Time | Masters |
 |----------|--------|---------|-------|------|---------|
-| `I[1,1,1,1,1,1,-3]` | (6,3) | 45 | 1,416 | ~20 min | 38 |
+| `I[1,1,1,1,1,1,-3]` | (6,3) | 45 | 1,416 | 353s | 38 |
 | `I[3,2,1,3,2,2,-6]` | (13,6) | 62 | 46,345 | ~19.7 hr | 63 |
 
 **V14 features:**
