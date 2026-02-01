@@ -19,11 +19,20 @@ from pathlib import Path
 # Default prime - can be changed with set_prime()
 PRIME = 2147483647
 
+# Default kinematics - can be changed with set_kinematics()
+KINEMATICS = {'d': 41, 'm1': 1, 'm2': 31, 'm3': 47}
+
 def set_prime(p):
     """Set the prime for modular arithmetic."""
     global PRIME
     PRIME = p
     print(f"IBP environment using PRIME = {PRIME}")
+
+def set_kinematics(d=41, m1=1, m2=31, m3=47):
+    """Set the kinematics (dimension and masses)."""
+    global KINEMATICS
+    KINEMATICS = {'d': d, 'm1': m1, 'm2': m2, 'm3': m3}
+    print(f"IBP environment using KINEMATICS = d={d}, m1={m1}, m2={m2}, m3={m3}")
 
 # Default paths
 IBP_PATH = Path(__file__).parent.parent / 'scripts/data_gen/IBP'
@@ -79,8 +88,8 @@ def parse_templates(path):
 def eval_coeff(coeff_str, seed):
     """Evaluate coefficient expression with given seed."""
     a0, a1, a2, a3, a4, a5, a6 = seed
-    d = 41
-    m1, m2, m3 = 1, 31, 47
+    d = KINEMATICS['d']
+    m1, m2, m3 = KINEMATICS['m1'], KINEMATICS['m2'], KINEMATICS['m3']
     try:
         return eval(coeff_str.replace('^', '**')) % PRIME
     except:
@@ -138,6 +147,109 @@ def apply_all_substitutions(expr, subs):
                 changed = True
         result = {k: v for k, v in result.items() if v != 0}
     return result
+
+
+def resolve_subs(subs):
+    """Precompute fully-resolved substitutions.
+
+    After resolution, each substitution's value contains NO keys from subs,
+    so apply_resolved_subs can apply everything in a single pass.
+
+    This is done once when subs changes, rather than iterating on every call.
+    """
+    if not subs:
+        return {}
+
+    # Deep copy the subs
+    resolved = {k: dict(v) for k, v in subs.items()}
+
+    # Keep resolving until no substitution value contains another substitution key
+    changed = True
+    while changed:
+        changed = False
+        for key in resolved:
+            value = resolved[key]
+            # Check if this value contains any keys from resolved
+            keys_to_expand = [k for k in value if k in resolved]
+            if keys_to_expand:
+                # Expand those keys
+                new_value = dict(value)
+                for expand_key in keys_to_expand:
+                    coeff = new_value.pop(expand_key)
+                    for k, v in resolved[expand_key].items():
+                        new_coeff = (coeff * v) % PRIME
+                        if k in new_value:
+                            new_value[k] = (new_value[k] + new_coeff) % PRIME
+                        else:
+                            new_value[k] = new_coeff
+                # Clean zeros
+                new_value = {k: v for k, v in new_value.items() if v != 0}
+                if new_value != resolved[key]:
+                    resolved[key] = new_value
+                    changed = True
+
+    return resolved
+
+
+def apply_resolved_subs(expr, resolved_subs):
+    """Apply pre-resolved substitutions in a single pass.
+
+    Since resolved_subs values don't contain any resolved_subs keys,
+    we only need ONE pass through the expression (no iteration to fixed point).
+    """
+    if not resolved_subs:
+        return dict(expr)
+
+    result = dict(expr)
+
+    # Single pass: expand any keys that are in resolved_subs
+    keys_to_expand = [k for k in result if k in resolved_subs]
+    for sub_int in keys_to_expand:
+        if sub_int in result and result[sub_int] != 0:
+            coeff = result.pop(sub_int)
+            for k, v in resolved_subs[sub_int].items():
+                new_coeff = (coeff * v) % PRIME
+                if k in result:
+                    result[k] = (result[k] + new_coeff) % PRIME
+                else:
+                    result[k] = new_coeff
+
+    return {k: v for k, v in result.items() if v != 0}
+
+
+def add_sub_to_resolved(resolved_subs, target, sol):
+    """Incrementally add a new substitution to resolved_subs.
+
+    Instead of recomputing the full transitive closure, we:
+    1. Resolve sol against existing resolved_subs (single pass)
+    2. Add target -> resolved_sol
+    3. Update any existing entries that contain target
+
+    Returns new resolved_subs dict.
+    """
+    # Step 1: Resolve the new sol against existing resolved_subs
+    resolved_sol = apply_resolved_subs(sol, resolved_subs)
+
+    # Step 2: Create new dict with the new entry
+    new_resolved = {k: dict(v) for k, v in resolved_subs.items()}
+    new_resolved[target] = resolved_sol
+
+    # Step 3: Update existing entries that contain target
+    for key in resolved_subs:  # Only iterate over OLD keys
+        value = new_resolved[key]
+        if target in value:
+            # Expand target in this value
+            coeff = value.pop(target)
+            for k, v in resolved_sol.items():
+                new_coeff = (coeff * v) % PRIME
+                if k in value:
+                    value[k] = (value[k] + new_coeff) % PRIME
+                else:
+                    value[k] = new_coeff
+            # Clean zeros
+            new_resolved[key] = {k: v for k, v in value.items() if v != 0}
+
+    return new_resolved
 
 
 def solve_ibp_for(ibp, target):
@@ -268,6 +380,115 @@ def action_introduces_outside_sector(cached_eq, target):
         if not is_subsector(integral, target):
             return True
     return False
+
+
+def integral_in_exact_sector(integral, target_sector):
+    """Check if integral is EXACTLY in target_sector (not a subsector).
+
+    Args:
+        integral: 7-element tuple (6 propagators + 1 ISP)
+        target_sector: 6-element list/tuple from get_sector_mask (just propagators)
+
+    Returns:
+        True if integral's sector mask exactly matches target_sector
+    """
+    for i in range(6):
+        integral_has_prop = integral[i] > 0
+        target_has_prop = target_sector[i] == 1
+        if integral_has_prop != target_has_prop:
+            return False
+    return True
+
+
+def integral_in_sector_or_subsector(integral, target_sector):
+    """Check if integral is in target_sector or a subsector of it.
+
+    Args:
+        integral: 7-element tuple (6 propagators + 1 ISP)
+        target_sector: 6-element list/tuple from get_sector_mask (just propagators)
+
+    Returns:
+        True if integral's sector is target_sector or a subsector
+    """
+    # Check first 6 indices (propagators) - integral can only have propagators
+    # where target_sector has them (subsector condition)
+    for i in range(6):
+        # If target_sector has this propagator OFF (0) but integral has it ON (>0),
+        # then integral is in a different/higher sector
+        if target_sector[i] == 0 and integral[i] > 0:
+            return False
+    return True
+
+
+def filter_subs_to_exact_sector(subs, target_sector):
+    """Filter replacement terms WITHIN each sub to only exact target sector.
+
+    When reducing sector S, replacement terms in lower sectors don't matter
+    yet - they'll be dealt with when we reduce those sectors. This filters
+    the replacement dict within each substitution to remove lower-sector terms.
+
+    Example: If target_sector is [1,1,1,1,1,1] and a sub is:
+        subs[(3,2,1,...)] = {
+            (2,2,1,2,2,2,-5): 100,  # sector [1,1,1,1,1,1] - KEEP
+            (0,2,1,2,2,2,-5): 50,   # sector [0,1,1,1,1,1] - DELETE
+        }
+    We keep only the first term in the replacement.
+
+    Args:
+        subs: dict mapping integral -> {replacement_integral: coeff, ...}
+        target_sector: 6-element list from get_sector_mask (propagator mask)
+
+    Returns:
+        dict: subs with replacement terms filtered to exact sector only
+    """
+    if not subs or target_sector is None:
+        return subs
+
+    filtered = {}
+    for source, replacement in subs.items():
+        # Filter the replacement dict to only keep terms in exact target sector
+        filtered_replacement = {}
+        for term, coeff in replacement.items():
+            if integral_in_exact_sector(term, target_sector):
+                filtered_replacement[term] = coeff
+        # Only include this sub if it has any remaining terms
+        if filtered_replacement:
+            filtered[source] = filtered_replacement
+
+    return filtered
+
+
+def filter_subs_by_sector(subs, target_sector):
+    """Filter subs to only include entries relevant to target sector.
+
+    DEPRECATED: Use filter_subs_to_exact_sector instead for better performance.
+    This function keeps subsectors which doesn't reduce subs for top sector.
+    """
+    if not subs or target_sector is None:
+        return subs
+
+    filtered = {}
+    for integral, replacement in subs.items():
+        if integral_in_sector_or_subsector(integral, target_sector):
+            filtered[integral] = replacement
+
+    return filtered
+
+
+def filter_resolved_subs_by_sector(resolved_subs, target_sector):
+    """Filter resolved_subs to only include entries relevant to target sector.
+
+    Same as filter_subs_by_sector but for the resolved form.
+    """
+    return filter_subs_by_sector(resolved_subs, target_sector)
+
+
+def filter_resolved_subs_to_exact_sector(resolved_subs, target_sector):
+    """Filter resolved_subs to only integrals EXACTLY in target sector.
+
+    Same as filter_subs_to_exact_sector but for the resolved form.
+    """
+    return filter_subs_to_exact_sector(resolved_subs, target_sector)
 
 
 def action_introduces_higher_sector(cached_eq, target):
@@ -449,6 +670,456 @@ def enumerate_valid_actions_cached(target, subs, ibp_t, li_t, shifts, filter_mod
     return valid
 
 
+def enumerate_valid_actions_resolved(target, subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache):
+    """Enumerate valid actions using pre-resolved substitutions.
+
+    OPTIMIZED VERSION: Uses apply_resolved_subs (single pass) instead of
+    apply_all_substitutions (iterate to fixed point).
+
+    Args:
+        resolved_subs: Pre-computed from resolve_subs(subs). Values don't contain any keys.
+    """
+    # Choose filter function based on mode
+    if filter_mode == 'subsector':
+        should_filter = lambda eq, tgt: action_introduces_outside_sector(eq, tgt)
+    elif filter_mode == 'higher_only':
+        should_filter = lambda eq, tgt: action_introduces_higher_sector_general(eq, tgt)
+    elif filter_mode == 'none':
+        should_filter = lambda eq, tgt: False
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
+
+    valid = []
+    seen = set()
+
+    def get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Direct actions
+    for ibp_op, shift_list in shifts.items():
+        for shift in shift_list:
+            seed = tuple(target[i] - shift[i] for i in range(7))
+            raw = get_raw_cached(ibp_op, seed)
+            if target not in raw or raw[target] == 0:
+                continue
+            # Use single-pass application with resolved subs
+            cached = apply_resolved_subs(raw, resolved_subs)
+            if target not in cached or cached[target] == 0:
+                continue
+            if should_filter(cached, target):
+                continue
+            delta = tuple(seed[i] - target[i] for i in range(7))
+            if (ibp_op, delta) not in seen:
+                seen.add((ibp_op, delta))
+                valid.append((ibp_op, delta))
+
+    # Indirect actions
+    for sub_int in subs:
+        for ibp_op, shift_list in shifts.items():
+            for shift in shift_list:
+                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                raw = get_raw_cached(ibp_op, seed)
+                if sub_int not in raw or raw[sub_int] == 0:
+                    continue
+                if target in raw and raw[target] != 0:
+                    continue
+                # Use single-pass application with resolved subs
+                cached = apply_resolved_subs(raw, resolved_subs)
+                if target not in cached or cached[target] == 0:
+                    continue
+                if should_filter(cached, target):
+                    continue
+                delta = tuple(seed[i] - target[i] for i in range(7))
+                if (ibp_op, delta) not in seen:
+                    seen.add((ibp_op, delta))
+                    valid.append((ibp_op, delta))
+
+    return valid
+
+
+def apply_resolved_subs_batch(raw_eqs, resolved_subs, verbose_timing=False):
+    """Apply resolved subs to multiple raw equations efficiently.
+
+    OPTIMIZED: Deduplicates raw equations to avoid redundant computation.
+
+    Args:
+        raw_eqs: list of raw equation dicts
+        resolved_subs: pre-resolved subs dict
+        verbose_timing: if True, print timing breakdown
+
+    Returns:
+        list of substituted equation dicts
+    """
+    import time as _time
+    t_start = _time.time()
+
+    if not resolved_subs:
+        # No subs to apply - just copy
+        return [dict(raw) for raw in raw_eqs]
+
+    # Deduplicate by object id - same raw eq object means same result
+    t_dedup = _time.time()
+    unique_cache = {}  # id(raw) -> result
+    results = []
+
+    t_dedup_elapsed = _time.time() - t_dedup
+    t_apply = _time.time()
+    n_computed = 0
+    n_reused = 0
+    total_subs_applied = 0
+
+    for raw in raw_eqs:
+        raw_id = id(raw)
+        if raw_id in unique_cache:
+            # Reuse previously computed result (copy it)
+            results.append(dict(unique_cache[raw_id]))
+            n_reused += 1
+        else:
+            # Compute fresh
+            result = dict(raw)
+            for integral in list(result.keys()):
+                if integral in resolved_subs:
+                    total_subs_applied += 1
+                    coeff = result.pop(integral)
+                    for repl_integral, repl_coeff in resolved_subs[integral].items():
+                        new_coeff = (coeff * repl_coeff) % PRIME
+                        if repl_integral in result:
+                            result[repl_integral] = (result[repl_integral] + new_coeff) % PRIME
+                        else:
+                            result[repl_integral] = new_coeff
+                        if result[repl_integral] == 0:
+                            del result[repl_integral]
+            unique_cache[raw_id] = result
+            results.append(dict(result))  # Return a copy
+            n_computed += 1
+
+    t_apply_elapsed = _time.time() - t_apply
+    total_elapsed = _time.time() - t_start
+
+    if verbose_timing:
+        print(f"        [apply_batch] total={total_elapsed:.4f}s | "
+              f"computed={n_computed}, reused={n_reused}, subs_applied={total_subs_applied}", flush=True)
+
+    return results
+
+
+def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_eq_cache):
+    """Precompute substituted indirect raw equations for a state.
+
+    This can be shared across all targets of the same state, avoiding
+    redundant substitution computation.
+
+    Args:
+        subs: original subs dict
+        resolved_subs: pre-resolved subs dict
+        ibp_t, li_t: IBP and LI templates
+        shifts: shifts lookup
+        raw_eq_cache: cache for raw equations
+
+    Returns:
+        list of (sub_int, ibp_op, shift, raw, cached) tuples
+    """
+    def get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Initialize sub_int cache if not present
+    if '_sub_cache' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache'] = {}
+    sub_cache = raw_eq_cache['_sub_cache']
+
+    # Collect all unique indirect raw equations
+    indirect_raws = []  # List of (sub_int, ibp_op, shift, raw)
+    seen_raws = set()  # Track unique raws by id to avoid duplicate subs application
+
+    for sub_int in subs:
+        if sub_int in sub_cache:
+            raw_list = sub_cache[sub_int]
+        else:
+            raw_list = []
+            for ibp_op, shift_list in shifts.items():
+                for shift in shift_list:
+                    seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                    raw = get_raw_cached(ibp_op, seed)
+                    if sub_int in raw and raw[sub_int] != 0:
+                        raw_list.append((ibp_op, shift, raw))
+            sub_cache[sub_int] = raw_list
+
+        for ibp_op, shift, raw in raw_list:
+            indirect_raws.append((sub_int, ibp_op, shift, raw))
+            seen_raws.add(id(raw))
+
+    if not indirect_raws:
+        return []
+
+    # Apply subs to all unique raw equations
+    # Build mapping from raw id to index for deduplication
+    unique_raws = []
+    raw_id_to_idx = {}
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        raw_id = id(raw)
+        if raw_id not in raw_id_to_idx:
+            raw_id_to_idx[raw_id] = len(unique_raws)
+            unique_raws.append(raw)
+
+    # Apply subs once to unique raws
+    cached_unique = apply_resolved_subs_batch(unique_raws, resolved_subs)
+
+    # Build result with cached versions
+    result = []
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        cached = cached_unique[raw_id_to_idx[id(raw)]]
+        result.append((sub_int, ibp_op, shift, raw, cached))
+
+    return result
+
+
+def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache, verbose_timing=False):
+    """Enumerate valid actions using precomputed indirect cache.
+
+    OPTIMIZED: Uses precomputed substituted indirect raw equations shared
+    across all targets of the same state.
+
+    Args:
+        target: target integral to eliminate
+        indirect_cache: precomputed list from compute_indirect_substituted
+        subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache: as before
+        verbose_timing: if True, print timing info
+
+    Returns:
+        list of (ibp_op, delta) tuples representing valid actions
+    """
+    import time as _time
+    t_start = _time.time()
+
+    # Choose filter function
+    if filter_mode == 'subsector':
+        should_filter = lambda eq, tgt: action_introduces_outside_sector(eq, tgt)
+    elif filter_mode == 'higher_only':
+        should_filter = lambda eq, tgt: action_introduces_higher_sector_general(eq, tgt)
+    elif filter_mode == 'none':
+        should_filter = lambda eq, tgt: False
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
+
+    def get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Phase 1a: Direct actions (target-dependent)
+    t1a = _time.time()
+    valid = []
+    seen = set()
+
+    for ibp_op, shift_list in shifts.items():
+        for shift in shift_list:
+            seed = tuple(target[i] - shift[i] for i in range(7))
+            raw = get_raw_cached(ibp_op, seed)
+            if target not in raw or raw[target] == 0:
+                continue
+            # Apply subs and check
+            cached = apply_resolved_subs(raw, resolved_subs)
+            if target not in cached or cached[target] == 0:
+                continue
+            if should_filter(cached, target):
+                continue
+            delta = tuple(seed[i] - target[i] for i in range(7))
+            if (ibp_op, delta) not in seen:
+                seen.add((ibp_op, delta))
+                valid.append((ibp_op, delta))
+    t1a_elapsed = _time.time() - t1a
+
+    # Phase 1b: Filter precomputed indirect cache (target-dependent filtering only)
+    t1b = _time.time()
+    n_indirect_checked = 0
+    n_indirect_valid = 0
+
+    for sub_int, ibp_op, shift, raw, cached in indirect_cache:
+        n_indirect_checked += 1
+        # Check target not in raw (before subs)
+        if target in raw and raw[target] != 0:
+            continue
+        # Check target in cached (after subs)
+        if target not in cached or cached[target] == 0:
+            continue
+        # Check sector filter
+        if should_filter(cached, target):
+            continue
+        seed = tuple(sub_int[i] - shift[i] for i in range(7))
+        delta = tuple(seed[i] - target[i] for i in range(7))
+        if (ibp_op, delta) not in seen:
+            seen.add((ibp_op, delta))
+            valid.append((ibp_op, delta))
+            n_indirect_valid += 1
+    t1b_elapsed = _time.time() - t1b
+
+    total_elapsed = _time.time() - t_start
+
+    if verbose_timing:
+        print(f"      [enumerate_cached] total={total_elapsed:.3f}s | "
+              f"P1a(direct)={t1a_elapsed:.3f}s | "
+              f"P1b(indirect_filter)={t1b_elapsed:.3f}s ({n_indirect_valid}/{n_indirect_checked}) | "
+              f"valid={len(valid)}", flush=True)
+
+    return valid
+
+
+def enumerate_valid_actions_batched(target, subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache, verbose_timing=False):
+    """Batched version of enumerate_valid_actions_resolved.
+
+    OPTIMIZED: Collects all candidate raw equations first, then applies subs
+    in batch to reduce function call overhead. ~3-4x faster than non-batched.
+
+    Args:
+        target: target integral to eliminate
+        subs: original subs dict
+        resolved_subs: pre-resolved subs dict
+        ibp_t, li_t: IBP and LI templates
+        shifts: shifts lookup
+        filter_mode: sector filtering mode
+        raw_eq_cache: cache for raw equations
+        verbose_timing: if True, print detailed timing info
+
+    Returns:
+        list of (ibp_op, delta) tuples representing valid actions
+    """
+    import time as _time
+    t_start = _time.time()
+
+    # Choose filter function based on mode
+    if filter_mode == 'subsector':
+        should_filter = lambda eq, tgt: action_introduces_outside_sector(eq, tgt)
+    elif filter_mode == 'higher_only':
+        should_filter = lambda eq, tgt: action_introduces_higher_sector_general(eq, tgt)
+    elif filter_mode == 'none':
+        should_filter = lambda eq, tgt: False
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
+
+    def get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Phase 1a: Direct actions
+    t1a = _time.time()
+    candidates = []  # List of (ibp_op, delta, raw_eq)
+    n_direct_checked = 0
+    n_direct_found = 0
+
+    for ibp_op, shift_list in shifts.items():
+        for shift in shift_list:
+            n_direct_checked += 1
+            seed = tuple(target[i] - shift[i] for i in range(7))
+            raw = get_raw_cached(ibp_op, seed)
+            if target not in raw or raw[target] == 0:
+                continue
+            delta = tuple(seed[i] - target[i] for i in range(7))
+            candidates.append((ibp_op, delta, raw))
+            n_direct_found += 1
+    t1a_elapsed = _time.time() - t1a
+
+    # Phase 1b: Indirect actions
+    # OPTIMIZATION: Cache which (ibp_op, shift, raw) contain each sub_int
+    # This avoids re-checking sub_int membership in raw for each target
+    t1b = _time.time()
+    n_subs = len(subs)
+    n_indirect_checked = 0
+    n_indirect_found = 0
+    n_cache_hits = 0
+    n_sub_cache_hits = 0
+    cache_size_before = len(raw_eq_cache)
+
+    # Initialize sub_int cache if not present (stored in raw_eq_cache to persist)
+    if '_sub_cache' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache'] = {}
+    sub_cache = raw_eq_cache['_sub_cache']
+
+    for sub_int in subs:
+        # Check if we've already computed which raw eqs contain this sub_int
+        if sub_int in sub_cache:
+            n_sub_cache_hits += 1
+            raw_list = sub_cache[sub_int]
+        else:
+            # Compute and cache: find all (ibp_op, shift, raw) where sub_int is in raw
+            raw_list = []
+            for ibp_op, shift_list in shifts.items():
+                for shift in shift_list:
+                    seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                    raw = get_raw_cached(ibp_op, seed)
+                    if sub_int in raw and raw[sub_int] != 0:
+                        raw_list.append((ibp_op, shift, raw))
+            sub_cache[sub_int] = raw_list
+
+        # Now check target against the precomputed raw equations
+        for ibp_op, shift, raw in raw_list:
+            n_indirect_checked += 1
+            if target in raw and raw[target] != 0:
+                continue
+            seed = tuple(sub_int[i] - shift[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(7))
+            candidates.append((ibp_op, delta, raw))
+            n_indirect_found += 1
+    t1b_elapsed = _time.time() - t1b
+    cache_size_after = len(raw_eq_cache) - 1  # Subtract 1 for _sub_cache key
+
+    if not candidates:
+        if verbose_timing:
+            print(f"      [enumerate] no candidates, subs={n_subs}, direct={n_direct_found}/{n_direct_checked}, indirect={n_indirect_found}/{n_indirect_checked}")
+        return []
+
+    # Phase 2: Apply subs to all candidates in batch
+    t2 = _time.time()
+    raw_eqs = [c[2] for c in candidates]
+    n_unique_raw = len(set(id(r) for r in raw_eqs))
+
+    # Count total terms in resolved_subs
+    n_resolved_subs = len(resolved_subs)
+    n_resolved_terms = sum(len(v) for v in resolved_subs.values())
+
+    cached_eqs = apply_resolved_subs_batch(raw_eqs, resolved_subs, verbose_timing=verbose_timing)
+    t2_elapsed = _time.time() - t2
+
+    # Phase 3: Filter results and collect valid actions
+    t3 = _time.time()
+    valid = []
+    seen = set()
+    n_filtered_no_target = 0
+    n_filtered_sector = 0
+    for i, (ibp_op, delta, raw) in enumerate(candidates):
+        cached = cached_eqs[i]
+        if target not in cached or cached[target] == 0:
+            n_filtered_no_target += 1
+            continue
+        if should_filter(cached, target):
+            n_filtered_sector += 1
+            continue
+        if (ibp_op, delta) not in seen:
+            seen.add((ibp_op, delta))
+            valid.append((ibp_op, delta))
+    t3_elapsed = _time.time() - t3
+
+    total_elapsed = _time.time() - t_start
+
+    if verbose_timing:
+        print(f"      [enumerate] total={total_elapsed:.3f}s | "
+              f"P1a(direct)={t1a_elapsed:.3f}s ({n_direct_found}/{n_direct_checked}) | "
+              f"P1b(indirect)={t1b_elapsed:.3f}s ({n_indirect_found}/{n_indirect_checked}, subs={n_subs}, sub_cache_hits={n_sub_cache_hits}) | "
+              f"P2(apply_subs)={t2_elapsed:.3f}s (cands={len(candidates)}, unique_raw={n_unique_raw}, resolved={n_resolved_subs}/{n_resolved_terms}terms) | "
+              f"P3(filter)={t3_elapsed:.3f}s (no_tgt={n_filtered_no_target}, sector={n_filtered_sector}, valid={len(valid)}) | "
+              f"raw_cache_size={cache_size_after}", flush=True)
+
+    return valid
+
+
 class IBPEnvironment:
     """Environment for IBP reduction with model-based action selection."""
 
@@ -481,6 +1152,62 @@ class IBPEnvironment:
             self._raw_eq_cache
         )
 
+    def get_valid_actions_resolved(self, target, subs, resolved_subs, filter_mode='subsector'):
+        """Get valid actions using pre-resolved substitutions.
+
+        OPTIMIZED: Uses single-pass substitution instead of iterating to fixed point.
+
+        Args:
+            resolved_subs: Pre-computed from resolve_subs(subs).
+        """
+        return enumerate_valid_actions_resolved(
+            target, subs, resolved_subs, self.ibp_t, self.li_t, self.shifts, filter_mode,
+            self._raw_eq_cache
+        )
+
+    def get_valid_actions_batched(self, target, subs, resolved_subs, filter_mode='subsector', verbose_timing=False):
+        """Get valid actions using batched substitution application.
+
+        OPTIMIZED: ~3-4x faster than get_valid_actions_resolved by batching
+        all substitution applications together.
+
+        Args:
+            resolved_subs: Pre-computed from resolve_subs(subs).
+            verbose_timing: if True, print detailed timing info for profiling.
+        """
+        return enumerate_valid_actions_batched(
+            target, subs, resolved_subs, self.ibp_t, self.li_t, self.shifts, filter_mode,
+            self._raw_eq_cache, verbose_timing=verbose_timing
+        )
+
+    def compute_indirect_cache(self, subs, resolved_subs):
+        """Precompute substituted indirect raw equations for a state.
+
+        Call this once per state, then use get_valid_actions_with_cache for each target.
+        This avoids redundant substitution computation across targets of the same state.
+
+        Returns:
+            indirect_cache: opaque object to pass to get_valid_actions_with_cache
+        """
+        return compute_indirect_substituted(
+            subs, resolved_subs, self.ibp_t, self.li_t, self.shifts, self._raw_eq_cache
+        )
+
+    def get_valid_actions_with_cache(self, target, indirect_cache, subs, resolved_subs, filter_mode='subsector', verbose_timing=False):
+        """Get valid actions using precomputed indirect cache.
+
+        OPTIMIZED: Uses precomputed substituted indirect raw equations.
+        Call compute_indirect_cache once per state, then this for each target.
+
+        Args:
+            indirect_cache: from compute_indirect_cache
+            Other args: as in get_valid_actions_batched
+        """
+        return enumerate_valid_actions_with_indirect_cache(
+            target, indirect_cache, subs, resolved_subs, self.ibp_t, self.li_t, self.shifts,
+            filter_mode, self._raw_eq_cache, verbose_timing=verbose_timing
+        )
+
     def apply_action(self, expr, subs, target, ibp_op, delta):
         """
         Apply action to eliminate target.
@@ -504,6 +1231,35 @@ class IBPEnvironment:
         new_expr = apply_substitution(expr, target, sol)
 
         return new_expr, new_subs, True
+
+    def apply_action_resolved(self, expr, subs, resolved_subs, target, ibp_op, delta):
+        """Apply action using pre-resolved substitutions.
+
+        OPTIMIZED: Uses single-pass substitution.
+
+        Returns:
+            (new_expr, new_subs, new_resolved_subs, success)
+        """
+        seed = tuple(target[i] + delta[i] for i in range(7))
+        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        # Use single-pass application
+        cached = apply_resolved_subs(raw, resolved_subs)
+
+        if target not in cached or cached[target] == 0:
+            return expr, subs, resolved_subs, False
+
+        sol = solve_ibp_for(cached, target)
+        if sol is None:
+            return expr, subs, resolved_subs, False
+
+        new_subs = dict(subs)
+        new_subs[target] = sol
+        new_expr = apply_substitution(expr, target, sol)
+
+        # Incrementally update resolved subs (O(|subs|) instead of O(|subs|²))
+        new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol)
+
+        return new_expr, new_subs, new_resolved_subs, True
 
     def get_valid_actions(self, target, subs, filter_mode='subsector'):
         """Get list of valid actions for target.
