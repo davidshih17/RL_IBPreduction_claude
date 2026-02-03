@@ -326,20 +326,17 @@ optimizer = AdamW
 
 # Beam Search Algorithm
 
-## Core Idea
-- Maintain the **beam width** best states (we use beam width = 20)
-- At each step, model ranks actions; try top **(beam width / #targets)** per target
-- Expand only those actions (not all valid actions)
-- Keep candidates with **lowest max weight** (model score breaks ties)
+## Each Step (beam width = 20)
+1. Start with **20 states** in the beam
+2. For each state, identify **target** = max weight non-master
+3. Model ranks valid actions; expand **top 20 actions per state**
+4. This produces **~400 candidate states**
+5. Sort by (max_weight, n_non_masters, -model_score)
+6. Keep **top 20** → new beam
 
 ## Termination
 - Stop when best state contains **only master integrals**
-- Return the reduction path from start to masters
-
-## Why Beam Search?
-- Greedy (k=1) often gets stuck on hard integrals
-- Full search is exponential - beam search is tractable
-- Model guides which actions to try; weight reduction decides what to keep
+- Model guides *which actions to try*; weight reduction decides *what to keep*
 
 ---
 
