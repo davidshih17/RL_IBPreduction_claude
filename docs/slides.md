@@ -31,12 +31,12 @@ Traditional IBP codes hit **memory limits** as integrals grow more complex:
 
 ---
 
-# Key Results
+# Key Results {.shrink}
 
 ## Triangle-Box Topology (arXiv:2502.05121)
 
-| Integral | Weight | Sequential | Parallel | Speedup | Masters |
-|----------|--------|------------|----------|---------|---------|
+| Integral | Weight | Seq. | Par. | Speedup | Masters |
+|----------|--------|------|------|---------|---------|
 | `I[2,0,2,0,1,1,0]` | (6,0) | 5 min | - | - | 4 |
 | `I[1,1,1,1,1,1,-3]` | (6,3) | 73 min | 12 min | 6x | 16 |
 | `I[3,2,1,3,2,2,-6]` | (13,6) | **~20 hr** | **115 min** | **~10x** | 16 |
@@ -46,29 +46,28 @@ Traditional IBP codes hit **memory limits** as integrals grow more complex:
 
 ---
 
-# System Architecture
+# System Architecture {.shrink}
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    Training Pipeline                        │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
-│  │    Data     │ →  │   Model     │ →  │  Trained    │    │
-│  │ Generation  │    │  Training   │    │ Checkpoint  │    │
-│  └─────────────┘    └─────────────┘    └─────────────┘    │
-└────────────────────────────────────────────────────────────┘
-                              ↓
-┌────────────────────────────────────────────────────────────┐
-│                   Inference Pipeline                        │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
-│  │  Starting   │ →  │    Beam     │ →  │   Master    │    │
-│  │  Integral   │    │   Search    │    │  Integrals  │    │
-│  └─────────────┘    └─────────────┘    └─────────────┘    │
-│                           ↓                                 │
-│              ┌─────────────────────────┐                   │
-│              │  Condor Parallelization │                   │
-│              │  (async + memoization)  │                   │
-│              └─────────────────────────┘                   │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│              Training Pipeline                    │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐     │
+│  │   Data   │ → │  Model   │ → │ Trained  │     │
+│  │Generation│   │ Training │   │Checkpoint│     │
+│  └──────────┘   └──────────┘   └──────────┘     │
+└──────────────────────────────────────────────────┘
+                        ↓
+┌──────────────────────────────────────────────────┐
+│             Inference Pipeline                    │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐     │
+│  │ Starting │ → │   Beam   │ → │  Master  │     │
+│  │ Integral │   │  Search  │   │ Integrals│     │
+│  └──────────┘   └──────────┘   └──────────┘     │
+│                       ↓                          │
+│         ┌────────────────────────┐               │
+│         │ Condor Parallelization │               │
+│         └────────────────────────┘               │
+└──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -108,7 +107,7 @@ Instead of collecting reduction trajectories (expensive), **reverse the process*
 
 ---
 
-# Data Format
+# Data Format {.shrink}
 
 Each training sample contains:
 
@@ -149,57 +148,50 @@ Full substitution encoding - encode not just the key integral but the complete r
 
 ---
 
-# Model Architecture Diagram
+# Model Architecture Diagram {.shrink}
 
 ```
 Inputs: Expression, Target, Substitutions, Sector, Actions
                               │
          ┌────────────────────┴────────────────────┐
-         │                                          │
          ▼                                          ▼
 ┌─────────────────────┐                ┌─────────────────────┐
 │  Expression Encoder │                │ Substitution Encoder│
-│  [CLS][TARGET][terms]               │  (full replacement)  │
-│  2-layer Transformer │                │  2-layer Transformer │
+│  2-layer Transformer│                │  2-layer Transformer│
 └──────────┬──────────┘                └──────────┬──────────┘
-           │                                       │
-           │    ┌─────────────────┐               │
-           │    │  Sector Encoder │               │
-           │    └────────┬────────┘               │
-           │             │                         │
-           └─────────────┼─────────────────────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │    State Combine    │
-              │   (4×256 → 256)    │
-              └──────────┬──────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │ Cross-Attention     │
-              │ Actions → Expr Terms│
-              │ 2-layer             │
-              └──────────┬──────────┘
-                         │
-                         ▼
-                  Action Scores
+           │       ┌─────────────────┐            │
+           │       │  Sector Encoder │            │
+           │       └────────┬────────┘            │
+           └────────────────┼─────────────────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │    State Combine    │
+                 │   (4×256 → 256)     │
+                 └──────────┬──────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │   Cross-Attention   │
+                 │ Actions → Expr Terms│
+                 └──────────┬──────────┘
+                            ▼
+                      Action Scores
 ```
 
 ---
 
-# Component Details
+# Component Details {.shrink}
 
-| Component | Purpose | Architecture |
-|-----------|---------|--------------|
-| **Expression Encoder** | Encode current expression + target | 2-layer Transformer |
-| **Substitution Encoder** | Encode reduction history | 2-layer Transformer + attention pooling |
-| **Sector Encoder** | Condition on target sector | Embedding + projection |
-| **Cross-Attention Scorer** | Score actions by attending to expression | 2-layer cross-attention |
+| Component | Purpose |
+|-----------|---------|
+| **Expression Encoder** | Encode expression + target |
+| **Substitution Encoder** | Encode reduction history |
+| **Sector Encoder** | Condition on sector |
+| **Cross-Attention Scorer** | Score actions vs expression |
+
+All use 2-layer architectures (Transformer or cross-attention)
 
 ## Model Hyperparameters
-- Embedding dimension: 256
-- Attention heads: 4
+- Embedding dimension: 256, Attention heads: 4
 - Total parameters: 7,696,709
 
 ---
@@ -240,7 +232,7 @@ optimizer = AdamW
 
 ---
 
-# Beam Search Algorithm
+# Beam Search Algorithm {.shrink}
 
 ```python
 def beam_search(start_integral, beam_width=20):
@@ -280,7 +272,7 @@ def beam_search(start_integral, beam_width=20):
 
 ---
 
-# Hierarchical Reduction Strategy
+# Hierarchical Reduction Strategy {.shrink}
 
 ## Algorithm
 1. Find highest-level sector with non-master integrals
@@ -334,28 +326,27 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
-# Async Parallel Architecture
+# Async Parallel Architecture {.shrink}
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   Main Controller                         │
-│                                                           │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐         │
-│  │ Work Queue │  │   Cache    │  │ Straggler  │         │
-│  │(non-masters)│ │(memoization)│ │ Detection  │         │
-│  └────────────┘  └────────────┘  └────────────┘         │
-└──────────────────────────────────────────────────────────┘
-                          │
-           ┌──────────────┼──────────────┐
-           ▼              ▼              ▼
-      ┌─────────┐    ┌─────────┐    ┌─────────┐
-      │Worker 1 │    │Worker 2 │    │Worker N │
-      │ (1 CPU) │    │ (1 CPU) │    │ (8 CPU) │
-      └─────────┘    └─────────┘    └─────────┘
-           │              │              │
-           └──────────────┼──────────────┘
-                          ▼
-                   Results (pickle)
+┌────────────────────────────────────────────────┐
+│               Main Controller                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │Work Queue│  │  Cache   │  │Straggler │     │
+│  │(pending) │  │(memoize) │  │Detection │     │
+│  └──────────┘  └──────────┘  └──────────┘     │
+└────────────────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+   ┌─────────┐    ┌─────────┐    ┌─────────┐
+   │Worker 1 │    │Worker 2 │    │Worker N │
+   │ (1 CPU) │    │ (1 CPU) │    │ (8 CPU) │
+   └─────────┘    └─────────┘    └─────────┘
+        │              │              │
+        └──────────────┼──────────────┘
+                       ▼
+                Results (pickle)
 ```
 
 ---
@@ -379,7 +370,7 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
-# Parallel Performance
+# Parallel Performance {.shrink}
 
 ## I[3,2,1,3,2,2,-6] Results
 
@@ -412,7 +403,7 @@ Our reduction produces the **exact same master basis** as professional IBP softw
 
 ---
 
-# Scaling Results
+# Scaling Results {.shrink}
 
 | Integral | Weight | Time | Steps | Masters |
 |----------|--------|------|-------|---------|
@@ -424,7 +415,7 @@ Our reduction produces the **exact same master basis** as professional IBP softw
 
 ---
 
-# Final Reduction Example
+# Final Reduction Example {.shrink}
 
 ## I[3,2,1,3,2,2,-6] → 16 Paper Masters
 
