@@ -14,16 +14,21 @@
 
 # Triangle-Box Topology
 
-## Two-Loop Integral Family
-- **2 loop momenta**: $k_1$, $k_2$
-- **3 external momenta**: $p_1$, $p_2$, $p_3$ with $p_1 + p_2 + p_3 = 0$
+![Triangle-Box Feynman Diagram](trianglebox_diagram.png){height=70%}
 
-## 7 Propagators/ISPs
+*Two-loop integral with 6 propagators + 1 ISP. From arXiv:2502.05121.*
+
+---
+
+# Propagators and ISP
+
+## 6 Propagators (denominators)
 | $D_1 = k_1^2$ | $D_2 = k_2^2$ | $D_3 = (k_1+k_2)^2$ |
 |---------------|---------------|---------------------|
 | $D_4 = (k_1+p_1)^2$ | $D_5 = (k_2+p_3)^2$ | $D_6 = (k_2-p_1)^2$ |
 
-$D_7 = (k_1+p_3)^2$ ← **ISP** (irreducible scalar product)
+## 1 ISP (irreducible scalar product)
+$D_7 = (k_1+p_3)^2$ — needed to complete basis, appears in numerator
 
 ---
 
