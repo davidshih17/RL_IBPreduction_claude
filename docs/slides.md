@@ -329,17 +329,17 @@ optimizer = AdamW
 ## Core Idea
 - Maintain **k best states** (beam width = 20)
 - At each step, expand all states with all valid actions
-- Score each candidate using the trained model
-- Keep only the **top-k scoring** candidates
+- Model scores candidates to guide exploration
+- Keep k candidates with **lowest max weight** (model score breaks ties)
 
 ## Termination
 - Stop when best state contains **only master integrals**
 - Return the reduction path from start to masters
 
 ## Why Beam Search?
-- Greedy (k=1) often fails on hard integrals
+- Greedy (k=1) often gets stuck on hard integrals
 - Full search is exponential - beam search is tractable
-- Top-5 model accuracy (~98%) means correct action usually in beam
+- Model guides which actions to try; weight reduction decides what to keep
 
 ---
 
