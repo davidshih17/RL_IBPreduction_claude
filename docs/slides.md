@@ -233,18 +233,32 @@ Sector 61 [1,0,1,1,1,1] (5 propagators)
 
 ---
 
-# Data Generation: Scrambling Approach
+# Data Generation: Two-Phase Approach
 
-## Key Insight
-Instead of collecting reduction trajectories (expensive), **reverse the process**:
-1. Start from master integrals
+## Phase 1: Scrambling
+1. Start from **random linear combination of masters**
 2. Apply random IBP identities to increase complexity
-3. Record each step - becomes training data when reversed
+3. **Record** each IBP used: `[(op₁, seed₁), (op₂, seed₂), ...]`
+4. Only use IBPs that stay within target sector (no higher sectors)
 
-## Constraints During Scrambling
-- Only apply IBPs that don't introduce higher-sector integrals
-- Stay within target sector and subsectors
-- Ensures training data reflects valid reduction paths
+## Phase 2: Unscrambling (Oracle)
+Replay the scramble in reverse to generate training samples
+
+---
+
+# Unscrambling: Step by Step
+
+## At each step:
+1. Find **target** = highest-weight non-master in expression
+2. Look up which recorded IBP can eliminate target (**oracle**)
+3. Enumerate **all valid actions** that could eliminate target
+4. Record training sample: `(expr, target, valid_actions, oracle_choice)`
+5. Apply action: add `target → solution` to substitutions
+6. Repeat until only masters remain
+
+## Key: Oracle provides perfect labels
+- No expensive search needed — answer comes from scramble record
+- Model learns to predict oracle's choice among valid alternatives
 
 ---
 
