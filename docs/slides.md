@@ -327,10 +327,10 @@ optimizer = AdamW
 # Beam Search Algorithm
 
 ## Core Idea
-- Maintain **k best states** (beam width = 20)
+- Maintain the **beam width** best states (we use beam width = 20)
 - At each step, expand all states with all valid actions
 - Model scores candidates to guide exploration
-- Keep k candidates with **lowest max weight** (model score breaks ties)
+- Keep candidates with **lowest max weight** (model score breaks ties)
 
 ## Termination
 - Stop when best state contains **only master integrals**
