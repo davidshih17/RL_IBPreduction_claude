@@ -328,7 +328,7 @@ optimizer = AdamW
 
 ## Core Idea
 - Maintain the **beam width** best states (we use beam width = 20)
-- At each step, model selects **top-k actions** to try per state
+- At each step, model ranks actions; only try the **top few**
 - Expand only those actions (not all valid actions)
 - Keep candidates with **lowest max weight** (model score breaks ties)
 
