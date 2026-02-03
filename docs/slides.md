@@ -16,7 +16,7 @@
 
 Traditional IBP codes hit **memory limits** as integrals grow more complex:
 
-![Kira Memory Scaling](kira_benchmark_plots.png){height=75%}
+![Kira Memory Scaling](kira_benchmark_plots.png){height=55%}
 
 *Kira benchmarks: Memory grows exponentially with integral weight (r), reaching 2.5+ GB for r=13.*
 
