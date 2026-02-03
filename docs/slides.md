@@ -31,6 +31,98 @@ Traditional IBP codes hit **memory limits** as integrals grow more complex:
 
 ---
 
+# The Action Space: Key Innovation
+
+## Why Traditional IBP is Hard
+- Infinite possible IBP identities (any seed, any operator)
+- No clear way to choose which identity to apply
+- Laporta: build giant linear system, solve globally
+
+## Our Approach: Finite Action Space
+- Restrict to actions that **solve for a specific target integral**
+- Each action = (IBP operator, seed shift)
+- Enumerate only **valid actions** that eliminate the target
+- Enables ML: classification over finite action set
+
+---
+
+# Action Representation {.shrink}
+
+## Action = (ibp_op, delta)
+
+- **ibp_op**: Which IBP/LI operator (0-15)
+- **delta**: Shift from target to seed integral
+
+## Example
+Target: `I[2,0,1,0,1,1,0]`, Action: `(3, (-1,0,0,0,0,0,0))`
+
+```
+IBP equation (op=3, seed=[1,0,1,0,1,1,0]):
+  c₁·I[2,0,1,0,1,1,0] + c₂·I[1,0,1,0,1,1,0] + c₃·I[1,0,2,0,1,1,0] + ... = 0
+         ↑ target
+```
+Solve for target → express in terms of simpler integrals
+
+---
+
+# Direct vs Indirect Actions {.shrink}
+
+## Direct Actions
+- Target appears directly in the raw IBP equation
+- Straightforward: apply IBP, solve for target
+
+## Indirect Actions (Key Innovation)
+- Target does **not** appear in raw IBP equation
+- But appears **after applying substitutions** from previous steps
+
+```
+Raw IBP:     c₁·I[A] + c₂·I[B] = 0   (no target)
+After subs:  c₁·I[A] + c₂·(... + c₃·I[target] + ...) = 0
+                               ↑ target appears!
+```
+
+Indirect actions leverage reduction history for deeper reductions
+
+---
+
+# Subsector Filtering {.shrink}
+
+## The Problem
+Arbitrary IBP actions can introduce integrals in **higher sectors** → explosion
+
+## Solution: Subsector Constraint
+Only allow actions where all resulting integrals are in **subsectors** of target
+
+## Sector Hierarchy
+```
+Sector 63 [1,1,1,1,1,1] (6 propagators)
+    ↓ subsectors
+Sector 62 [0,1,1,1,1,1] (5 propagators)
+Sector 61 [1,0,1,1,1,1] (5 propagators)
+    ↓
+  ...lower sectors...
+```
+
+**Result**: Reductions flow downward through sector hierarchy
+
+---
+
+# Why This Works
+
+## Finite + Learnable
+- Typically 10-100 valid actions per state
+- Model learns which actions lead to successful reductions
+
+## Hierarchical Structure
+- Subsector filtering ensures monotonic progress
+- Never introduces integrals harder than current target
+
+## Substitution Chains
+- Indirect actions enable multi-step reasoning
+- Model implicitly learns useful substitution patterns
+
+---
+
 # Key Results {.shrink}
 
 ## Triangle-Box Topology (arXiv:2502.05121)
