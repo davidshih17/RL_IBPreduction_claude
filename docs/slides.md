@@ -324,25 +324,22 @@ optimizer = AdamW
 
 ---
 
-# Beam Search Algorithm {.shrink}
+# Beam Search Algorithm
 
-```python
-def beam_search(start_integral, beam_width=20):
-    beam = [start_state]
+## Core Idea
+- Maintain **k best states** (beam width = 20)
+- At each step, expand all states with all valid actions
+- Score each candidate using the trained model
+- Keep only the **top-k scoring** candidates
 
-    while not all_masters(beam[0]):
-        candidates = []
-        for state in beam:
-            for action in get_valid_actions(state):
-                score = model.score(state, action)
-                new_state = apply_action(state, action)
-                candidates.append((new_state, score))
+## Termination
+- Stop when best state contains **only master integrals**
+- Return the reduction path from start to masters
 
-        # Keep top-k by score
-        beam = sorted(candidates, key=score)[:beam_width]
-
-    return beam[0]
-```
+## Why Beam Search?
+- Greedy (k=1) often fails on hard integrals
+- Full search is exponential - beam search is tractable
+- Top-5 model accuracy (~98%) means correct action usually in beam
 
 ---
 
