@@ -293,6 +293,17 @@ def get_sector(integral):
 # Sectors covered by the paper masters
 PAPER_MASTER_SECTORS = frozenset(get_sector(m) for m in PAPER_MASTERS)
 
+# Global flag to control whether to reduce to paper masters only
+# If True, only the 16 paper masters are considered masters
+# If False (default), corner integrals in uncovered sectors are also masters
+PAPER_MASTERS_ONLY = False
+
+
+def set_paper_masters_only(value):
+    """Set whether to reduce to paper masters only (no corner integrals)."""
+    global PAPER_MASTERS_ONLY
+    PAPER_MASTERS_ONLY = value
+
 
 def is_corner_integral(integral):
     """Check if integral is a corner integral.
@@ -317,10 +328,15 @@ def is_master(i):
     Masters are:
     1. The 16 specific integrals from paper 2502.05121v1.pdf (eq. 2.5)
     2. Corner integrals in sectors NOT covered by the 16 paper masters
+       (unless PAPER_MASTERS_ONLY is True)
     """
     # Check if it's one of the 16 paper masters
     if i in PAPER_MASTERS:
         return True
+
+    # If paper-masters-only mode, don't accept corner integrals
+    if PAPER_MASTERS_ONLY:
+        return False
 
     # Check if it's a corner integral in an uncovered sector
     sector = get_sector(i)
