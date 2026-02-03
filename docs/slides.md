@@ -1,5 +1,6 @@
 # ML-Guided IBP Reduction
 ## Neural Network Guided Integration-by-Parts Reduction of Feynman Integrals
+### Two-Loop Triangle-Box Topology
 
 ---
 
@@ -8,16 +9,29 @@
 ## The Problem
 - **IBP reduction**: Express complex Feynman integrals as linear combinations of simpler "master" integrals
 - **Challenge**: Exponential search space of IBP identities
-- **Traditional approaches**: Laporta algorithm, Kira, FIRE - can be slow for complex integrals
+- **Traditional approaches**: Laporta algorithm, Kira, FIRE
 
-## Our Solution
+## The Memory Wall
+Traditional IBP codes hit **memory limits** as integrals grow more complex:
+
+![Kira Memory Scaling](kira_benchmark_plots.png)
+
+*Kira benchmarks on triangle-box topology: Memory usage grows exponentially with integral weight (r), reaching 2.5+ GB for r=13. This scaling becomes prohibitive for more complex topologies.*
+
+---
+
+# Our Solution
+
 - **ML-guided beam search**: Train a neural network to score IBP actions
 - **Hierarchical reduction**: Process sectors from highest to lowest
 - **Parallel execution**: Distribute across Condor cluster for ~10x speedup
+- **Constant memory**: Each one-step reduction is independent - no system accumulation
 
 ---
 
 # Key Results
+
+## Triangle-Box Topology (arXiv:2502.05121)
 
 | Integral | Weight | Sequential | Parallel | Speedup | Masters |
 |----------|--------|------------|----------|---------|---------|
@@ -25,8 +39,7 @@
 | `I[1,1,1,1,1,1,-3]` | (6,3) | 73 min | 12 min | 6x | 16 |
 | `I[3,2,1,3,2,2,-6]` | (13,6) | **~20 hr** | **115 min** | **~10x** | 16 |
 
-- Results match Kira (professional IBP software) exactly
-- 44x faster than AIR on benchmark integral
+- Results match Kira exactly
 - Reduces to exact 16 paper masters from arXiv:2502.05121
 
 ---
@@ -384,17 +397,16 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
-# Benchmark Comparison
+# Validation Against Kira
 
 ## I[2,0,2,0,1,1,0] (Sector 53)
 
-| Method | Time | Masters | Notes |
-|--------|------|---------|-------|
-| **Kira** | - | 4 | Reference |
-| **Our V5** | 5 min | 4 | Matches Kira |
-| **AIR** | 3.7 hr | 5 | Corner basis |
+| Method | Masters | Result |
+|--------|---------|--------|
+| **Kira** | 4 | Reference |
+| **Our V5** | 4 | ✓ Matches exactly |
 
-**44x faster than AIR** with correct minimal basis!
+Our reduction produces the **exact same master basis** as professional IBP software.
 
 ---
 
@@ -436,11 +448,12 @@ Matches arXiv:2502.05121 basis exactly!
 
 # Key Contributions
 
-1. **ML-guided IBP reduction** that matches professional software
-2. **Hierarchical beam search** with restart strategy for deep reductions
-3. **Async parallel execution** with ~10x speedup
-4. **Straggler handling** for robust distributed computing
-5. **Paper-masters-only mode** for clean minimal basis
+1. **ML-guided IBP reduction** that matches professional software (Kira)
+2. **Constant memory usage** - avoids the memory wall of traditional approaches
+3. **Hierarchical beam search** with restart strategy for deep reductions
+4. **Async parallel execution** with ~10x speedup
+5. **Straggler handling** for robust distributed computing
+6. **Paper-masters-only mode** for clean minimal basis
 
 ---
 
