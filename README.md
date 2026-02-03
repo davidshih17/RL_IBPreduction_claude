@@ -4,7 +4,22 @@ This repository contains code for ML-guided Integration-by-Parts (IBP) reduction
 
 ## Key Results
 
-### Latest: V14 with Checkpoint/Resume
+### Latest: Async Parallel Reduction with Condor
+
+| Integral | Weight | Time (Sequential) | Time (Parallel) | Speedup | Masters |
+|----------|--------|-------------------|-----------------|---------|---------|
+| `I[1,1,1,1,1,1,-3]` | (6,3) | 73 min | 12 min | 6x | 16 |
+| `I[3,2,1,3,2,2,-6]` | (13,6) | ~20 hr | **115 min** | **~10x** | 16 |
+
+**Async parallelization features:**
+- Distributes one-step reductions across Condor CPU nodes
+- Memoization cache avoids redundant work (~55k cache hits)
+- Straggler detection: jobs >30 min are killed and resubmitted with 8 CPUs
+- Paper-masters-only mode: reduce to exactly 16 paper masters from arXiv:2502.05121
+
+See [docs/parallelization.md](docs/parallelization.md) for detailed documentation.
+
+### Previous: V14 with Checkpoint/Resume
 
 | Integral | Weight | Sectors | Steps | Time | Masters |
 |----------|--------|---------|-------|------|---------|
@@ -16,7 +31,7 @@ This repository contains code for ML-guided Integration-by-Parts (IBP) reduction
 - Resume from checkpoint if interrupted
 - Beam restart strategy: prune to best state after each weight improvement
 
-### Previous: V5 Hierarchical Reduction
+### V5 Hierarchical Reduction
 
 - Reduced `I[2,0,2,0,1,1,0]` (sector 53) to 4 master integrals in **~5 minutes**
 - Results match Kira exactly
@@ -42,26 +57,26 @@ ibp-neural-reduction/
 │   ├── classifier_v3.py          # Cross-attention scorer
 │   ├── classifier_v2.py          # Base encoder components
 │   ├── classifier_v1.py          # Collate functions
-│   └── ibp_env.py                # IBP environment with caching
+│   └── ibp_env.py                # IBP environment with caching + paper-masters-only mode
 ├── scripts/
 │   ├── training/
 │   │   └── train_classifier_v5.py    # Training script
 │   └── eval/
-│       ├── hierarchical_reduction_v14.py  # V14: checkpoint/resume
-│       ├── beam_search_classifier_v11.py  # V11: beam restart strategy
-│       ├── beam_search_classifier_v5.py   # V5: optimized beam search
-│       ├── replay_reduction_path.py       # Replay saved reductions
-│       ├── run_hierarchical_v14.sh        # Run script
-│       └── run_hierarchical_v14_resume.sh # Resume script
+│       ├── hierarchical_reduction_async.py   # Async parallel with Condor (recommended)
+│       ├── reduce_integral_onestep_worker.py # Condor worker for one-step reductions
+│       ├── hierarchical_reduction_v14.py     # V14: checkpoint/resume (sequential)
+│       ├── beam_search_classifier_v11.py     # V11: beam restart strategy
+│       ├── beam_search_classifier_v5.py      # V5: optimized beam search
+│       └── replay_reduction_path.py          # Replay saved reductions
 ├── results/
-│   └── reduction_111111m3_v14.pkl  # Saved reduction path (1416 steps)
+│   └── reduction_321322m6_async_papermasters.pkl  # Async reduction (115 min)
 ├── logs/
-│   ├── hierarchical_v14_111111m3.log       # V14 run log
-│   └── hierarchical_v12_321322m6_unlimited.log  # V12 extended run
+│   └── async_321322m6_papermasters.log  # Async run log
 ├── checkpoints/
 │   └── classifier_v5/
 │       └── best_model.pt         # Trained model checkpoint
 └── docs/
+    ├── parallelization.md                    # Parallel reduction documentation
     └── progress_summary_v5_hierarchical.md   # Technical documentation
 ```
 
@@ -78,7 +93,35 @@ pip install torch numpy
 
 ## Usage
 
-### Running V14 Hierarchical Reduction (Recommended)
+### Running Async Parallel Reduction (Recommended)
+
+For large reductions, use the async parallel approach with Condor:
+
+```bash
+python -u scripts/eval/hierarchical_reduction_async.py \
+    --integral 3,2,1,3,2,2,-6 \
+    --output results/reduction.pkl \
+    --work-dir /scratch/ibp_async \
+    --beam_width 20 \
+    --prime 1009 \
+    --paper-masters-only \
+    --straggler-timeout 1800 \
+    --straggler-cpus 8
+```
+
+**Async Arguments:**
+- `--integral`: Starting integral indices (comma-separated)
+- `--output`: Output pickle file for final reduction
+- `--work-dir`: Working directory for Condor job files and intermediate results
+- `--paper-masters-only`: Reduce to 16 paper masters only (no corner integrals)
+- `--straggler-timeout`: Seconds before resubmitting slow jobs (default: 1800 = 30 min)
+- `--straggler-cpus`: CPUs for resubmitted stragglers (default: 8)
+- `--beam_width`: Beam width for search (default: 20)
+- `--prime`: Prime for modular arithmetic (default: 1009)
+
+**Requirements:** HTCondor cluster with CPU nodes available.
+
+### Running V14 Hierarchical Reduction (Sequential)
 
 ```bash
 # Fresh start with checkpointing
