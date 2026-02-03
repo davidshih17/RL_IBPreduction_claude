@@ -12,6 +12,66 @@
 
 ---
 
+# Triangle-Box Topology
+
+## Two-Loop Integral Family
+- **2 loop momenta**: $k_1$, $k_2$
+- **3 external momenta**: $p_1$, $p_2$, $p_3$ with $p_1 + p_2 + p_3 = 0$
+
+## 7 Propagators/ISPs
+| $D_1 = k_1^2$ | $D_2 = k_2^2$ | $D_3 = (k_1+k_2)^2$ |
+|---------------|---------------|---------------------|
+| $D_4 = (k_1+p_1)^2$ | $D_5 = (k_2+p_3)^2$ | $D_6 = (k_2-p_1)^2$ |
+
+$D_7 = (k_1+p_3)^2$ ← **ISP** (irreducible scalar product)
+
+---
+
+# Integral Notation
+
+## $I[a_1, a_2, a_3, a_4, a_5, a_6, a_7]$
+
+$$I(a_1,\ldots,a_7) = \int \frac{d^D k_1 \, d^D k_2}{\prod_{i=1}^{7} D_i^{a_i}}$$
+
+## Index Meaning
+- $a_i > 0$: **propagator** in denominator (power $a_i$)
+- $a_i < 0$: **numerator** insertion (ISP to power $|a_i|$)
+- $a_i = 0$: $D_i$ absent
+
+## Example
+$I[1,1,1,1,1,1,-3]$ = top sector integral with $D_7^3$ in numerator
+
+---
+
+# Kinematics and Masses
+
+## External Masses
+- $p_1^2 = m_1^2$, $p_2^2 = m_2^2$, $p_3^2 = m_3^2$
+- Physics depends on ratios $m_2/m_1$, $m_3/m_1$
+
+## Our Numerical Setup
+- Work over **finite field** $\mathbb{F}_p$ with $p = 1009$
+- Fixed random values: $d=41$, $m_1=1$, $m_2=31$, $m_3=47$
+- Exact integer arithmetic (no floating point errors)
+
+---
+
+# IBP Identities
+
+## Source
+Integration by parts under the integral sign:
+$$0 = \int d^D k_1 \, d^D k_2 \; \frac{\partial}{\partial k_l^\mu} \frac{q^\mu}{\prod_i D_i^{a_i}}$$
+
+## For Triangle-Box
+- **8 IBP operators**: 2 loop momenta × 4 vectors $\{k_1, k_2, p_1, p_2\}$
+- **1 LI identity**: from Lorentz invariance
+- Each identity relates integrals with shifted indices $a_i$
+
+## Result
+All integrals reduce to **16 master integrals**
+
+---
+
 # The Memory Wall
 
 Traditional IBP codes hit **memory limits** as integrals grow more complex:
@@ -176,10 +236,10 @@ Instead of collecting reduction trajectories (expensive), **reverse the process*
 2. Apply random IBP identities to increase complexity
 3. Record each step - becomes training data when reversed
 
-## Numerical Setup
-- Work over **finite prime field** $\mathbb{F}_p$ with $p = 1009$
-- Fixed random kinematics: $d=41$, $m_1=1$, $m_2=31$, $m_3=47$
-- Coefficients are integers mod $p$ → exact arithmetic, no numerical instability
+## Constraints During Scrambling
+- Only apply IBPs that don't introduce higher-sector integrals
+- Stay within target sector and subsectors
+- Ensures training data reflects valid reduction paths
 
 ---
 
