@@ -57,9 +57,9 @@ Traditional IBP codes hit **memory limits** as integrals grow more complex:
 Target: `I[2,0,1,0,1,1,0]`, Action: `(3, (-1,0,0,0,0,0,0))`
 
 ```
-IBP equation (op=3, seed=[1,0,1,0,1,1,0]):
-  c₁·I[2,0,1,0,1,1,0] + c₂·I[1,0,1,0,1,1,0] + c₃·I[1,0,2,0,1,1,0] + ... = 0
-         ↑ target
+IBP eq (op=3, seed=[1,0,1,0,1,1,0]):
+  c₁·I[2,0,1,0,1,1,0] + c₂·I[1,0,1,...] + ... = 0
+       ↑ target
 ```
 Solve for target → express in terms of simpler integrals
 
