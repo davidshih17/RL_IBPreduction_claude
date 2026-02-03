@@ -404,7 +404,7 @@ Each one-step reduction is independent - distribute across workers!
 | Method | Masters | Result |
 |--------|---------|--------|
 | **Kira** | 4 | Reference |
-| **Our V5** | 4 | ✓ Matches exactly |
+| **Our V5** | 4 | Matches exactly |
 
 Our reduction produces the **exact same master basis** as professional IBP software.
 
