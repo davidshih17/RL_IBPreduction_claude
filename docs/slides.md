@@ -176,10 +176,10 @@ Instead of collecting reduction trajectories (expensive), **reverse the process*
 2. Apply random IBP identities to increase complexity
 3. Record each step - becomes training data when reversed
 
-## Constraints During Scrambling
-- Only apply IBPs that don't introduce higher-sector integrals
-- Stay within target sector and subsectors
-- Ensures training data reflects valid reduction paths
+## Numerical Setup
+- Work over **finite prime field** $\mathbb{F}_p$ with $p = 1009$
+- Fixed random kinematics: $d=41$, $m_1=1$, $m_2=31$, $m_3=47$
+- Coefficients are integers mod $p$ → exact arithmetic, no numerical instability
 
 ---
 
