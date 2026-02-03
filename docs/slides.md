@@ -14,9 +14,9 @@
 ## The Memory Wall
 Traditional IBP codes hit **memory limits** as integrals grow more complex:
 
-![Kira Memory Scaling](kira_benchmark_plots.png)
+![Kira Memory Scaling](kira_benchmark_plots.png){width=85%}
 
-*Kira benchmarks on triangle-box topology: Memory usage grows exponentially with integral weight (r), reaching 2.5+ GB for r=13. This scaling becomes prohibitive for more complex topologies.*
+*Memory grows exponentially with integral weight, reaching 2.5+ GB for r=13.*
 
 ---
 
