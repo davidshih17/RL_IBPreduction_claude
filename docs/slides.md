@@ -270,6 +270,11 @@ Replay the scramble in reverse to generate training samples
 - Uses 16 paper masters for their respective sectors
 - Uses corner integrals for remaining sectors
 
+## Scrambling Parameters
+- **Scramble steps:** 5 to 20 per trajectory
+- **Max weight:** (r,s,d) up to (13, 9, 4) in training data
+- **Scrambles per sector:** ~1000 trajectories
+
 ## Dataset Statistics
 | Split | Samples | Size |
 |-------|---------|------|
