@@ -612,6 +612,46 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
+# Validation Against Kira {.shrink}
+
+## I[3,2,1,3,2,2,-6] Coefficient Comparison (mod 1009)
+
+| Master Integral | Our Coeff | Kira Coeff | Match |
+|-----------------|-----------|------------|-------|
+| `I[1,0,1,1,1,1,0]` | 171 | 171 | Exact |
+| `I[1,1,0,1,1,1,0]` | 854 | 854 | Exact |
+| `I[1,1,1,1,1,0,0]` | 377 | 377 | Exact |
+| `I[-1,1,1,1,1,0,0]` | 160 | 160 | Exact |
+| `I[0,1,1,1,1,0,0]` | 100 | 100 | Exact |
+| `I[1,-1,1,0,1,1,0]` | 647 | 647 | Exact |
+| `I[1,-1,1,1,1,0,0]` | 9 | 9 | Exact |
+| `I[1,0,0,1,1,1,0]` | 197 | 197 | Exact |
+
+---
+
+# Validation Against Kira {.shrink}
+
+## I[3,2,1,3,2,2,-6] (continued)
+
+| Master Integral | Our Coeff | Kira Coeff | Match |
+|-----------------|-----------|------------|-------|
+| `I[1,0,1,0,1,1,0]` | 38 | 38 | Exact |
+| `I[1,0,1,1,1,0,0]` | 674 | 674 | Exact |
+| `I[1,1,0,1,0,1,0]` | 143 | 143 | Exact |
+| `I[1,1,0,1,1,0,0]` | 794 | 794 | Exact |
+| `I[0,0,1,1,1,0,0]` | 502 | 502 | Exact |
+| `I[1,0,1,0,1,0,0]` | 944 | 944 | Exact |
+| `I[0,1,1,1,0,0,0]` | 320 | 267 | Symmetry |
+| `I[1,0,1,0,0,1,0]` | 956 | — | Symmetry |
+
+**Symmetry pair:** `I[0,1,1,1,0,0,0]` and `I[1,0,1,0,0,1,0]` related by k1 <-> k2 symmetry. Sum: (320+956) mod 1009 = 267
+
+**Result:** All 16 masters validated! (14 exact, 2 symmetry-related)
+
+**Kira time:** ~10 min vs our 115 min (Kira uses symbolic reduction + optimizations)
+
+---
+
 # Scaling Results {.shrink}
 
 | Integral | Weight | Time | Steps | Masters |
