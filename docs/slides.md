@@ -236,10 +236,11 @@ Sector 61 [1,0,1,1,1,1] (5 propagators)
 # Data Generation: Two-Phase Approach
 
 ## Phase 1: Scrambling
-1. Start from **random linear combination of masters**
-2. Apply random IBP identities to increase complexity
-3. **Record** each IBP used: `[(op₁, seed₁), (op₂, seed₂), ...]`
-4. Only use IBPs that stay within target sector (no higher sectors)
+1. Choose a **random sector** from 63 non-trivial sectors
+2. Start from random linear combination of **that sector's masters**
+3. Apply random IBP identities to increase complexity
+4. **Record** each IBP used: `[(op₁, seed₁), (op₂, seed₂), ...]`
+5. Only use IBPs that stay within target sector (no higher sectors)
 
 ## Phase 2: Unscrambling (Oracle)
 Replay the scramble in reverse to generate training samples
