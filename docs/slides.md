@@ -556,16 +556,21 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
-# Validation Against Kira
+# Validation Against Kira {.shrink}
 
-## I[2,0,2,0,1,1,0] (Sector 53)
+## I[2,0,2,0,1,1,0] Coefficient Comparison (mod 1009)
 
-| Method | Masters | Result |
-|--------|---------|--------|
-| **Kira** | 4 | Reference |
-| **Our V5** | 4 | Matches exactly |
+| Master Integral | Kira | Our Result | Match |
+|-----------------|------|------------|-------|
+| `I[1,-1,1,0,1,1,0]` | 107 | 107 | Exact |
+| `I[1,0,1,0,1,1,0]` | 303 | 303 | Exact |
+| `I[1,0,1,0,1,0,0]` | 752 | 752 | Exact |
+| `I[0,1,1,1,0,0,0]` | 915 | — | Symmetry |
+| `I[1,0,1,0,0,1,0]` | — | 915 | Symmetry |
 
-Our reduction produces the **exact same master basis** as professional IBP software.
+**4th master:** `I[0,1,1,1,0,0,0]` and `I[1,0,1,0,0,1,0]` related by k1 <-> k2 loop exchange symmetry
+
+**Result:** Perfect agreement with Kira!
 
 ---
 
@@ -573,11 +578,11 @@ Our reduction produces the **exact same master basis** as professional IBP softw
 
 | Integral | Weight | Time | Steps | Masters |
 |----------|--------|------|-------|---------|
-| `I[2,0,2,0,1,1,0]` | (6,0) | 5 min | 176 | 4 |
+| `I[2,0,2,0,1,1,0]` | (6,0) | 5 min* | 526 | 4 |
 | `I[1,1,1,1,1,1,-3]` | (6,3) | 12 min* | 1,416 | 16 |
 | `I[3,2,1,3,2,2,-6]` | (13,6) | **115 min*** | 131,769 | 16 |
 
-*With parallel execution
+*With parallel execution (async hierarchical)
 
 ---
 
