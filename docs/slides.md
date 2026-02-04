@@ -664,26 +664,6 @@ Each one-step reduction is independent - distribute across workers!
 
 ---
 
-# Final Reduction Example {.shrink}
-
-## I[3,2,1,3,2,2,-6] → 16 Paper Masters
-
-```
-Final expression (mod 1009):
-  171 * I[1,0,1,1,1,1,0]
-  854 * I[1,1,0,1,1,1,0]
-  377 * I[1,1,1,1,1,0,0]
-  160 * I[-1,1,1,1,1,0,0]
-  100 * I[0,1,1,1,1,0,0]
-  647 * I[1,-1,1,0,1,1,0]
-    9 * I[1,-1,1,1,1,0,0]
-  ... (16 masters total)
-```
-
-Matches arXiv:2502.05121 basis exactly!
-
----
-
 # Part 7: Conclusions
 
 ---
