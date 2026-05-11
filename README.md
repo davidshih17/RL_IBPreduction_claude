@@ -104,11 +104,16 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl
 
 The paper run used **1 000 Condor workers in parallel × 100 scrambles each**
 (`--max_steps 25`). Of the 100 000 scrambles attempted, ≈18% are skipped
-because the random scramble produces a vanishing coefficient on the sector's
-corner integral (printed as `SKIPPED_VANISHING` in the worker logs and
-discarded — not retried). The remaining ≈82 000 trajectories yield ≈1.06 M
-training samples — the "≈$8 \times 10^4$ trajectories, ≈$1.06 \times 10^6$
-samples" quoted in paper §IV.B.
+because, for some sectors, the corner integral is identically zero as an
+algebraic consequence of the IBP identities themselves — i.e. one of the 9
+IBP/LI identities, evaluated at the corner seed, collapses to
+`0 = β · I[corner]` with `β ≠ 0` (mod the prime), forcing `I[corner] = 0`.
+The data-gen has no pre-filter for this; it discovers it post-hoc, since
+the scramble step nullifies the corner and the round-trip check then fails.
+Those trajectories are flagged `SKIPPED_VANISHING` and discarded — not
+retried. The remaining ≈82 000 trajectories yield ≈1.06 M training samples —
+the "≈$8 \times 10^4$ trajectories, ≈$1.06 \times 10^6$ samples" quoted in
+paper §IV.B.
 
 ```bash
 export SAILIR_DIR=$(pwd)              # path to the cloned repo
