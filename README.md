@@ -54,7 +54,7 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl
 
 ### 1. Generate training data
 
-1000 Condor workers × 100 scrambles each (`--max_steps 25`). ≈18% of attempts
+100 Condor workers × 1000 scrambles each (`--max_steps 25`). ≈18% of attempts
 are discarded as `SKIPPED_VANISHING`; the remaining ≈82 000 trajectories yield
 the $8\times10^4$ trajectories / $1.06\times10^6$ samples reported in paper §IV.B.
 
@@ -62,9 +62,9 @@ the $8\times10^4$ trajectories / $1.06\times10^6$ samples reported in paper §IV
 export SAILIR_DIR=$(pwd)
 export PYTHON=$(which python)
 
-bash scripts/data_gen/submit_datagen.sh 1000 100
+bash scripts/data_gen/submit_datagen.sh 100 1000
 condor_submit scripts/data_gen/datagen_job_custom.jdl
-# ... wait for all 1000 jobs to finish ...
+# ... wait for all 100 jobs to finish ...
 bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
 ```
 

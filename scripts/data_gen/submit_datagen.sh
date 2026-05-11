@@ -1,8 +1,9 @@
 #!/bin/bash
 # Submit Condor jobs to generate self-supervised training data in parallel.
-# Default: 1 000 jobs * 100 scrambles = 100 000 scrambles attempted, of
+# Default: 100 jobs * 1000 scrambles = 100 000 scrambles attempted, of
 # which ~18% are skipped (vanishing corners), giving the ~80k successful
-# trajectories quoted in the paper (§IV.B).
+# trajectories quoted in the paper (§IV.B).  Reproduces the data the
+# published checkpoint was trained on.
 #
 # Usage:  ./submit_datagen.sh [n_jobs] [scrambles_per_job]
 #
@@ -17,8 +18,8 @@ if [[ -z "${SAILIR_DIR:-}" ]]; then
     exit 1
 fi
 
-N_JOBS=${1:-1000}
-SCRAMBLES_PER_JOB=${2:-100}
+N_JOBS=${1:-100}
+SCRAMBLES_PER_JOB=${2:-1000}
 OUTPUT_DIR="${OUTPUT_DIR:-${SAILIR_DIR}/data/raw_jsonl}"
 CONDOR_DIR="${SAILIR_DIR}/scripts/data_gen"
 
