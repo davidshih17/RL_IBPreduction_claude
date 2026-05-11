@@ -108,8 +108,6 @@ done
 wait
 ```
 
-Set `SAILIR_PYTHON=/path/to/python` if Condor workers need a specific interpreter.
-
 ### 5. Plot
 
 ```bash
