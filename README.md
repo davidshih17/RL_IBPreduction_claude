@@ -243,10 +243,14 @@ encoders, 2 layers of cross-attention scoring. Total: **7.7M parameters**.
 ## Citation
 
 ```bibtex
-@article{Shih:2026sailir,
-  author  = {Shih, David},
-  title   = {Learning to Unscramble Feynman Loop Integrals with SAILIR},
-  year    = {2026}
+@article{Shih:2026jfe,
+    author = "Shih, David",
+    title = "{Learning to Unscramble Feynman Loop Integrals with SAILIR}",
+    eprint = "2604.05034",
+    archivePrefix = "arXiv",
+    primaryClass = "hep-ph",
+    month = "4",
+    year = "2026"
 }
 ```
 
