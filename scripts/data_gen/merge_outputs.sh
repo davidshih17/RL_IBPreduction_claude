@@ -38,15 +38,11 @@ echo "Total samples: ${TOTAL}"
 ${PYTHON:-python3} - "${MERGED_FILE}" <<'PY'
 import json, sys
 from collections import Counter
-scrambles = set()
 by_sector = Counter()
 with open(sys.argv[1]) as f:
     for line in f:
-        d = json.loads(line)
-        scrambles.add((d['scramble_id'], d['sector_id']))
-        by_sector[d['sector_id']] += 1
-print(f"Unique scrambles: {len(scrambles)}")
-print(f"Samples per sector:")
+        by_sector[json.loads(line)['sector_id']] += 1
+print("Samples per sector:")
 for sid in sorted(by_sector):
     print(f"  Sector {sid:2d}: {by_sector[sid]:6d}")
 print(f"Total across {len(by_sector)} sectors: {sum(by_sector.values())}")
