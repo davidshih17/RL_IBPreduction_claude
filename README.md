@@ -103,11 +103,11 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl
 ### 1. Generate self-supervised training data
 
 The paper run used **1 000 Condor workers in parallel × 100 scrambles each**
-(`--max_steps 25`). Of the 100 000 scrambles attempted, ~18% are skipped
+(`--max_steps 25`). Of the 100 000 scrambles attempted, ≈18% are skipped
 because the random scramble produces a vanishing coefficient on the sector's
 corner integral (printed as `SKIPPED_VANISHING` in the worker logs and
-discarded — not retried). The remaining ~82 000 trajectories yield ~1.06 M
-training samples — the "~$8 \times 10^4$ trajectories, ~$1.06 \times 10^6$
+discarded — not retried). The remaining ≈82 000 trajectories yield ≈1.06 M
+training samples — the "≈$8 \times 10^4$ trajectories, ≈$1.06 \times 10^6$
 samples" quoted in paper §IV.B.
 
 ```bash
@@ -129,7 +129,7 @@ step concatenates them into `multisector_training_data.jsonl` and prints
 per-sector sample counts.
 
 If you don't have Condor, you can still run a single worker locally — but
-1000 scrambles takes ~1 hr on a single CPU, so the full 100k will take days
+1000 scrambles takes ≈1 hr on a single CPU, so the full 100k will take days
 serially:
 
 ```bash
@@ -166,7 +166,7 @@ python scripts/train/train_classifier.py \
 ```
 
 Reproduces the published checkpoint to within initialisation noise. On the
-paper's hardware (single GPU) one epoch takes ~5 minutes; total run ~3 hours.
+paper's hardware (single GPU) one epoch takes ≈5 minutes; total run ≈3 hours.
 Best validation accuracy at epoch 22 (90.8% top-1). Use the training log
 output to regenerate Fig. 2:
 
