@@ -1,0 +1,9 @@
+jobs:
+ - reduce_sectors:
+    reduce:
+     - {topologies: [trianglebox], sectors: [63], r: 13, s: 7, d: 7}
+    select_integrals:
+      select_mandatory_list:
+         - [integrals-13.7.7]
+    numerical_points: numerics
+    run_initiate: true

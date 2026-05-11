@@ -1,0 +1,21 @@
+# Kinematics for two-loop triangle-box from arXiv:2502.05121
+# Three massive external momenta: p1, p2, p3
+# with p1 + p2 + p3 = 0 (momentum conservation)
+# p1^2 = m1^2, p2^2 = m2^2, p3^2 = m3^2
+# Using random finite field values for generic kinematics
+# m1=1, m2=31, m3=47 (random primes)
+# Dimension d is kept symbolic by Kira
+
+kinematics:
+  incoming_momenta: [p1, p2]
+  outgoing_momenta: [p3]
+  momentum_conservation: [p3, p1+p2]
+  kinematic_invariants:
+    - [m1, 2]
+    - [m2, 2]
+    - [m3, 2]
+  scalarproduct_rules:
+    - [[p1, p1], m1]
+    - [[p2, p2], m2]
+    - [[p3, p3], m3]
+  symbol_to_replace_by_one: m1
