@@ -2,18 +2,19 @@
 # Merge per-worker JSONL shards into a single training file and print stats.
 #
 # Usage:  ./merge_outputs.sh [output_dir]
-#
-# Required env vars:
-#   SAILIR_DIR  -- absolute path to the SAILIR repo root
+# If output_dir is not given, falls back to ${SAILIR_DIR}/data/raw_jsonl.
 
 set -e
 
-if [[ -z "${SAILIR_DIR:-}" ]]; then
-    echo "ERROR: set SAILIR_DIR to the repo root before running." >&2
+if [[ -n "${1:-}" ]]; then
+    OUTPUT_DIR=$1
+elif [[ -n "${SAILIR_DIR:-}" ]]; then
+    OUTPUT_DIR=${SAILIR_DIR}/data/raw_jsonl
+else
+    echo "ERROR: pass output_dir as \$1, or set SAILIR_DIR." >&2
     exit 1
 fi
 
-OUTPUT_DIR=${1:-${SAILIR_DIR}/data/raw_jsonl}
 MERGED_FILE="${OUTPUT_DIR}/multisector_training_data.jsonl"
 
 echo "========================================"
