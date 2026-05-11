@@ -102,19 +102,23 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl
 
 ### 1. Generate self-supervised training data
 
-The paper run used **100 Condor workers in parallel × 1 000 scrambles each**
-(`--max_steps 25`), yielding ~1.06 M training samples (see paper §IV.B). The
-scripts under `scripts/data_gen/` reproduce this:
+The paper run used **1 000 Condor workers in parallel × 100 scrambles each**
+(`--max_steps 25`). Of the 100 000 scrambles attempted, ~18% are skipped
+because the random scramble produces a vanishing coefficient on the sector's
+corner integral (printed as `SKIPPED_VANISHING` in the worker logs and
+discarded — not retried). The remaining ~82 000 trajectories yield ~1.06 M
+training samples — the "~$8 \times 10^4$ trajectories, ~$1.06 \times 10^6$
+samples" quoted in paper §IV.B.
 
 ```bash
 export SAILIR_DIR=$(pwd)              # path to the cloned repo
 export PYTHON=$(which python)         # the interpreter Condor workers should use
 
 # Build the JDL and tell you what to submit:
-bash scripts/data_gen/submit_datagen.sh 100 1000
+bash scripts/data_gen/submit_datagen.sh 1000 100
 condor_submit scripts/data_gen/datagen_job_custom.jdl
 
-# When all 100 jobs are done, merge per-worker shards:
+# When all 1 000 jobs are done, merge per-worker shards:
 bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
 ```
 
