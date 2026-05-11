@@ -1,32 +1,15 @@
 #!/usr/bin/env python3
-"""Pack JSONL training data from generate_multisector_data.py into PyTorch tensors.
+"""
+Preprocess JSONL training data to packed tensor files.
 
-generate_multisector_data.py writes one JSON sample per line, with variable-
-length expression, substitution, and action lists.  This script reads the
-JSONL files, splits into train/val, and saves packed tensor dictionaries
-(``train.pt``, ``val.pt``) that train_classifier.py loads directly.
+Uses packed format with offsets for variable-length data.
+Small dtypes to minimize file size.
 
-Schema produced (consumed by scripts/train/train_classifier.py):
-    expr_integrals (N_tokens, 7) long
-    expr_coeffs    (N_tokens,)   long
-    expr_offsets   (N+1,)        long  -- cumulative
-    sub_integrals  (M_tokens, 7) long  -- substitution KEY integrals only
-    sub_offsets    (N+1,)        long
-    subs_raw       Python list[N]      -- full [[key, [[repl_i, coeff_i], ...]], ...]
-    action_ibp_ops (A_tokens,)   long
-    action_deltas  (A_tokens, 7) long
-    action_offsets (N+1,)        long
-    sector_masks   (N, 6)        long
-    target_integrals (N, 7)      long
-    labels         (N,)          long  -- oracle action index into each sample's
-                                          action window
-
-Usage:
-    python scripts/data_gen/preprocess_to_tensors.py \\
-        --input  data/raw_jsonl/             \\
-        --output data/multisector/           \\
-        --val-fraction 0.1                   \\
-        --seed 0
+KEEPS ALL FIELDS FROM THE ORIGINAL JSONL:
+- scramble_id, sector_id, sector_mask, step
+- target, target_weight
+- expr, subs, valid_actions
+- num_valid_actions, chosen_action, chosen_action_idx
 """
 
 import argparse
@@ -37,114 +20,210 @@ from pathlib import Path
 import torch
 
 
-def iter_jsonl(input_path: Path):
-    """Yield parsed samples from a single .jsonl file or all .jsonl files in a directory."""
-    if input_path.is_dir():
-        files = sorted(input_path.glob('*.jsonl')) + sorted(input_path.glob('*.jsonl.gz'))
-    else:
-        files = [input_path]
+def load_and_convert(input_path, max_samples=None):
+    """Load JSONL and convert to lists of tensors. KEEPS ALL FIELDS."""
+    samples = []
 
-    for f in files:
-        if f.suffix == '.gz':
-            import gzip
-            opener = lambda p: gzip.open(p, 'rt')
-        else:
-            opener = lambda p: open(p, 'r')
-        with opener(f) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                yield json.loads(line)
+    with open(input_path) as f:
+        for i, line in enumerate(f):
+            if max_samples and i >= max_samples:
+                break
+            s = json.loads(line)
+
+            expr = s['expr']
+            subs = s['subs']
+            actions = s['valid_actions']
+
+            samples.append({
+                # === METADATA ===
+                'scramble_id': s.get('scramble_id', -1),
+                'sector_id': s.get('sector_id', -1),
+                'sector_mask': torch.tensor(s['sector_mask'], dtype=torch.int8),
+                'step': s.get('step', -1),
+
+                # === TARGET INFO ===
+                'target': torch.tensor(s['target'], dtype=torch.int8),
+                'target_weight': torch.tensor(s.get('target_weight', [0, 0])[:2], dtype=torch.int8),
+
+                # === EXPRESSION ===
+                'expr_integrals': torch.tensor([t[0] for t in expr], dtype=torch.int8),
+                'expr_coeffs': torch.tensor([t[1] for t in expr], dtype=torch.int16),
+
+                # === SUBSTITUTIONS (complex structure: [integral, [[integral,coeff],...]] for each) ===
+                # Store the integral being substituted
+                'sub_integrals': torch.tensor([t[0] for t in subs], dtype=torch.int8) if subs else torch.zeros(0, 7, dtype=torch.int8),
+                # Store the full substitution expressions as raw JSON (can't easily tensorize)
+                'subs_raw': subs,
+
+                # === ACTIONS ===
+                'action_ibp_ops': torch.tensor([a[0] for a in actions], dtype=torch.int8),
+                'action_deltas': torch.tensor([a[1] for a in actions], dtype=torch.int8),
+                'num_valid_actions': s.get('num_valid_actions', len(actions)),
+
+                # === LABEL ===
+                # chosen_action is [ibp_op, [delta...]] - store as ibp_op and delta separately
+                'chosen_action_ibp_op': s['chosen_action'][0] if 'chosen_action' in s else (actions[s['chosen_action_idx']][0] if actions else 0),
+                'chosen_action_delta': torch.tensor(s['chosen_action'][1] if 'chosen_action' in s else (actions[s['chosen_action_idx']][1] if actions else [0]*7), dtype=torch.int8),
+                'label': s['chosen_action_idx'],
+            })
+
+            if (i + 1) % 100000 == 0:
+                print(f"  Loaded {i + 1} samples...", flush=True)
+
+    return samples
 
 
-def pack(samples):
-    """Pack a list of JSONL sample dicts into the tensor dictionary."""
-    expr_integrals, expr_coeffs = [], []
+def pack_samples(samples):
+    """Pack variable-length samples into flat arrays with offsets. KEEPS ALL FIELDS."""
+
+    # Collect all data
+    all_scramble_ids = []
+    all_sector_ids = []
+    all_sector_masks = []
+    all_steps = []
+
+    all_targets = []
+    all_target_weights = []
+
+    all_expr_integrals = []
+    all_expr_coeffs = []
     expr_offsets = [0]
-    sub_integrals = []
+
+    all_sub_integrals = []
     sub_offsets = [0]
-    subs_raw = []
-    action_ibp_ops, action_deltas = [], []
+    all_subs_raw = []
+
+    all_action_ibp_ops = []
+    all_action_deltas = []
     action_offsets = [0]
-    sector_masks, target_integrals, labels = [], [], []
+    all_num_valid_actions = []
+
+    all_chosen_action_ibp_ops = []
+    all_chosen_action_deltas = []
+    all_labels = []
 
     for s in samples:
-        # Expression: list of [integral, coeff]
-        for integral, coeff in s['expr']:
-            expr_integrals.append(integral)
-            expr_coeffs.append(int(coeff))
-        expr_offsets.append(len(expr_integrals))
+        # Metadata
+        all_scramble_ids.append(s['scramble_id'])
+        all_sector_ids.append(s['sector_id'])
+        all_sector_masks.append(s['sector_mask'])
+        all_steps.append(s['step'])
 
-        # Substitutions: list of [key, [[repl_i, coeff_i], ...]]
-        for key, _repls in s['subs']:
-            sub_integrals.append(key)
-        sub_offsets.append(len(sub_integrals))
-        # subs_raw keeps the FULL structure (coeffs as Python ints, integrals as
-        # plain lists) -- the collate_fn pads it on the fly.
-        subs_raw.append([
-            [list(key), [[list(ri), int(rc)] for ri, rc in repls]]
-            for key, repls in s['subs']
-        ])
+        # Target
+        all_targets.append(s['target'])
+        all_target_weights.append(s['target_weight'])
 
-        # Valid actions: list of [ibp_op, delta]
-        for ibp_op, delta in s['valid_actions']:
-            action_ibp_ops.append(int(ibp_op))
-            action_deltas.append(delta)
-        action_offsets.append(len(action_ibp_ops))
+        # Expression
+        all_expr_integrals.append(s['expr_integrals'])
+        all_expr_coeffs.append(s['expr_coeffs'])
+        expr_offsets.append(expr_offsets[-1] + len(s['expr_integrals']))
 
-        sector_masks.append(s['sector_mask'])
-        target_integrals.append(s['target'])
-        labels.append(int(s['chosen_action_idx']))
+        # Substitutions
+        all_sub_integrals.append(s['sub_integrals'])
+        sub_offsets.append(sub_offsets[-1] + len(s['sub_integrals']))
+        all_subs_raw.append(s['subs_raw'])
+
+        # Actions
+        all_action_ibp_ops.append(s['action_ibp_ops'])
+        all_action_deltas.append(s['action_deltas'])
+        action_offsets.append(action_offsets[-1] + len(s['action_ibp_ops']))
+        all_num_valid_actions.append(s['num_valid_actions'])
+
+        # Label
+        all_chosen_action_ibp_ops.append(s['chosen_action_ibp_op'])
+        all_chosen_action_deltas.append(s['chosen_action_delta'])
+        all_labels.append(s['label'])
 
     return {
-        'expr_integrals':   torch.tensor(expr_integrals,  dtype=torch.long),
-        'expr_coeffs':      torch.tensor(expr_coeffs,     dtype=torch.long),
-        'expr_offsets':     torch.tensor(expr_offsets,    dtype=torch.long),
-        'sub_integrals':    torch.tensor(sub_integrals,   dtype=torch.long) if sub_integrals
-                            else torch.zeros((0, 7), dtype=torch.long),
-        'sub_offsets':      torch.tensor(sub_offsets,     dtype=torch.long),
-        'subs_raw':         subs_raw,
-        'action_ibp_ops':   torch.tensor(action_ibp_ops,  dtype=torch.long),
-        'action_deltas':    torch.tensor(action_deltas,   dtype=torch.long),
-        'action_offsets':   torch.tensor(action_offsets,  dtype=torch.long),
-        'sector_masks':     torch.tensor(sector_masks,    dtype=torch.long),
-        'target_integrals': torch.tensor(target_integrals, dtype=torch.long),
-        'labels':           torch.tensor(labels,          dtype=torch.long),
+        # === METADATA ===
+        'scramble_ids': torch.tensor(all_scramble_ids, dtype=torch.int32),
+        'sector_ids': torch.tensor(all_sector_ids, dtype=torch.int16),
+        'sector_masks': torch.stack(all_sector_masks),
+        'steps': torch.tensor(all_steps, dtype=torch.int16),
+
+        # === TARGET INFO ===
+        'target_integrals': torch.stack(all_targets),
+        'target_weights': torch.stack(all_target_weights),
+
+        # === EXPRESSION ===
+        'expr_integrals': torch.cat(all_expr_integrals) if all_expr_integrals else torch.zeros(0, 7, dtype=torch.int8),
+        'expr_coeffs': torch.cat(all_expr_coeffs) if all_expr_coeffs else torch.zeros(0, dtype=torch.int16),
+        'expr_offsets': torch.tensor(expr_offsets, dtype=torch.int32),
+
+        # === SUBSTITUTIONS ===
+        'sub_integrals': torch.cat(all_sub_integrals) if any(len(s) > 0 for s in all_sub_integrals) else torch.zeros(0, 7, dtype=torch.int8),
+        'sub_offsets': torch.tensor(sub_offsets, dtype=torch.int32),
+        'subs_raw': all_subs_raw,  # Full substitution expressions (list of lists)
+
+        # === ACTIONS ===
+        'action_ibp_ops': torch.cat(all_action_ibp_ops) if all_action_ibp_ops else torch.zeros(0, dtype=torch.int8),
+        'action_deltas': torch.cat(all_action_deltas) if all_action_deltas else torch.zeros(0, 7, dtype=torch.int8),
+        'action_offsets': torch.tensor(action_offsets, dtype=torch.int32),
+        'num_valid_actions': torch.tensor(all_num_valid_actions, dtype=torch.int16),
+
+        # === LABEL ===
+        'chosen_action_ibp_ops': torch.tensor(all_chosen_action_ibp_ops, dtype=torch.int8),
+        'chosen_action_deltas': torch.stack(all_chosen_action_deltas),
+        'labels': torch.tensor(all_labels, dtype=torch.int16),
     }
 
 
+def preprocess(input_path, output_dir, val_split=0.1, test_split=0.1, seed=42):
+    """Preprocess JSONL to packed tensor files."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading samples from {input_path}...", flush=True)
+    samples = load_and_convert(input_path)
+    n_total = len(samples)
+    print(f"Total samples: {n_total}", flush=True)
+
+    # Shuffle and split
+    random.seed(seed)
+    random.shuffle(samples)
+
+    n_test = int(n_total * test_split)
+    n_val = int(n_total * val_split)
+
+    splits = {
+        'test': samples[:n_test],
+        'val': samples[n_test:n_test + n_val],
+        'train': samples[n_test + n_val:],
+    }
+
+    print(f"Train: {len(splits['train'])}, Val: {len(splits['val'])}, Test: {len(splits['test'])}", flush=True)
+
+    # Pack and save each split
+    print("Packing and saving splits...", flush=True)
+    for name, split_samples in splits.items():
+        packed = pack_samples(split_samples)
+        path = output_dir / f'{name}.pt'
+        torch.save(packed, path)
+        size_mb = path.stat().st_size / 1e6
+        print(f"  {name}: {len(split_samples)} samples, {size_mb:.1f} MB", flush=True)
+        print(f"    Keys: {list(packed.keys())}", flush=True)
+
+    print("Done!", flush=True)
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--input',  required=True,
-                    help='JSONL file, or directory containing one or more *.jsonl(.gz) files')
-    ap.add_argument('--output', required=True,
-                    help='Output directory (will hold train.pt and val.pt)')
-    ap.add_argument('--val-fraction', type=float, default=0.1,
-                    help='Fraction of samples reserved for validation')
-    ap.add_argument('--seed', type=int, default=0)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True)
+    parser.add_argument('--val_split', type=float, default=0.1)
+    parser.add_argument('--test_split', type=float, default=0.1)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
 
-    rng = random.Random(args.seed)
+    print("=" * 70, flush=True)
+    print("Preprocess JSONL to Packed Tensor Files (ALL FIELDS PRESERVED)", flush=True)
+    print("=" * 70, flush=True)
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}", flush=True)
+    print(flush=True)
 
-    print(f'Reading from {args.input} ...', flush=True)
-    all_samples = list(iter_jsonl(Path(args.input)))
-    rng.shuffle(all_samples)
-    n_total = len(all_samples)
-    n_val = int(n_total * args.val_fraction)
-    val_samples   = all_samples[:n_val]
-    train_samples = all_samples[n_val:]
-    print(f'  total = {n_total}   train = {len(train_samples)}   val = {len(val_samples)}',
-          flush=True)
-
-    outdir = Path(args.output)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    print('Packing train ...', flush=True)
-    torch.save(pack(train_samples), outdir / 'train.pt')
-    print('Packing val ...', flush=True)
-    torch.save(pack(val_samples),   outdir / 'val.pt')
-    print(f'Wrote {outdir/"train.pt"} and {outdir/"val.pt"}', flush=True)
+    preprocess(args.input, args.output_dir, args.val_split, args.test_split, args.seed)
 
 
 if __name__ == '__main__':

@@ -72,10 +72,11 @@ bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
 
 ```bash
 python scripts/data_gen/preprocess_to_tensors.py \
-    --input  data/raw_jsonl/multisector_training_data.jsonl \
-    --output data/multisector/ \
-    --val-fraction 0.1 --seed 0
+    --input      data/raw_jsonl/multisector_training_data.jsonl \
+    --output_dir data/multisector/
 ```
+
+Defaults reproduce the paper's preprocessing: `--val_split 0.1`, `--test_split 0.1`, `--seed 42`. Produces `train.pt` (≈80%), `val.pt` (≈10%), `test.pt` (≈10%).
 
 ### 3. Train
 
