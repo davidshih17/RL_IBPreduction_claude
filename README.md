@@ -133,12 +133,12 @@ non-overlapping seeds (`--start_seed = worker_id * 1000000`), writing
 step concatenates them into `multisector_training_data.jsonl` and prints
 per-sector sample counts.
 
-If you don't have Condor, you can still run a single worker locally — but
-1000 scrambles takes ≈1 hr on a single CPU, so the full 100k will take days
-serially:
+If you don't have Condor, you can still run a single worker locally — each
+worker does 100 scrambles in ≈2 min on a single CPU, so the full 100k will
+take ≈35 hr serially:
 
 ```bash
-SAILIR_DIR=$(pwd) bash scripts/data_gen/datagen_worker.sh 0 1000 data/raw_jsonl
+SAILIR_DIR=$(pwd) bash scripts/data_gen/datagen_worker.sh 0 100 data/raw_jsonl
 ```
 
 ### 2. Pack JSONL into PyTorch tensors

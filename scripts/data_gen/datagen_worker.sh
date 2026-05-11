@@ -1,7 +1,7 @@
 #!/bin/bash
 # Condor worker: generate one shard of self-supervised training data.
 # Reproduces the per-worker invocation used for the paper (max_steps=25,
-# 1 000 scrambles per worker, non-overlapping seeds).
+# 100 scrambles per worker, non-overlapping seeds).
 #
 # Usage (from the orchestrator): ./datagen_worker.sh <worker_id> [n_scrambles] [output_dir]
 #
@@ -12,7 +12,7 @@
 set -e
 
 WORKER_ID=$1
-N_SCRAMBLES=${2:-1000}
+N_SCRAMBLES=${2:-100}
 OUTPUT_DIR=${3:-${SAILIR_DIR}/data/raw_jsonl}
 PYTHON=${PYTHON:-python3}
 
