@@ -102,37 +102,51 @@ python scripts/eval/replay_reduction_path.py --path reduction.pkl
 
 ### 1. Generate self-supervised training data
 
-Scramble + unscramble corner integrals across all 63 sectors:
+The paper run used **100 Condor workers in parallel × 1 000 scrambles each**
+(`--max_steps 25`), yielding ~1.06 M training samples (see paper §IV.B). The
+scripts under `scripts/data_gen/` reproduce this:
 
 ```bash
-python scripts/data_gen/generate_multisector_data.py \
-    --n_scrambles 80000 \
-    --min_steps 5 --max_steps 20 \
-    --output data/raw_jsonl/scrambles_seed0.jsonl \
-    --start_seed 0 \
-    --prime 1009 \
-    --ibp_path scripts/data_gen/IBP \
-    --li_path  scripts/data_gen/LI
+export SAILIR_DIR=$(pwd)              # path to the cloned repo
+export PYTHON=$(which python)         # the interpreter Condor workers should use
+
+# Build the JDL and tell you what to submit:
+bash scripts/data_gen/submit_datagen.sh 100 1000
+condor_submit scripts/data_gen/datagen_job_custom.jdl
+
+# When all 100 jobs are done, merge per-worker shards:
+bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
 ```
 
-For the paper we ran ~80k scrambles, yielding ~1.06M training samples (see
-§IV.B). Each sample is one step of an unscrambling trajectory. Parallelise
-by launching multiple jobs with different `--start_seed` and `--output`
-filenames; they can be merged in the next step.
+Each worker calls `scripts/data_gen/generate_multisector_data.py` with
+non-overlapping seeds (`--start_seed = worker_id * 1000000`), writing
+`multisector_data_worker<i>.jsonl` shards into `data/raw_jsonl/`. The merge
+step concatenates them into `multisector_training_data.jsonl` and prints
+per-sector sample counts.
+
+If you don't have Condor, you can still run a single worker locally — but
+1000 scrambles takes ~1 hr on a single CPU, so the full 100k will take days
+serially:
+
+```bash
+SAILIR_DIR=$(pwd) bash scripts/data_gen/datagen_worker.sh 0 1000 data/raw_jsonl
+```
 
 ### 2. Pack JSONL into PyTorch tensors
 
 ```bash
 python scripts/data_gen/preprocess_to_tensors.py \
-    --input  data/raw_jsonl/ \
+    --input  data/raw_jsonl/multisector_training_data.jsonl \
     --output data/multisector/ \
     --val-fraction 0.1 \
     --seed 0
 ```
 
-Reads every `*.jsonl(.gz)` under `--input`, shuffles, splits into train/val,
-and writes `train.pt` + `val.pt` containing packed expression / substitution
-/ action tensors with offsets.
+`--input` can be a single JSONL file (the merged output) or a directory
+containing one or more `*.jsonl(.gz)` files (in which case the per-worker
+shards are read directly — skip the merge step in that case). The script
+shuffles, splits into train/val, and writes `train.pt` + `val.pt`
+containing packed expression / substitution / action tensors with offsets.
 
 ### 3. Train the classifier
 
