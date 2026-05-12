@@ -258,13 +258,26 @@ def main():
     model = model.to(args.device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
+    # Multi-GPU via DataParallel.  Lets a 16 GB GPU host batch_size=256 by
+    # splitting the per-step batch across all visible CUDA devices.
+    if args.device == 'cuda' and torch.cuda.device_count() > 1:
+        n_gpu = torch.cuda.device_count()
+        names = [torch.cuda.get_device_name(i) for i in range(n_gpu)]
+        print(f"Using DataParallel over {n_gpu} GPUs: {names}", flush=True)
+        model = torch.nn.DataParallel(model)
+    # ``base_model`` is the un-wrapped IBPActionClassifier so .state_dict() and
+    # .load_state_dict() produce/consume checkpoints in the canonical format
+    # (no ``module.`` prefix), interoperable with single-GPU runs and the
+    # published checkpoint.
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr/10)
 
     start_epoch, best_val_loss = 1, float('inf')
     if args.resume:
         ckpt = torch.load(args.resume, weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
+        base_model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt['val_metrics']['loss']
@@ -285,17 +298,17 @@ def main():
 
         if val_m['loss'] < best_val_loss:
             best_val_loss = val_m['loss']
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
+            torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
                         'args': vars(args)}, output_dir / 'best_model.pt')
             print(f"  -> New best val loss! Saved.", flush=True)
 
         if epoch % 5 == 0:
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
+            torch.save({'epoch': epoch, 'model_state_dict': base_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
                         'args': vars(args)}, output_dir / f'checkpoint_epoch{epoch}.pt')
 
-    torch.save({'epoch': args.epochs, 'model_state_dict': model.state_dict(),
+    torch.save({'epoch': args.epochs, 'model_state_dict': base_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(), 'val_metrics': val_m,
                 'args': vars(args)}, output_dir / 'final_model.pt')
 
