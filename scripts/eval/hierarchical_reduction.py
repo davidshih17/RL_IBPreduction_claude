@@ -475,6 +475,12 @@ def main():
 
     # Save result
     result = {
+        # Replay-compatible header (for replay_reduction_path.py --orchestrator).
+        # The per-worker IBP paths are NOT stored here -- they live in the
+        # individual worker pickles under work_dir/results/ and are loaded
+        # by the orchestrator-mode replay.
+        'start_integral': starting_integral,
+        'prime': args.prime,
         'final_expr': expr,
         'cache': cache,
         'total_jobs': total_jobs,

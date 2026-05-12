@@ -130,6 +130,12 @@ def main():
     current_weight = max_weight(expr, target_sector)
     initial_weight_tuple = current_weight
     accumulated_path = []
+    # Index into accumulated_path where each beam_search call's contribution
+    # begins.  Each beam_search call starts with subs={} internally, so these
+    # are the *only* points where the reduction's subs state resets to empty.
+    # The replay script needs these explicit boundaries (the sector / weight
+    # heuristic over-clears in some cases).
+    restart_offsets = []
     total_steps = 0
     restart_count = 0
     success = False
@@ -161,6 +167,7 @@ def main():
         if solution:
             # Fully reduced to masters
             expr = solution.expr
+            restart_offsets.append(len(accumulated_path))
             accumulated_path.extend(solution.path)
             total_steps += len(solution.path)
             success = True
@@ -183,6 +190,7 @@ def main():
         if new_weight < current_weight:
             # Weight improved - accept and stop (goal achieved)
             expr = best_state.expr
+            restart_offsets.append(len(accumulated_path))
             accumulated_path.extend(best_state.path)
             total_steps += steps_taken
             current_weight = new_weight
@@ -201,6 +209,7 @@ def main():
             else:
                 # Non-masters decreased - continue with this state
                 expr = best_state.expr
+                restart_offsets.append(len(accumulated_path))
                 accumulated_path.extend(best_state.path)
                 total_steps += steps_taken
                 if args.verbose:
@@ -221,6 +230,7 @@ def main():
         path = []
         steps = 0
         success = False
+        restart_offsets = []
         if args.verbose:
             print(f"\nFailed to improve weight after {restart_count} restarts")
 
@@ -233,6 +243,10 @@ def main():
         'original_integral': integral,
         'final_expr': final_expr,
         'path': path,
+        # Indices in `path` where each beam_search call's contribution begins.
+        # Subs are empty at the start of each such call -- replay must clear
+        # subs at exactly these positions.
+        'restart_offsets': restart_offsets,
         'steps': steps,
         'time': elapsed,
         'prime': args.prime,
