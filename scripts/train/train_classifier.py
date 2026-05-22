@@ -55,7 +55,15 @@ class PackedDatasetV5(Dataset):
 
 MAX_REPLACEMENT_TERMS = 20  # Max replacement terms per substitution
 
-def collate_fn(samples):
+
+def make_collate_fn(n_indices, n_denominators):
+    """Build a topology-aware collate_fn closure."""
+    def collate_fn(samples):
+        return _collate(samples, n_indices, n_denominators)
+    return collate_fn
+
+
+def _collate(samples, n_indices, n_denominators):
     """Pad variable-length tensors to batch max and stack."""
     batch_size = len(samples)
 
@@ -63,23 +71,23 @@ def collate_fn(samples):
     max_sub = max(len(s['subs_raw']) for s in samples) if any(len(s['subs_raw']) > 0 for s in samples) else 1
     max_action = max(len(s['action_ibp_ops']) for s in samples)
 
-    expr_integrals = torch.zeros(batch_size, max_expr, 7, dtype=torch.long)
+    expr_integrals = torch.zeros(batch_size, max_expr, n_indices, dtype=torch.long)
     expr_coeffs = torch.zeros(batch_size, max_expr, dtype=torch.long)
     expr_mask = torch.zeros(batch_size, max_expr, dtype=torch.bool)
 
     # Batched substitution tensors
-    sub_keys = torch.zeros(batch_size, max_sub, 7, dtype=torch.long)
-    sub_repl_ints = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, 7, dtype=torch.long)
+    sub_keys = torch.zeros(batch_size, max_sub, n_indices, dtype=torch.long)
+    sub_repl_ints = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, n_indices, dtype=torch.long)
     sub_repl_coeffs = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, dtype=torch.long)
     sub_repl_mask = torch.zeros(batch_size, max_sub, MAX_REPLACEMENT_TERMS, dtype=torch.bool)
     sub_mask = torch.zeros(batch_size, max_sub, dtype=torch.bool)
 
     action_ibp_ops = torch.zeros(batch_size, max_action, dtype=torch.long)
-    action_deltas = torch.zeros(batch_size, max_action, 7, dtype=torch.long)
+    action_deltas = torch.zeros(batch_size, max_action, n_indices, dtype=torch.long)
     action_mask = torch.zeros(batch_size, max_action, dtype=torch.bool)
 
-    sector_masks = torch.zeros(batch_size, 6, dtype=torch.long)
-    target_integrals = torch.zeros(batch_size, 7, dtype=torch.long)
+    sector_masks = torch.zeros(batch_size, n_denominators, dtype=torch.long)
+    target_integrals = torch.zeros(batch_size, n_indices, dtype=torch.long)
     labels = torch.zeros(batch_size, dtype=torch.long)
 
     for i, s in enumerate(samples):
@@ -194,6 +202,9 @@ def evaluate(model, dataloader, device):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--topology', type=str, required=True,
+                        help='Path to topology_input/<family>/ directory '
+                             '(determines n_indices, n_denominators, n_actions)')
     parser.add_argument('--data_dir', type=str, required=True, help='Directory with train.pt, val.pt')
     parser.add_argument('--output_dir', type=str, default='checkpoints')
     parser.add_argument('--epochs', type=int, default=30)
@@ -210,6 +221,14 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
+
+    # Load topology to determine model dimensions.
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from sailir.topology import Topology
+    topology = Topology.from_dir(args.topology)
+    n_indices = topology.n_indices
+    n_denominators = topology.n_denominators
+    n_actions = topology.n_actions
 
     print("=" * 70, flush=True)
     print("IBP Action Classifier v5 Training", flush=True)
@@ -239,21 +258,23 @@ def main():
     val_dataset = PackedDatasetV5(val_data)
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}", flush=True)
 
+    collate = make_collate_fn(n_indices=n_indices, n_denominators=n_denominators)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+                              collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+                            collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}", flush=True)
 
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from ibp_env import set_prime
-    set_prime(args.prime)
+    from sailir import ibp_env
+    ibp_env.init_from_topology(topology)
+    ibp_env.set_prime(args.prime)
 
     model = IBPActionClassifier(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
-        n_subs_layers=args.n_subs_layers, prime=args.prime
+        n_subs_layers=args.n_subs_layers, prime=args.prime,
+        n_indices=n_indices, n_denominators=n_denominators, n_ibp_ops=n_actions,
     )
     model = model.to(args.device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)

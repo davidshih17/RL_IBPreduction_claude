@@ -2,13 +2,14 @@
 """
 Generate classifier training data for IBP reduction across ALL sectors.
 
-Key differences from single-sector version:
-1. Randomly samples from sectors (with paper masters or corner integrals)
-2. Uses sector-parameterized functions for is_in_sector, is_higher_sector, is_master
-3. Includes sector_id in output for model conditioning
+TOPOLOGY-AGNOSTIC since C5d: this module reads dimensions, action templates,
+and the master basis from a Topology (loaded with Topology.from_dir from a
+topology_input/<family>/ directory). Run init_from_topology(t) before any
+of the parsing / scrambling functions.
 
 Each sample contains:
-- sector_id: binary encoding of the sector being reduced
+- sector_id: binary encoding of the sector being reduced (bits = denominator
+             positions, in Kira convention)
 - Current expression
 - Previous substitutions
 - Valid action space
@@ -21,62 +22,79 @@ import re
 import random
 import json
 import argparse
+import sys
 from pathlib import Path
+
+# Make the SAILIR package importable when this script is run directly.
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent.parent))
+from sailir.topology import Topology
 
 # Global prime - set by command line argument
 PRIME = None
 
-# =============================================================================
-# 16 Master Integrals from arXiv:2502.05121 (equation 2.5)
-# =============================================================================
-PAPER_MASTERS = {
-    14: [(0, 1, 1, 1, 0, 0, 0)],                    # sector 14
-    21: [(1, 0, 1, 0, 1, 0, 0)],                    # sector 21
-    27: [(1, 1, 0, 1, 1, 0, 0)],                    # sector 27
-    28: [(0, 0, 1, 1, 1, 0, 0)],                    # sector 28
-    29: [(1, 0, 1, 1, 1, 0, 0), (1, -1, 1, 1, 1, 0, 0)],  # sector 29 (2 masters)
-    30: [(0, 1, 1, 1, 1, 0, 0), (-1, 1, 1, 1, 1, 0, 0)],  # sector 30 (2 masters)
-    31: [(1, 1, 1, 1, 1, 0, 0)],                    # sector 31
-    37: [(1, 0, 1, 0, 0, 1, 0)],                    # sector 37
-    43: [(1, 1, 0, 1, 0, 1, 0)],                    # sector 43
-    53: [(1, 0, 1, 0, 1, 1, 0), (1, -1, 1, 0, 1, 1, 0)],  # sector 53 (2 masters)
-    57: [(1, 0, 0, 1, 1, 1, 0)],                    # sector 57
-    59: [(1, 1, 0, 1, 1, 1, 0)],                    # sector 59
-    61: [(1, 0, 1, 1, 1, 1, 0)],                    # sector 61
-}
+# ---------------------------------------------------------------------------
+# Topology-driven globals (set by init_from_topology).
+# ---------------------------------------------------------------------------
+_TOPOLOGY: Topology = None
+N_INDICES: int = 0
+N_DENOMINATORS: int = 0
+ISP_POSITIONS: tuple = ()
+FAMILY_NAME: str = ""
+KINEMATICS: dict = {}
+PAPER_MASTERS: dict = {}                     # sector_id -> [master tuples]
+SECTORS_WITH_PAPER_MASTERS: set = set()
 
-# Sectors that have paper masters
-SECTORS_WITH_PAPER_MASTERS = set(PAPER_MASTERS.keys())
+
+def init_from_topology(topology: Topology) -> None:
+    """Pull topology-dependent constants into module globals."""
+    global _TOPOLOGY, N_INDICES, N_DENOMINATORS, ISP_POSITIONS, FAMILY_NAME
+    global KINEMATICS, PAPER_MASTERS, SECTORS_WITH_PAPER_MASTERS
+    _TOPOLOGY = topology
+    N_INDICES = topology.n_indices
+    N_DENOMINATORS = topology.n_denominators
+    ISP_POSITIONS = tuple(topology.isp_positions)
+    FAMILY_NAME = topology.family_name
+    KINEMATICS = dict(topology.kinematics_values)
+    PAPER_MASTERS = {s: [tuple(m) for m in ms]
+                     for s, ms in topology.masters_by_sector.items()}
+    SECTORS_WITH_PAPER_MASTERS = set(PAPER_MASTERS.keys())
 
 
 def get_sector_id(integral):
-    """
-    Compute sector ID from integral indices.
-    Sector ID = binary encoding of which propagators (indices 0-5) have power >= 1.
-    Index 6 is the ISP and doesn't contribute to sector ID.
+    """Compute sector ID from integral indices.
+
+    Sector ID is the bitmask of denominator positions (those NOT in
+    ISP_POSITIONS) where integral[i] >= 1. Matches Kira's convention.
     """
     sector_id = 0
-    for i in range(6):  # Only first 6 indices (propagators)
+    for i in range(N_INDICES):
+        if i in ISP_POSITIONS:
+            continue
         if integral[i] >= 1:
             sector_id += (1 << i)
     return sector_id
 
 
 def get_sector_mask(sector_id):
+    """Tuple of length N_DENOMINATORS: 1 at each denom slot present in sector_id.
+
+    Walks denominator positions in order (skipping ISP slots) so the returned
+    tuple is indexed 0..N_DENOMINATORS-1 (same convention as the old trianglebox
+    6-bit mask).
     """
-    Get the sector mask (which propagators must be >= 1).
-    Returns tuple of 6 booleans.
-    """
-    return tuple((sector_id >> i) & 1 for i in range(6))
+    out = []
+    for i in range(N_INDICES):
+        if i in ISP_POSITIONS:
+            continue
+        out.append((sector_id >> i) & 1)
+    return tuple(out)
 
 
 def get_corner_integral(sector_id):
-    """
-    Get the corner integral for a sector.
-    Corner = (mask[0], mask[1], ..., mask[5], 0) where mask[i] = 1 if bit i is set.
-    """
-    mask = get_sector_mask(sector_id)
-    return tuple(mask) + (0,)
+    """Corner integral for a sector: 1 at each present denom, 0 elsewhere."""
+    return tuple(1 if (sector_id >> i) & 1 and i not in ISP_POSITIONS else 0
+                  for i in range(N_INDICES))
 
 
 def get_masters_for_sector(sector_id):
@@ -91,34 +109,31 @@ def get_masters_for_sector(sector_id):
 
 
 def is_in_sector(integral, sector_id):
-    """
-    Check if integral belongs to the given sector (or a subsector).
-    An integral is in sector S if:
-    - For each propagator i where S requires power >= 1, integral[i] >= 1
+    """Is `integral` in `sector_id` or a subsector?
+
+    True iff every denominator position required by sector_id has integral >= 1.
+    Assumes denominator positions are 0..N_DENOMINATORS-1 (ISPs come last).
     """
     mask = get_sector_mask(sector_id)
-    for i in range(6):
+    for i in range(N_DENOMINATORS):
         if mask[i] and integral[i] < 1:
             return False
     return True
 
 
 def is_higher_sector(integral, sector_id):
-    """
-    Check if integral is in a strictly higher sector than sector_id.
-    A sector T is higher than S if T > S (as binary numbers), meaning T has
-    additional propagators with power >= 1 beyond those required by S.
+    """Is `integral` in a strictly higher sector than sector_id?
+
+    Higher = has all required denoms AND at least one extra denom (or any ISP > 0).
     """
     if not is_in_sector(integral, sector_id):
         return False
-
     mask = get_sector_mask(sector_id)
-    for i in range(6):
-        # If this propagator is NOT required by sector but integral has it >= 1
+    for i in range(N_DENOMINATORS):
         if not mask[i] and integral[i] >= 1:
             return True
-    # Also check ISP (index 6) - if ISP has power >= 1, it's a higher sector
-    if integral[6] >= 1:
+    # Any ISP with positive index counts as higher.
+    if any(integral[p] >= 1 for p in ISP_POSITIONS):
         return True
     return False
 
@@ -187,6 +202,10 @@ def apply_all_substitutions(expr, subs):
 # =============================================================================
 
 def parse_templates(path):
+    """Parse IBP or LI file. Family name comes from the configured topology."""
+    if not FAMILY_NAME:
+        raise RuntimeError("init_from_topology() must be called before parse_templates")
+    pat = re.compile(rf'{re.escape(FAMILY_NAME)}\[([^\]]+)\]\*\(([^)]+)\)')
     templates = {}
     current_idx, terms = None, []
     with open(path, 'r') as f:
@@ -197,9 +216,9 @@ def parse_templates(path):
                     templates[current_idx] = terms
                 current_idx, terms = None, []
                 continue
-            if '→' in line:
-                line = line.split('→', 1)[1]
-            match = re.match(r'trianglebox\[([^\]]+)\]\*\(([^)]+)\)', line)
+            if '\u2192' in line:  # original "→" arrow
+                line = line.split('\u2192', 1)[1]
+            match = pat.match(line)
             if match:
                 shift = tuple(int(x.strip()) for x in match.group(1).split(','))
                 if current_idx is None:
@@ -211,24 +230,27 @@ def parse_templates(path):
 
 
 def evaluate_coefficient(coeff_str, seed):
-    a0, a1, a2, a3, a4, a5, a6 = seed
-    d, m1, m2, m3 = 41, 1, 31, 47
+    """Eval coefficient at finite-field point. Indices a0..a{N-1} from `seed`,
+    plus topology kinematics (d + invariants) from KINEMATICS."""
+    ns = {f'a{i}': seed[i] for i in range(N_INDICES)}
+    ns.update(KINEMATICS)
     try:
-        return eval(coeff_str.replace('^', '**')) % PRIME
-    except:
+        return eval(coeff_str.replace('^', '**'), {"__builtins__": {}}, ns) % PRIME
+    except Exception:
         return 0
 
 
 def get_raw_equation(ibp_t, li_t, ibp_op, seed):
-    if ibp_op >= 8:
-        template = li_t.get(ibp_op - 8, [])
+    n_ibp = len(ibp_t)
+    if ibp_op >= n_ibp:
+        template = li_t.get(ibp_op - n_ibp, [])
     else:
         template = ibp_t.get(ibp_op, [])
     eq = {}
     for shift, coeff_str in template:
         coeff = evaluate_coefficient(coeff_str, seed)
         if coeff:
-            eq[tuple(seed[i] + shift[i] for i in range(7))] = coeff
+            eq[tuple(seed[i] + shift[i] for i in range(N_INDICES))] = coeff
     return eq
 
 
@@ -246,7 +268,7 @@ def action_introduces_higher_sector(cached_eq, sector_id):
 
 def get_integral_props(integral):
     """Get the set of propagator indices where integral has power >= 1."""
-    return {i for i in range(6) if integral[i] >= 1}
+    return {i for i in range(N_DENOMINATORS) if integral[i] >= 1}
 
 
 def is_lateral_sector(integral, sector_id):
@@ -261,7 +283,7 @@ def is_lateral_sector(integral, sector_id):
              sector 55 has props {0,1,2,4,5} - NOT lateral (superset)
     """
     int_props = get_integral_props(integral)
-    target_props = {i for i in range(6) if (sector_id >> i) & 1}
+    target_props = {i for i in range(N_DENOMINATORS) if (sector_id >> i) & 1}
     is_subset = int_props <= target_props
     is_superset = int_props >= target_props
     return not is_subset and not is_superset
@@ -297,8 +319,16 @@ def find_candidates(ibp_t, li_t, expr, num_ops, sector_id):
     return candidates
 
 
-def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id, filter_lateral=False):
-    """Scramble expression using only actions that don't introduce higher/lateral sectors."""
+def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id,
+             filter_lateral=False, bias_low_s_elim=False):
+    """Scramble expression using only actions that don't introduce higher/lateral sectors.
+
+    bias_low_s_elim: if True, when choosing which integral to eliminate from the
+        IBP equation, prefer integrals with LOW s (few ISP numerators). The elim
+        is replaced by the rest of the equation, so removing a low-s integral
+        tends to LEAVE high-s ones in the expression — pushing scramble outputs
+        toward the deep-ISP regime that the baseline underrepresents.
+    """
     expr = dict(start)
     used_ibps = []
 
@@ -326,7 +356,13 @@ def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id, filter_lateral=Fal
             if not top_only:
                 continue
 
-            elim = random.choice(top_only)
+            if bias_low_s_elim and len(top_only) > 1:
+                # Weight by 1/(1+s) so low-s integrals are heavily preferred.
+                # weight(k) returns (r, s, |abs|); we use s = weight(k)[1].
+                w = [1.0 / (1 + weight(k)[1]) for k in top_only]
+                elim = random.choices(top_only, weights=w)[0]
+            else:
+                elim = random.choice(top_only)
             sol = solve_ibp_for(raw, elim)
             if sol is None:
                 continue
@@ -368,7 +404,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
     # Direct actions: target directly in raw_ibp
     for ibp_op, shift_list in shifts.items():
         for shift in shift_list:
-            seed = tuple(target[i] - shift[i] for i in range(7))
+            seed = tuple(target[i] - shift[i] for i in range(N_INDICES))
             raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
@@ -383,7 +419,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
                 else:
                     if action_introduces_higher_sector(cached, sector_id):
                         continue
-            delta = tuple(seed[i] - target[i] for i in range(7))
+            delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
                 valid.append((ibp_op, delta))
@@ -392,7 +428,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
     for sub_int in subs:
         for ibp_op, shift_list in shifts.items():
             for shift in shift_list:
-                seed = tuple(sub_int[i] - shift[i] for i in range(7))
+                seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
                 raw = get_raw_equation(ibp_t, li_t, ibp_op, seed)
                 if sub_int not in raw or raw[sub_int] == 0:
                     continue
@@ -409,7 +445,7 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
                     else:
                         if action_introduces_higher_sector(cached, sector_id):
                             continue
-                delta = tuple(seed[i] - target[i] for i in range(7))
+                delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
                 if (ibp_op, delta) not in seen:
                     seen.add((ibp_op, delta))
                     valid.append((ibp_op, delta))
@@ -434,11 +470,23 @@ def subs_to_json(subs):
 # Main
 # =============================================================================
 
-def get_all_valid_sectors():
-    """
-    Get list of all 63 non-trivial sectors (sector_id 1-63).
-    """
+def get_all_valid_sectors_legacy_trianglebox():
+    """Trianglebox-specific: 63 non-trivial sectors (1..63)."""
     return list(range(1, 64))
+
+
+def get_all_valid_sectors():
+    """All candidate corner-sectors for the configured topology.
+
+    Returns every non-empty bitmask over the topology's N_DENOMINATORS
+    propagator positions, i.e., range(1, 2**N_DENOMINATORS).
+
+    For trianglebox this is 1..63 (=63 sectors), for pentagon-box 1..255
+    (=255 sectors). Note that SAILIR's data generator intentionally
+    iterates over ALL such corners, including ones Kira would flag as
+    trivial; the trivial ones just produce empty/zero trajectories.
+    """
+    return list(range(1, 1 << N_DENOMINATORS))
 
 
 def main():
@@ -446,6 +494,9 @@ def main():
 
     parser = argparse.ArgumentParser(
         description='Generate multi-sector IBP reduction training data')
+    parser.add_argument('--topology', type=str, required=True,
+                        help='Path to topology_input/<family>/ directory '
+                             '(e.g. topology_input/trianglebox)')
     parser.add_argument('--n_scrambles', type=int, default=1000,
                         help='Number of scramble trajectories to generate')
     parser.add_argument('--min_steps', type=int, default=5,
@@ -459,44 +510,70 @@ def main():
                         help='Starting random seed')
     parser.add_argument('--prime', type=int, default=1009,
                         help='Prime for modular arithmetic')
-    parser.add_argument('--ibp_path', type=str,
-                        default='scripts/data_gen/IBP',
-                        help='Path to IBP templates')
-    parser.add_argument('--li_path', type=str,
-                        default='scripts/data_gen/LI',
-                        help='Path to LI templates')
+    parser.add_argument('--ibp_path', type=str, default=None,
+                        help='Path to IBP templates (defaults to <topology>/IBP)')
+    parser.add_argument('--li_path', type=str, default=None,
+                        help='Path to LI templates (defaults to <topology>/LI)')
     parser.add_argument('--filter_lateral', action='store_true',
                         help='Also filter out actions that introduce lateral sector integrals')
+    parser.add_argument('--bias-low-s-elim', action='store_true',
+                        help='Bias scramble to prefer eliminating low-s integrals '
+                             '(so substituted-in terms are high-s). Pushes the '
+                             'output (r,s) distribution toward deep ISPs.')
+    parser.add_argument('--restrict-sectors', type=str, default=None,
+                        help='Comma-separated sector_ids to restrict scrambling to. '
+                             'If omitted, all valid sectors are used.')
     args = parser.parse_args()
 
     PRIME = args.prime
 
+    # Configure topology globals (N_INDICES, ISP_POSITIONS, KINEMATICS,
+    # PAPER_MASTERS, ...) before any parsing happens.
+    topology = Topology.from_dir(args.topology)
+    init_from_topology(topology)
+
+    if args.ibp_path is None:
+        args.ibp_path = str(Path(args.topology) / 'IBP')
+    if args.li_path is None:
+        args.li_path = str(Path(args.topology) / 'LI')
+
     print(f"=" * 70, flush=True)
     print(f"Multi-Sector IBP Training Data Generator", flush=True)
     print(f"=" * 70, flush=True)
+    print(f"Topology: {topology.name} (family={topology.family_name}, "
+          f"n_indices={N_INDICES}, n_denominators={N_DENOMINATORS}, "
+          f"ISPs={ISP_POSITIONS})", flush=True)
     print(f"PRIME = {PRIME}", flush=True)
     print(f"Scrambles: {args.n_scrambles}", flush=True)
     print(f"Steps: {args.min_steps}-{args.max_steps}", flush=True)
     print(f"Output: {args.output}", flush=True)
     print(f"Filter lateral sectors: {args.filter_lateral}", flush=True)
 
-    # Always use all 63 sectors
-    sector_list = get_all_valid_sectors()
-    print(f"Using all {len(sector_list)} sectors (1-63)", flush=True)
+    if args.restrict_sectors:
+        sector_list = [int(s) for s in args.restrict_sectors.split(',')]
+        print(f"Restricted to {len(sector_list)} sectors: {sector_list}", flush=True)
+    else:
+        sector_list = get_all_valid_sectors()
+        print(f"Using all {len(sector_list)} sectors "
+              f"(1..{(1 << N_DENOMINATORS) - 1})", flush=True)
+    print(f"bias_low_s_elim: {args.bias_low_s_elim}", flush=True)
 
     # Load IBP/LI templates
     ibp_t = parse_templates(args.ibp_path)
     li_t = parse_templates(args.li_path)
-    num_ops = len(ibp_t) + len(li_t)
-    print(f"Loaded {len(ibp_t)} IBP templates, {len(li_t)} LI templates", flush=True)
+    n_ibp = len(ibp_t)
+    n_li = len(li_t)
+    num_ops = n_ibp + n_li
+    print(f"Loaded {n_ibp} IBP templates, {n_li} LI templates "
+          f"(action space size {num_ops})", flush=True)
 
-    # Build shifts lookup
+    # Build shifts lookup. Action indices 0..n_ibp-1 are IBPs, n_ibp..n_ibp+n_li-1 are LIs.
     shifts = {}
-    for ibp_op in range(8):
+    for ibp_op in range(n_ibp):
         if ibp_op in ibp_t:
             shifts[ibp_op] = [s for s, _ in ibp_t[ibp_op]]
     for li_idx in li_t:
-        shifts[8 + li_idx] = [s for s, _ in li_t[li_idx]]
+        shifts[n_ibp + li_idx] = [s for s, _ in li_t[li_idx]]
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
@@ -526,7 +603,8 @@ def main():
             # Scramble
             n_steps = random.randint(args.min_steps, args.max_steps)
             scrambled, used_ibps = scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id,
-                                           filter_lateral=args.filter_lateral)
+                                           filter_lateral=args.filter_lateral,
+                                           bias_low_s_elim=args.bias_low_s_elim)
 
             if not used_ibps:
                 # Check if this is a vanishing corner (expression became empty or trivial)
@@ -579,7 +657,7 @@ def main():
                     break
 
                 idx, chosen_ibp_op, chosen_seed = found_action
-                chosen_delta = tuple(chosen_seed[i] - target[i] for i in range(7))
+                chosen_delta = tuple(chosen_seed[i] - target[i] for i in range(N_INDICES))
 
                 # Enumerate valid actions
                 valid_actions = enumerate_valid_actions(

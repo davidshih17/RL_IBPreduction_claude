@@ -1,0 +1,27 @@
+# Preprocess pentagonbox 10× raw JSONL into per-worker packed shards.
+# Uses Condor file transfer: input JSONL staged into scratch, output shard_N/
+# transferred back to data/pentagonbox_10x_packed/shard_N at job exit.
+#
+# Submit with the wrapper submit_preprocess_pentagonbox_10x_batched.sh to
+# throttle to ~200 concurrent jobs (avoids hammering NFS / metadata).
+universe                 = vanilla
+executable               = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/preprocess_shard_pentagonbox_10x.sh
+arguments                = $(Process)
+
+# Stage input via Condor file transfer (NOT direct NFS read in the job)
+should_transfer_files    = YES
+when_to_transfer_output  = ON_EXIT
+transfer_input_files     = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/data/pentagonbox_10x_raw_jsonl/multisector_data_worker$(Process).jsonl
+transfer_output_files    = shard_$(Process)
+transfer_output_remaps   = "shard_$(Process)=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/data/pentagonbox_10x_packed/shard_$(Process)"
+
+output                   = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/preprocess_pb_10x_shard_$(Process).out
+error                    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/preprocess_pb_10x_shard_$(Process).err
+log                      = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/preprocess_pb_10x_shard_$(Process).log
+
+request_cpus             = 1
+request_memory           = 6GB
+request_disk             = 1GB
+
+notification             = Error
+queue 1000
