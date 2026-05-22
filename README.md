@@ -7,20 +7,49 @@ Code, trained model, and benchmark data accompanying:
 > **Learning to Unscramble Feynman Loop Integrals with SAILIR**
 > David Shih, 2026. arXiv:2604.05034.
 
+## Topologies
+
+Phase-2 makes the pipeline **topology-agnostic**: every script (data-gen,
+preprocess, train, eval) takes a `--topology topology_input/<family>/`
+argument that selects the integral family at runtime. The repo ships with
+two configurations:
+
+- `topology_input/trianglebox/` — 2-loop triangle-box (6 propagators + 1 ISP),
+  the published phase-1 family. Used by all examples below unless noted.
+- `topology_input/pentagonbox/` — 2-loop pentagon-box, TA family from Kira
+  (8 propagators + 3 ISPs). See `topology_input/HOW_TO_DERIVE_FROM_KIRA.md`
+  for how to derive a new topology's inputs.
+
+Each topology directory contains:
+
+```
+integralfamilies.yaml   propagators + ISPs + symmetry classes
+kinematics.yaml         kinematic invariants (d, s_ij, ...) + their finite-field values
+IBP                     IBP identity templates (shift, coefficient)
+LI                      Lorentz-invariance identities
+masters                 Kira's master basis
+```
+
 ## Repository layout
 
 ```
 sailir/
-  ibp_env.py                 IBP environment (kinematics, identities, action enumeration)
-  classifier.py              Action classifier
+  topology.py            Topology dataclass; init_from_topology() configures the module
+  ibp_env.py             IBP environment (identities, action enumeration); topology-driven
+  classifier.py          Action classifier; encoder dims taken from the topology
+  symmetries.py          Sector-symmetry library (standalone, optional)
 scripts/
-  data_gen/                  Self-supervised trajectory generation + JSONL→tensor packing
-  train/train_classifier.py  Cross-entropy training
-  eval/                      Hierarchical async orchestrator + single-integral worker + replay
-  kira/                      Kira inputs for the comparison side of Fig. 3
-  plots/                     Fig. 2 and Fig. 3
-checkpoints/best_model.pt    Published trained model
-results/                     Benchmark CSVs and training log
+  data_gen/              Self-supervised trajectory generation + JSONL→tensor packing
+                         (now supports multi-file --input and per-worker sharding)
+  train/train_classifier.py
+                         Cross-entropy training with topology-aware collate
+  eval/                  Hierarchical async orchestrator + single-integral worker + replay
+  kira/                  Kira inputs for the comparison side of Fig. 3
+  plots/                 Fig. 2 and Fig. 3
+topology_input/<family>/ Per-topology config (see above)
+checkpoints/best_model.pt
+                         Published phase-1 trained model (trianglebox)
+results/                 Benchmark CSVs and training log
 ```
 
 ## Requirements
@@ -36,10 +65,11 @@ pip install torch numpy matplotlib
 
 ## Quick start
 
-Reduce a single integral with the published checkpoint:
+Reduce a single trianglebox integral with the published checkpoint:
 
 ```bash
 python scripts/eval/onestep_worker.py \
+    --topology topology_input/trianglebox \
     --integral 2,1,2,1,2,2,-4 \
     --model-checkpoint checkpoints/best_model.pt \
     --output reduction.pkl \
@@ -50,7 +80,7 @@ python scripts/eval/onestep_worker.py \
 python scripts/eval/replay_reduction_path.py --path reduction.pkl
 ```
 
-## End-to-end reproduction
+## End-to-end reproduction (trianglebox)
 
 ### 1. Generate training data
 
@@ -72,17 +102,23 @@ bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
 
 ```bash
 python scripts/data_gen/preprocess_to_tensors.py \
+    --topology   topology_input/trianglebox \
     --input      data/raw_jsonl/multisector_training_data.jsonl \
     --output_dir data/multisector/
 ```
 
 Defaults reproduce the paper's preprocessing: `--val_split 0.1`, `--test_split 0.1`, `--seed 42`. Produces `train.pt` (≈80%), `val.pt` (≈10%), `test.pt` (≈10%).
 
+`--input` accepts multiple files now (e.g. all per-worker JSONLs) and
+streams them in sequence, so no concatenation step is needed.
+
 ### 3. Train
 
 ```bash
 python scripts/train/train_classifier.py \
-    --data_dir data/multisector/ --output_dir checkpoints/ \
+    --topology   topology_input/trianglebox \
+    --data_dir   data/multisector/ \
+    --output_dir checkpoints/ \
     --epochs 30 --batch_size 256 --lr 4e-4 --prime 1009 --device cuda
 
 python scripts/plots/plot_training_curve.py --log results/training_log/train.log
@@ -100,6 +136,7 @@ mkdir -p logs results work-dir
 for I in "${INTEGRALS[@]}"; do
     label=$(echo "$I" | tr ',' '_' | tr '-' 'm')
     python -u scripts/eval/hierarchical_reduction.py \
+        --topology topology_input/trianglebox \
         --integral $I --output results/reduction_${label}.pkl \
         --work-dir work-dir/${label} \
         --model-checkpoint checkpoints/best_model.pt \
@@ -131,6 +168,80 @@ export KIRA=/path/to/kira/bin/kira
 export FERMATPATH=/path/to/fermat/fer64
 cd scripts/kira/ && ./run_benchmark_s7.sh
 ```
+
+## Pentagon-box (TA family)
+
+The pentagon-box pipeline mirrors the trianglebox flow with the
+`topology_input/pentagonbox` directory and the dedicated launcher set:
+
+### Data-gen
+
+```bash
+export SAILIR_DIR=$(pwd)
+export PYTHON=$(which python)
+
+condor_submit scripts/data_gen/datagen_pentagonbox.jdl     # 100 × 1000 (= 1×)
+# or:
+condor_submit scripts/data_gen/datagen_pentagonbox_10x.jdl # 1000 × 1000 (= 10×)
+```
+
+Output JSONLs land in `data/pentagonbox_raw_jsonl/` (or
+`data/pentagonbox_10x_raw_jsonl/` for the 10× run; seeds are offset to keep
+them disjoint from the 1× set).
+
+### Sharded preprocess (large datasets)
+
+For the 10× dataset, packing all ~13M samples in a single Python process
+would exhaust memory. Each worker JSONL is preprocessed independently into
+its own packed shard:
+
+```bash
+bash scripts/data_gen/submit_preprocess_pentagonbox_10x_batched.sh
+```
+
+This submits the 1000 shards in throttled batches via Condor file transfer
+(input staged into `$_CONDOR_SCRATCH_DIR`, output transferred back to
+`data/pentagonbox_10x_packed/shard_<N>/`). Each shard packs to
+`train.pt + val.pt + test.pt` (~115 MB total). At train time, wrap the
+shards in `torch.utils.data.ConcatDataset` with `torch.load(..., mmap=True)`
+to keep peak RAM bounded.
+
+### Train
+
+```bash
+condor_submit scripts/train/train_pentagonbox.sub
+```
+
+Or directly:
+
+```bash
+python scripts/train/train_classifier.py \
+    --topology   topology_input/pentagonbox \
+    --data_dir   data/pentagonbox_packed/ \
+    --output_dir checkpoints/pentagonbox/ \
+    --epochs 30 --batch_size 128 --lr 4e-4 --prime 1009 --device cuda
+```
+
+### Reduce
+
+Same as trianglebox, but with `--topology topology_input/pentagonbox` and an
+11-index integral, e.g.:
+
+```bash
+python scripts/eval/onestep_worker.py \
+    --topology topology_input/pentagonbox \
+    --integral 1,0,1,0,1,1,-1,0,0,0,-1 \
+    --model-checkpoint checkpoints/pentagonbox/best_model.pt \
+    --output reduction.pkl \
+    --beam_width 20 --prime 1009 -v
+```
+
+## Adding a new topology
+
+See `topology_input/HOW_TO_DERIVE_FROM_KIRA.md`. In brief, run Kira to
+extract: integralfamilies.yaml, kinematics.yaml, IBP+LI identity templates,
+and the master basis. Drop them into `topology_input/<family>/` and every
+script accepts that path via `--topology`.
 
 ## Citation
 
