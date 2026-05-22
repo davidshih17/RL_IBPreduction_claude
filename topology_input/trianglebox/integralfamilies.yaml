@@ -1,0 +1,26 @@
+# Two-loop triangle-box from arXiv:2502.05121
+#
+# Propagators (from eq. 2.2 in paper):
+#   D1 = k1^2
+#   D2 = k2^2
+#   D3 = (k1+k2)^2
+#   D4 = (k1+p1)^2
+#   D5 = (k2+p3)^2
+#   D6 = (k2-p1)^2
+#   D7 = (k1+p3)^2  (ISP - irreducible scalar product)
+#
+# Target integral: I(1,1,1,1,1,1,-3)
+# 16 master integrals
+
+integralfamilies:
+  - name: "trianglebox"
+    loop_momenta: [k1, k2]
+    top_level_sectors: [63]  # binary 111111 = all 6 propagators
+    propagators:
+      - ["k1", 0]           # D1 = k1^2
+      - ["k2", 0]           # D2 = k2^2
+      - ["k1+k2", 0]        # D3 = (k1+k2)^2
+      - ["k1+p1", 0]        # D4 = (k1+p1)^2
+      - ["k2+p3", 0]        # D5 = (k2+p3)^2
+      - ["k2-p1", 0]        # D6 = (k2-p1)^2
+      - ["k1+p3", 0]        # D7 = (k1+p3)^2 - ISP
