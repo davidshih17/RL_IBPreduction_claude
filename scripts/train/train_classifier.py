@@ -11,7 +11,6 @@ Usage:
 """
 
 import argparse
-import contextlib
 import json
 import os
 import time
@@ -20,7 +19,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.algorithms.join import Join
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
@@ -143,9 +141,11 @@ def _collate(samples, n_indices, n_denominators):
 
 
 def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_batches=None,
-                ddp_enabled=False):
+                max_iters=None):
+    """Run one training epoch. Returns RAW sums (not averages) so the caller
+    can compute correct sample-weighted means across DDP ranks."""
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     total_top1 = 0
     total_top5 = 0
     total_samples = 0
@@ -153,61 +153,63 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
     denom = f"/{total_batches}" if total_batches else ""
     t_prev = time.time()
 
-    # Join handles uneven per-rank iteration counts: when one rank's iterator
-    # is exhausted, Join provides "shadow" all-reduces (zero gradients) on its
-    # behalf so the still-active ranks' backward all-reduces stay aligned with
-    # NCCL's strict ordering requirement. Without this, uneven sample counts
-    # across ranks cause NCCL op queues to drift out of order at the
-    # train→val boundary, which manifests as a 10-min watchdog timeout.
-    join_cm = Join([model]) if ddp_enabled else contextlib.nullcontext()
+    for batch_idx, batch in enumerate(dataloader):
+        # Deterministic iteration cap — every DDP rank does EXACTLY max_iters
+        # backward passes, so NCCL allreduce queues stay aligned across ranks.
+        # This replaces the previous Join-based approach, which was probabilistic
+        # at scale (raced after 56K iterations / 2.5h wall time).
+        if max_iters is not None and batch_idx >= max_iters:
+            break
 
-    with join_cm:
-        for batch_idx, batch in enumerate(dataloader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            optimizer.zero_grad()
+        batch = {k: v.to(device) for k, v in batch.items()}
+        optimizer.zero_grad()
 
-            logits, _ = model(
-                batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
-                batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
-                batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
-                batch['sector_mask'], batch['target_integral']
-            )
+        logits, _ = model(
+            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
+            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+            batch['sector_mask'], batch['target_integral']
+        )
 
-            loss = F.cross_entropy(logits, batch['labels'])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+        loss = F.cross_entropy(logits, batch['labels'])
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-            bs = batch['labels'].size(0)
-            total_loss += loss.item() * bs
-            total_top1 += (logits.argmax(-1) == batch['labels']).sum().item()
-            _, top5 = logits.topk(min(5, logits.size(1)), dim=-1)
-            total_top5 += (top5 == batch['labels'].unsqueeze(1)).any(1).sum().item()
-            total_samples += bs
+        bs = batch['labels'].size(0)
+        total_loss += loss.item() * bs
+        total_top1 += (logits.argmax(-1) == batch['labels']).sum().item()
+        _, top5 = logits.topk(min(5, logits.size(1)), dim=-1)
+        total_top5 += (top5 == batch['labels'].unsqueeze(1)).any(1).sum().item()
+        total_samples += bs
 
-            if log_every > 0 and (batch_idx + 1) % log_every == 0:
-                now = time.time()
-                dt_ms = (now - t_prev) * 1000 / log_every
-                t_prev = now
-                print(f"  E{epoch} b{batch_idx+1}{denom} bs={bs} loss={loss.item():.4f} "
-                      f"top1={total_top1/total_samples:.3f} {dt_ms:.0f}ms/batch", flush=True)
+        if log_every > 0 and (batch_idx + 1) % log_every == 0:
+            now = time.time()
+            dt_ms = (now - t_prev) * 1000 / log_every
+            t_prev = now
+            print(f"  E{epoch} b{batch_idx+1}{denom} bs={bs} loss={loss.item():.4f} "
+                  f"top1={total_top1/total_samples:.3f} {dt_ms:.0f}ms/batch", flush=True)
 
-    if total_samples == 0:
-        # Edge case: rank's shard list was empty (e.g., smoke test with fewer
-        # shards than ranks). Return safe defaults so reduce_metrics still works.
-        return {'loss': 0.0, 'top1_acc': 0.0, 'top5_acc': 0.0}
-    return {'loss': total_loss/total_samples, 'top1_acc': total_top1/total_samples, 'top5_acc': total_top5/total_samples}
+    return {
+        'loss_sum': total_loss,
+        'top1_sum': total_top1,
+        'top5_sum': total_top5,
+        'n_samples': total_samples,
+    }
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, max_iters=None):
+    """Run validation. Returns RAW sums for sample-weighted aggregation."""
     model.eval()
-    total_loss = 0
+    total_loss = 0.0
     total_top1 = 0
     total_top5 = 0
     total_samples = 0
 
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
+        if max_iters is not None and batch_idx >= max_iters:
+            break
         batch = {k: v.to(device) for k, v in batch.items()}
         logits, _ = model(
             batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
@@ -223,9 +225,12 @@ def evaluate(model, dataloader, device):
         total_top5 += (top5 == batch['labels'].unsqueeze(1)).any(1).sum().item()
         total_samples += bs
 
-    if total_samples == 0:
-        return {'loss': 0.0, 'top1_acc': 0.0, 'top5_acc': 0.0}
-    return {'loss': total_loss/total_samples, 'top1_acc': total_top1/total_samples, 'top5_acc': total_top5/total_samples}
+    return {
+        'loss_sum': total_loss,
+        'top1_sum': total_top1,
+        'top5_sum': total_top5,
+        'n_samples': total_samples,
+    }
 
 
 def main():
@@ -280,12 +285,32 @@ def main():
     # DDP detection: torchrun sets LOCAL_RANK/RANK/WORLD_SIZE env vars.
     local_rank = int(os.environ.get('LOCAL_RANK', -1))
     ddp_enabled = local_rank >= 0
+
+    # Build manifest on rank 0 BEFORE CUDA is touched.
+    # multiprocessing.Pool uses fork, which is safe pre-CUDA-init.
+    # ~2-3 min one-time; cached to JSON for future runs.
+    if args.shards_dir and (not ddp_enabled or local_rank == 0):
+        manifest_path = Path(args.shards_dir) / 'manifest.json'
+        if not manifest_path.is_file():
+            print(f"[rank{max(local_rank,0)}] Building manifest at {manifest_path} "
+                  f"(one-time, ~2-3 min)...", flush=True)
+            from sharded_dataset import build_manifest as _bm
+            _bm(args.shards_dir)
+            print(f"[rank{max(local_rank,0)}] Manifest built.", flush=True)
+
     if ddp_enabled:
         dist.init_process_group(backend='nccl')
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = f'cuda:{local_rank}'
+        # CRITICAL: synchronize all ranks here. With --standalone rendezvous,
+        # init_process_group returns as soon as each rank registers with the
+        # store (microseconds) — it does NOT wait for other ranks. NCCL
+        # communicator is created lazily on first collective op. So if we
+        # don't barrier here, ranks 1/2 race ahead and try to read the manifest
+        # before rank 0 has finished building it.
+        dist.barrier(device_ids=[local_rank])
     else:
         rank = 0
         world_size = 1
@@ -356,20 +381,40 @@ def main():
                         f"dropping {len(shards_list)-n_keep})")
                 shards_list[:] = shards_list[:n_keep]
 
-        # Manifest gives exact samples/epoch; build once and cache.
+        # Manifest is guaranteed to exist here (built pre-DDP by rank 0).
         manifest_path = Path(args.shards_dir) / 'manifest.json'
-        if manifest_path.is_file():
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-            log(f"  manifest: {manifest_path} (cached)")
-        else:
-            log(f"  manifest not found — estimating sample counts from 5 shards")
-            manifest = None
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        log(f"  manifest: {manifest_path}")
 
-        n_train_samples = estimate_samples_per_epoch(train_shards, manifest, 'train')
-        n_val_samples = estimate_samples_per_epoch(val_shards, manifest, 'val')
-        log(f"  ~train samples/epoch (global): {n_train_samples:,}")
-        log(f"  ~val   samples/epoch (global): {n_val_samples:,}")
+        n_train_samples = sum(manifest['splits']['train'].get(str(p), 0) for p in train_shards)
+        n_val_samples = sum(manifest['splits']['val'].get(str(p), 0) for p in val_shards)
+        log(f"  train samples/epoch (global): {n_train_samples:,}")
+        log(f"  val   samples/epoch (global): {n_val_samples:,}")
+
+        # Per-rank exact batch counts (mirror the rank-stride in ShardedIBPDataset.__iter__).
+        rank_train_paths = train_shards[rank::world_size]
+        rank_val_paths = val_shards[rank::world_size]
+        local_train_samples = sum(manifest['splits']['train'][str(p)] for p in rank_train_paths)
+        local_val_samples = sum(manifest['splits']['val'][str(p)] for p in rank_val_paths)
+        local_train_batches = local_train_samples // args.batch_size
+        local_val_batches = local_val_samples // args.batch_size
+
+        # Global iteration cap = MIN across ranks. Every rank does EXACTLY this
+        # many backward passes per epoch → NCCL allreduce queues stay aligned by
+        # construction, no possibility of train→val boundary desync.
+        if ddp_enabled:
+            t = torch.tensor(local_train_batches, device=device, dtype=torch.long)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            train_iter_cap = int(t.item())
+            t = torch.tensor(local_val_batches, device=device, dtype=torch.long)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            val_iter_cap = int(t.item())
+        else:
+            train_iter_cap = local_train_batches
+            val_iter_cap = local_val_batches
+        log(f"  iteration cap: train={train_iter_cap}/rank, val={val_iter_cap}/rank "
+            f"(this rank had: {local_train_batches} train, {local_val_batches} val)")
 
         train_dataset = ShardedIBPDataset(
             train_shards, shuffle=True, buffer_shards=args.buffer_shards, seed=args.seed,
@@ -393,11 +438,9 @@ def main():
             collate_fn=collate, num_workers=args.num_workers, pin_memory=True,
             persistent_workers=False,
         )
-        # Per-rank batch count (used only for the progress denominator string).
-        approx_train_batches = max(1, n_train_samples // (args.batch_size * world_size))
-        approx_val_batches = max(1, n_val_samples // (args.batch_size * world_size))
-        log(f"  ~train batches/epoch/rank: {approx_train_batches:,}")
-        log(f"  ~val   batches/epoch/rank: {approx_val_batches:,}")
+        # Per-rank batch count for the progress denominator string.
+        approx_train_batches = train_iter_cap
+        approx_val_batches = val_iter_cap
     else:
         log("\nLoading packed tensors...")
         t0 = time.time()
@@ -420,6 +463,10 @@ def main():
                                 collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
         approx_train_batches = len(train_loader)
         approx_val_batches = len(val_loader)
+        # No cap needed for map-style dataset (DistributedSampler would give exact
+        # parity if DDP were enabled; we don't use DDP in --data_dir mode here).
+        train_iter_cap = None
+        val_iter_cap = None
 
         log(f"Train batches: {approx_train_batches}, Val batches: {approx_val_batches}")
 
@@ -502,16 +549,23 @@ def main():
             log_fp.write("epoch\ttrain_loss\ttrain_top1\ttrain_top5\tval_loss\tval_top1\tval_top5\tlr\twall_s\n")
             log_fp.flush()
 
-    def reduce_metrics(m):
-        """All-reduce a dict of scalar metrics across DDP ranks (mean)."""
-        if not ddp_enabled:
-            return m
-        out = {}
-        for k, v in m.items():
-            t = torch.tensor(float(v), device=device)
+    def aggregate_metrics(raw):
+        """Sum raw counts across DDP ranks then divide by global sample count.
+
+        Correct under uneven per-rank sample counts (where mean-of-means would
+        be biased). Also guarantees top5_acc >= top1_acc because we sum raw
+        counts before dividing.
+        """
+        loss_sum = raw['loss_sum']
+        top1_sum = raw['top1_sum']
+        top5_sum = raw['top5_sum']
+        n = raw['n_samples']
+        if ddp_enabled:
+            t = torch.tensor([loss_sum, top1_sum, top5_sum, n], device=device, dtype=torch.float64)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            out[k] = (t.item() / world_size)
-        return out
+            loss_sum, top1_sum, top5_sum, n = t.tolist()
+        n = max(int(n), 1)
+        return {'loss': loss_sum / n, 'top1_acc': top1_sum / n, 'top5_acc': top5_sum / n}
 
     log("\nStarting training...")
     log("=" * 70)
@@ -520,18 +574,18 @@ def main():
         t0 = time.time()
         if hasattr(train_dataset, 'set_epoch'):
             train_dataset.set_epoch(epoch)
-        train_m_local = train_epoch(
+        train_raw = train_epoch(
             model, train_loader, optimizer, device, epoch,
             log_every=args.log_every if is_main else 0,
             total_batches=approx_train_batches,
-            ddp_enabled=ddp_enabled,
+            max_iters=train_iter_cap,
         )
-        val_m_local = evaluate(model, val_loader, device)
+        val_raw = evaluate(model, val_loader, device, max_iters=val_iter_cap)
         scheduler.step()
 
-        # Aggregate across ranks so all log/save decisions use the global view.
-        train_m = reduce_metrics(train_m_local)
-        val_m = reduce_metrics(val_m_local)
+        # Sample-weighted aggregation across DDP ranks.
+        train_m = aggregate_metrics(train_raw)
+        val_m = aggregate_metrics(val_raw)
 
         wall = time.time() - t0
         cur_lr = optimizer.param_groups[0]['lr']

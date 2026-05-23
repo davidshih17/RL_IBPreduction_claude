@@ -55,14 +55,30 @@ def discover_shards(shards_dir: str | os.PathLike, split: str) -> List[Path]:
     return files
 
 
-def build_manifest(shards_dir: str | os.PathLike, splits=('train', 'val', 'test'),
-                   force: bool = False) -> dict:
-    """
-    Cache per-shard sample counts in <shards_dir>/manifest.json so we know
-    samples-per-epoch without re-loading every shard at startup.
+def _count_shard_samples(path: str) -> tuple:
+    """Worker function for parallel manifest build. Top-level so it pickles."""
+    import torch as _torch
+    d = _torch.load(path, weights_only=False)
+    n = int(len(d['labels']))
+    del d
+    return (path, n)
 
-    Returns the manifest dict: {split: {shard_path: n_samples, ...}, total_samples: {...}}.
+
+def build_manifest(shards_dir: str | os.PathLike, splits=('train', 'val', 'test'),
+                   force: bool = False, n_workers: int = 16) -> dict:
     """
+    Cache per-shard sample counts in <shards_dir>/manifest.json so the training
+    loop can compute exact per-rank batch counts without re-loading every shard.
+
+    Returns the manifest dict: {'splits': {split: {shard_path: n}, ...},
+    'totals': {split: n_total}}. Parallelized with `n_workers` processes.
+
+    Cost: ~2-3 min for 2000 shards at n_workers=16. Cached to JSON; subsequent
+    calls return instantly from disk unless force=True.
+    """
+    import time as _time
+    from multiprocessing import Pool
+
     root = Path(shards_dir)
     manifest_path = root / 'manifest.json'
     if manifest_path.is_file() and not force:
@@ -72,22 +88,35 @@ def build_manifest(shards_dir: str | os.PathLike, splits=('train', 'val', 'test'
     manifest = {'splits': {}, 'totals': {}}
     for split in splits:
         files = discover_shards(root, split)
-        counts = {}
-        print(f"[manifest] scanning {len(files)} {split} shards...", flush=True)
-        for i, path in enumerate(files):
-            # weights_only=False because subs_raw is a Python list. We could
-            # try mmap=True but it doesn't skip the pickle of non-tensor fields,
-            # so the speedup is small and not worth the conditional.
-            d = torch.load(path, weights_only=False)
-            counts[str(path)] = int(len(d['labels']))
-            del d
-            if (i + 1) % 100 == 0:
-                print(f"[manifest]   {split}: {i+1}/{len(files)}", flush=True)
+        if not files:
+            manifest['splits'][split] = {}
+            manifest['totals'][split] = 0
+            continue
+        t0 = _time.time()
+        print(f"[manifest] scanning {len(files)} {split} shards with {n_workers} workers...", flush=True)
+        # Pool.imap_unordered for progress feedback; chunksize amortizes IPC.
+        chunksize = max(1, len(files) // (n_workers * 4))
+        counts: dict = {}
+        with Pool(n_workers) as pool:
+            for i, (p, n) in enumerate(pool.imap_unordered(_count_shard_samples,
+                                                           [str(f) for f in files],
+                                                           chunksize=chunksize)):
+                counts[p] = n
+                if (i + 1) % 200 == 0 or (i + 1) == len(files):
+                    elapsed = _time.time() - t0
+                    rate = (i + 1) / elapsed
+                    print(f"[manifest]   {split}: {i+1}/{len(files)}  "
+                          f"({rate:.1f} shard/s, ETA {(len(files)-i-1)/rate:.0f}s)", flush=True)
         manifest['splits'][split] = counts
         manifest['totals'][split] = sum(counts.values())
+        print(f"[manifest]   {split}: total {manifest['totals'][split]:,} samples "
+              f"in {_time.time()-t0:.1f}s", flush=True)
 
-    with open(manifest_path, 'w') as f:
+    # Atomic write so a crash mid-build can't leave a corrupt manifest.
+    tmp = manifest_path.with_suffix('.json.tmp')
+    with open(tmp, 'w') as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp, manifest_path)
     print(f"[manifest] wrote {manifest_path}", flush=True)
     return manifest
 

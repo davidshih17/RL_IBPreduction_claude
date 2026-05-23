@@ -1,7 +1,9 @@
 #!/bin/bash
-# DDP smoke test: 9 train shards + 9 val shards (3 per rank), 3 epochs.
+# DDP smoke test: 50 train shards + 9 val shards, 5 epochs (~30 min).
 #
-# Designed to catch end-of-epoch / train→val NCCL desync bugs in <5 minutes.
+# Sized to actually exercise the failure mode that 9/3-shard smoke missed:
+# scale-dependent NCCL desync at epoch boundaries shows up only after
+# thousands of iterations / dozens of minutes of wall time.
 # Exercises the full pipeline:
 #   - DDP init (3 ranks)
 #   - Sharded streaming dataset with rank-stride partition
@@ -40,16 +42,17 @@ LOG=logs/smoke_test_ddp.log
 
 echo "Smoke test launched: $(date -Iseconds)" | tee -a "$LOG"
 
-# Run in foreground (smoke test is short, want to see output and final exit code).
-torchrun --standalone --nnodes=1 --nproc_per_node=3 \
+# Detached via nohup so the job survives terminal/session disconnect.
+# Use `tail -f $LOG` to watch. PID written to a file for easy kill if needed.
+nohup torchrun --standalone --nnodes=1 --nproc_per_node=3 \
     scripts/train/train_classifier.py \
     --topology       topology_input/pentagonbox \
     --shards_dir     data/pentagonbox_10x_packed \
-    --max_train_shards 9 \
+    --max_train_shards 50 \
     --n_val_shards   9 \
-    --buffer_shards  2 \
+    --buffer_shards  4 \
     --output_dir     smoke_checkpoints \
-    --epochs         3 \
+    --epochs         5 \
     --batch_size     64 \
     --lr             4e-4 \
     --prime          1009 \
@@ -58,31 +61,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=3 \
     --checkpoint_every 1 \
     --log_every      20 \
     --seed           0 \
-    2>&1 | tee -a "$LOG"
+    >> "$LOG" 2>&1 &
 
-RC=${PIPESTATUS[0]}
-echo "" | tee -a "$LOG"
-echo "Smoke test exit code: $RC" | tee -a "$LOG"
-
-# Validate expected outputs.
-echo "" | tee -a "$LOG"
-echo "=== Validation ===" | tee -a "$LOG"
-for f in smoke_checkpoints/last.pt smoke_checkpoints/best_model.pt \
-         smoke_checkpoints/checkpoint_epoch1.pt smoke_checkpoints/checkpoint_epoch2.pt \
-         smoke_checkpoints/checkpoint_epoch3.pt smoke_checkpoints/final_model.pt; do
-    if [ -f "$f" ]; then
-        echo "  OK  $f ($(du -h "$f" | cut -f1))" | tee -a "$LOG"
-    else
-        echo "  MISSING  $f" | tee -a "$LOG"
-        RC=99
-    fi
-done
-
-# Final verdict.
-echo "" | tee -a "$LOG"
-if [ $RC -eq 0 ]; then
-    echo "SMOKE TEST PASSED" | tee -a "$LOG"
-else
-    echo "SMOKE TEST FAILED (exit $RC)" | tee -a "$LOG"
-fi
-exit $RC
+PID=$!
+echo "$PID" > logs/smoke_test_ddp.pid
+echo "Started PID=$PID. Tail with: tail -f $LOG" | tee -a "$LOG"
+echo "Kill with: kill \$(cat logs/smoke_test_ddp.pid)" | tee -a "$LOG"
