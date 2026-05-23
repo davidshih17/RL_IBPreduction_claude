@@ -27,3 +27,11 @@ scratch/
 data/
 *.jsonl
 *.jsonl.gz
+
+# Training output (the published phase-1 model at checkpoints/best_model.pt
+# is committed; everything else under checkpoints/ is per-run output).
+checkpoints/pentagonbox/
+checkpoints/*/last.pt
+checkpoints/*/checkpoint_epoch*.pt
+checkpoints/*/final_model.pt
+smoke_checkpoints/
