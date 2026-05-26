@@ -482,6 +482,55 @@ def is_subsector(integral, target):
     return True
 
 
+# Process-wide cache mapping integral tuple -> sector bitmask.
+# Memoizes the (otherwise) per-call 11-element loop. Each entry is ~100 bytes
+# (tuple key + small int + dict slot); the cache size is bounded by the
+# number of unique integrals seen by this worker process (typically 100k-1M
+# during a long reduction = 10-100 MB).
+_BITMASK_CACHE = {}
+
+
+def sector_bitmask(integral):
+    """Compute a sector bitmask: bit i set iff integral[i] > 0.
+
+    Memoized in `_BITMASK_CACHE` (process-wide). Used to vectorize
+    is_subsector checks. Equivalent to:
+        is_subsector(integral, target) == ((bitmask(integral) & ~bitmask(target)) == 0).
+    """
+    bm = _BITMASK_CACHE.get(integral)
+    if bm is None:
+        bm = 0
+        for i in range(N_INDICES):
+            if integral[i] > 0:
+                bm |= (1 << i)
+        _BITMASK_CACHE[integral] = bm
+    return bm
+
+
+def cached_union_bitmask(cached_eq):
+    """OR of sector bitmasks across cached_eq.keys().
+
+    By distributivity, action_introduces_outside_sector(cached_eq, target)
+    becomes ((union_bm & ~target_bm) != 0) — one bitwise check instead of an
+    iteration over every key. Stored once per indirect_cache entry to make
+    the per-target filter check O(1). Uses _BITMASK_CACHE so repeated
+    integrals across many indirect_cache entries are looked up, not
+    recomputed.
+    """
+    u = 0
+    cache = _BITMASK_CACHE  # local alias for inner-loop speed
+    for k in cached_eq:
+        bm = cache.get(k)
+        if bm is None:
+            bm = 0
+            for i in range(N_INDICES):
+                if k[i] > 0:
+                    bm |= (1 << i)
+            cache[k] = bm
+        u |= bm
+    return u
+
+
 def action_introduces_outside_sector(cached_eq, target):
     """Check if an IBP equation introduces integrals outside target's sector hierarchy.
 
@@ -918,6 +967,113 @@ def apply_resolved_subs_batch(raw_eqs, resolved_subs, verbose_timing=False):
     return results
 
 
+def _substitute_one_in_cached(cached, sub_key, replacement):
+    """Substitute sub_key -> replacement in cached, returning a NEW dict.
+    If sub_key not in cached, returns the original cached (shared reference).
+    """
+    if sub_key not in cached:
+        return cached
+    new_cached = dict(cached)
+    coeff = new_cached.pop(sub_key)
+    for k, v in replacement.items():
+        nc = (coeff * v) % PRIME
+        if k in new_cached:
+            s = (new_cached[k] + nc) % PRIME
+            if s == 0:
+                del new_cached[k]
+            else:
+                new_cached[k] = s
+        elif nc != 0:
+            new_cached[k] = nc
+    return new_cached
+
+
+def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved_sol,
+                                              new_resolved_subs, ibp_t, li_t, shifts,
+                                              raw_eq_cache):
+    """Incrementally update indirect_cache state for one new substitution.
+
+    Given prev_aux = (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+    from a previous compute (at step N with resolved_subs not yet containing
+    new_sub_int), build the state at step N+1 where new_sub_int has been
+    added with new_resolved_sol = (already-resolved-against-old-resolved_subs).
+
+    Correctness: NEW resolved_subs equals OLD plus the new entry. For each
+    old cached (which has no keys from OLD), applying NEW is equivalent to
+    substituting just new_sub_int -> new_resolved_sol (we can prove the
+    OLD-key values that changed are not in old cached).
+
+    Returns: (result, new_aux) in same shape as compute_indirect_substituted +
+             returned aux for chaining further incremental calls.
+    """
+    prev_cu, prev_ubm, prev_rid, prev_iraws = prev_aux
+
+    # Phase A: update existing cached entries to substitute new_sub_int.
+    new_cu = []
+    new_ubm = []
+    for old_c, old_ub in zip(prev_cu, prev_ubm):
+        new_c = _substitute_one_in_cached(old_c, new_sub_int, new_resolved_sol)
+        if new_c is old_c:
+            new_cu.append(old_c)
+            new_ubm.append(old_ub)
+        else:
+            new_cu.append(new_c)
+            new_ubm.append(cached_union_bitmask(new_c))
+
+    new_rid = dict(prev_rid)
+
+    # Phase B: add new raws coming from new_sub_int.
+    if '_sub_cache' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache'] = {}
+    sub_cache = raw_eq_cache['_sub_cache']
+
+    def _get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    if new_sub_int in sub_cache:
+        new_raw_list = sub_cache[new_sub_int]
+    else:
+        new_raw_list = []
+        for ibp_op, shift_list in shifts.items():
+            for shift in shift_list:
+                seed = tuple(new_sub_int[i] - shift[i] for i in range(N_INDICES))
+                raw = _get_raw_cached(ibp_op, seed)
+                if new_sub_int in raw and raw[new_sub_int] != 0:
+                    new_raw_list.append((ibp_op, shift, raw))
+        sub_cache[new_sub_int] = new_raw_list
+
+    new_iraws_for_new = [(new_sub_int, op, sh, r) for op, sh, r in new_raw_list]
+
+    raws_to_apply = []
+    for sub_int, op, sh, raw in new_iraws_for_new:
+        rid = id(raw)
+        if rid not in new_rid:
+            # Reserve the slot index BEFORE applying. Multiple unique raws
+            # each get their own index — must add len(raws_to_apply) so they
+            # don't all collapse to the same len(new_cu) value.
+            new_rid[rid] = len(new_cu) + len(raws_to_apply)
+            raws_to_apply.append(raw)
+
+    if raws_to_apply:
+        new_cacheds = apply_resolved_subs_batch(raws_to_apply, new_resolved_subs)
+        for c in new_cacheds:
+            new_cu.append(c)
+            new_ubm.append(cached_union_bitmask(c))
+
+    new_iraws = prev_iraws + new_iraws_for_new
+
+    # Build result list (same format as compute_indirect_substituted).
+    result = []
+    for sub_int, op, sh, raw in new_iraws:
+        idx = new_rid[id(raw)]
+        result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
+
+    return result, (new_cu, new_ubm, new_rid, new_iraws)
+
+
 def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_eq_cache):
     """Precompute substituted indirect raw equations for a state.
 
@@ -932,8 +1088,17 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
         raw_eq_cache: cache for raw equations
 
     Returns:
-        list of (sub_int, ibp_op, shift, raw, cached) tuples
+        list of (sub_int, ibp_op, shift, raw, cached, union_bm) tuples.
+        (Use compute_indirect_substituted_with_aux to also get aux state
+        for incremental chaining.)
+
+    When env BEAM_PROFILE_CIC is set, accumulates per-phase timings into
+    the module-global list `_CIC_PROFILE`.
     """
+    import os, time as _time
+    _profile = bool(os.environ.get("BEAM_PROFILE_CIC"))
+    _t0 = _time.time()
+
     def get_raw_cached(ibp_op, seed):
         key = (ibp_op, seed)
         if key not in raw_eq_cache:
@@ -945,14 +1110,17 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
         raw_eq_cache['_sub_cache'] = {}
     sub_cache = raw_eq_cache['_sub_cache']
 
-    # Collect all unique indirect raw equations
+    # Phase 1: collect indirect raw equations
+    _t_phase = _time.time()
     indirect_raws = []  # List of (sub_int, ibp_op, shift, raw)
     seen_raws = set()  # Track unique raws by id to avoid duplicate subs application
+    n_sub_cache_misses = 0
 
     for sub_int in subs:
         if sub_int in sub_cache:
             raw_list = sub_cache[sub_int]
         else:
+            n_sub_cache_misses += 1
             raw_list = []
             for ibp_op, shift_list in shifts.items():
                 for shift in shift_list:
@@ -965,12 +1133,20 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
         for ibp_op, shift, raw in raw_list:
             indirect_raws.append((sub_int, ibp_op, shift, raw))
             seen_raws.add(id(raw))
+    t_phase1 = _time.time() - _t_phase
 
     if not indirect_raws:
+        if _profile:
+            globals().setdefault('_CIC_PROFILE', []).append({
+                't_total': _time.time() - _t0, 't_phase1_collect': t_phase1,
+                't_phase2_dedup': 0.0, 't_phase3_apply_subs': 0.0,
+                't_phase4_union_bm': 0.0, 't_phase5_build': 0.0,
+                'n_indirect_raws': 0, 'n_unique_raws': 0,
+                'n_sub_cache_misses': n_sub_cache_misses})
         return []
 
-    # Apply subs to all unique raw equations
-    # Build mapping from raw id to index for deduplication
+    # Phase 2: deduplicate raws by id
+    _t_phase = _time.time()
     unique_raws = []
     raw_id_to_idx = {}
     for sub_int, ibp_op, shift, raw in indirect_raws:
@@ -978,17 +1154,102 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
         if raw_id not in raw_id_to_idx:
             raw_id_to_idx[raw_id] = len(unique_raws)
             unique_raws.append(raw)
+    t_phase2 = _time.time() - _t_phase
 
-    # Apply subs once to unique raws
+    # Phase 3: apply subs to unique raws
+    _t_phase = _time.time()
     cached_unique = apply_resolved_subs_batch(unique_raws, resolved_subs)
+    t_phase3 = _time.time() - _t_phase
 
-    # Build result with cached versions
+    # Phase 4: compute OR-union sector bitmasks
+    _t_phase = _time.time()
+    union_bms = [cached_union_bitmask(c) for c in cached_unique]
+    t_phase4 = _time.time() - _t_phase
+
+    # Phase 5: build result list
+    _t_phase = _time.time()
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        cached = cached_unique[raw_id_to_idx[id(raw)]]
-        result.append((sub_int, ibp_op, shift, raw, cached))
+        idx = raw_id_to_idx[id(raw)]
+        cached = cached_unique[idx]
+        union_bm = union_bms[idx]
+        result.append((sub_int, ibp_op, shift, raw, cached, union_bm))
+    t_phase5 = _time.time() - _t_phase
+
+    if _profile:
+        globals().setdefault('_CIC_PROFILE', []).append({
+            't_total': _time.time() - _t0,
+            't_phase1_collect': t_phase1,
+            't_phase2_dedup': t_phase2,
+            't_phase3_apply_subs': t_phase3,
+            't_phase4_union_bm': t_phase4,
+            't_phase5_build': t_phase5,
+            'n_indirect_raws': len(indirect_raws),
+            'n_unique_raws': len(unique_raws),
+            'n_sub_cache_misses': n_sub_cache_misses,
+        })
 
     return result
+
+
+def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
+                                            shifts, raw_eq_cache):
+    """Full compute that ALSO returns aux state for chaining incremental updates.
+
+    Returns: (result, aux_state) where
+        aux_state = (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+
+    Pass aux_state to compute_indirect_substituted_incremental on the next step.
+    """
+    # Reuse the same logic by recomputing locally — we need access to the
+    # intermediate variables that the standard function doesn't expose. The
+    # cost of this is identical to compute_indirect_substituted itself.
+    if '_sub_cache' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache'] = {}
+    sub_cache = raw_eq_cache['_sub_cache']
+
+    def _grc(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    indirect_raws = []
+    for sub_int in subs:
+        if sub_int in sub_cache:
+            raw_list = sub_cache[sub_int]
+        else:
+            raw_list = []
+            for ibp_op, shift_list in shifts.items():
+                for shift in shift_list:
+                    seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+                    raw = _grc(ibp_op, seed)
+                    if sub_int in raw and raw[sub_int] != 0:
+                        raw_list.append((ibp_op, shift, raw))
+            sub_cache[sub_int] = raw_list
+        for ibp_op, shift, raw in raw_list:
+            indirect_raws.append((sub_int, ibp_op, shift, raw))
+
+    if not indirect_raws:
+        return [], ([], [], {}, [])
+
+    unique_raws = []
+    raw_id_to_idx = {}
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        rid = id(raw)
+        if rid not in raw_id_to_idx:
+            raw_id_to_idx[rid] = len(unique_raws)
+            unique_raws.append(raw)
+
+    cached_unique = apply_resolved_subs_batch(unique_raws, resolved_subs)
+    union_bms = [cached_union_bitmask(c) for c in cached_unique]
+
+    result = []
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        idx = raw_id_to_idx[id(raw)]
+        result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
+
+    return result, (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
 
 
 def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache, verbose_timing=False):
@@ -1005,8 +1266,16 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
 
     Returns:
         list of (ibp_op, delta) tuples representing valid actions
+
+    When env BEAM_PROFILE_CSV is set, accumulates fine-grained per-call
+    counters (#entries, #passing each short-circuit, time per phase,
+    avg cached-dict size for surviving entries) into a module-global
+    dict `_GETVALID_PROFILE` keyed by call_id. The caller can flush
+    these to a sibling profile CSV.
     """
     import time as _time
+    import os
+    _detailed_profile = bool(os.environ.get("BEAM_PROFILE_CSV"))
     t_start = _time.time()
 
     # Choose filter function
@@ -1018,6 +1287,13 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
         should_filter = lambda eq, tgt: False
     else:
         raise ValueError(f"Unknown filter_mode: {filter_mode}")
+
+    # Fast path: for the 'subsector' filter, the check is equivalent to a
+    # single bitwise op (union_bm & ~target_bm != 0). The union_bm is
+    # precomputed once per indirect_cache entry (see compute_indirect_substituted).
+    fast_subsector_filter = (filter_mode == 'subsector')
+    target_bm = sector_bitmask(target) if fast_subsector_filter else None
+    not_target_bm = (~target_bm) if fast_subsector_filter else None
 
     def get_raw_cached(ibp_op, seed):
         key = (ibp_op, seed)
@@ -1040,8 +1316,12 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
             cached = apply_resolved_subs(raw, resolved_subs)
             if target not in cached or cached[target] == 0:
                 continue
-            if should_filter(cached, target):
-                continue
+            if fast_subsector_filter:
+                if (cached_union_bitmask(cached) & not_target_bm) != 0:
+                    continue
+            else:
+                if should_filter(cached, target):
+                    continue
             delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
             if (ibp_op, delta) not in seen:
                 seen.add((ibp_op, delta))
@@ -1052,18 +1332,56 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
     t1b = _time.time()
     n_indirect_checked = 0
     n_indirect_valid = 0
+    n_pass_sc1 = 0           # passed "target not in raw" short-circuit (we keep going)
+    n_pass_sc2 = 0           # passed "target in cached" short-circuit
+    n_pass_filter = 0        # passed sector filter
+    t_sc1 = 0.0              # time on the target-in-raw check
+    t_sc2 = 0.0              # time on the target-in-cached check
+    t_filter_in_loop = 0.0   # time inside should_filter calls
+    sum_cached_size = 0      # cumulative |cached| for entries that hit sc2
+    sum_should_filter_cached_size = 0  # cumulative |cached| for entries that reached filter
 
-    for sub_int, ibp_op, shift, raw, cached in indirect_cache:
+    for sub_int, ibp_op, shift, raw, cached, union_bm in indirect_cache:
         n_indirect_checked += 1
-        # Check target not in raw (before subs)
-        if target in raw and raw[target] != 0:
-            continue
-        # Check target in cached (after subs)
-        if target not in cached or cached[target] == 0:
-            continue
-        # Check sector filter
-        if should_filter(cached, target):
-            continue
+        if _detailed_profile:
+            _t = _time.time()
+            in_raw = target in raw and raw[target] != 0
+            t_sc1 += _time.time() - _t
+            if in_raw:
+                continue
+        else:
+            if target in raw and raw[target] != 0:
+                continue
+        n_pass_sc1 += 1
+        if _detailed_profile:
+            _t = _time.time()
+            sc2_fail = target not in cached or cached[target] == 0
+            t_sc2 += _time.time() - _t
+            if sc2_fail:
+                continue
+        else:
+            if target not in cached or cached[target] == 0:
+                continue
+        n_pass_sc2 += 1
+        if _detailed_profile:
+            sum_cached_size += len(cached)
+            sum_should_filter_cached_size += len(cached)
+            _t = _time.time()
+            if fast_subsector_filter:
+                filt = (union_bm & not_target_bm) != 0
+            else:
+                filt = should_filter(cached, target)
+            t_filter_in_loop += _time.time() - _t
+            if filt:
+                continue
+        else:
+            if fast_subsector_filter:
+                if (union_bm & not_target_bm) != 0:
+                    continue
+            else:
+                if should_filter(cached, target):
+                    continue
+        n_pass_filter += 1
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
         if (ibp_op, delta) not in seen:
@@ -1073,6 +1391,23 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
     t1b_elapsed = _time.time() - t1b
 
     total_elapsed = _time.time() - t_start
+
+    if _detailed_profile:
+        prof = globals().setdefault('_GETVALID_PROFILE', [])
+        prof.append({
+            'n_indirect_checked': n_indirect_checked,
+            'n_pass_sc1': n_pass_sc1,
+            'n_pass_sc2': n_pass_sc2,
+            'n_pass_filter': n_pass_filter,
+            't_sc1': t_sc1,
+            't_sc2': t_sc2,
+            't_filter_in_loop': t_filter_in_loop,
+            't_p1a_direct': t1a_elapsed,
+            't_p1b_indirect': t1b_elapsed,
+            't_total': total_elapsed,
+            'sum_cached_size_at_sc2': sum_cached_size,
+            'sum_cached_size_at_filter': sum_should_filter_cached_size,
+        })
 
     if verbose_timing:
         print(f"      [enumerate_cached] total={total_elapsed:.3f}s | "

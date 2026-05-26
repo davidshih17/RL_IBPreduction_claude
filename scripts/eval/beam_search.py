@@ -15,21 +15,25 @@ Usage:
 """
 
 import sys
+import math
 import argparse
 from pathlib import Path
 from collections import namedtuple
 import multiprocessing as mp
 from functools import partial
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent.parent))
 
 import numpy as np
 import torch
-from ibp_env import (
+from sailir import ibp_env
+from sailir.ibp_env import (
     IBPEnvironment, set_prime, filter_top_sector, is_master, weight, resolve_subs,
     filter_subs_to_exact_sector, filter_resolved_subs_to_exact_sector
 )
-from classifier import IBPActionClassifier
+from sailir.classifier import IBPActionClassifier
+from sailir.topology import Topology
 
 # Reuse core functions from v4
 from beam_search_utils import (
@@ -63,33 +67,83 @@ def process_state_tasks(args):
               where targets_info is [(task_idx, target), ...]
 
     Returns:
-        List of (task_idx, valid_actions) tuples
+        Tuple (results_list, state_idx, profile_data_or_None). profile_data is
+        a dict with sizes + timings if env var BEAM_PROFILE_CSV is set, else None.
     """
     global _worker_env
+    import os, time
 
     state_idx, state_subs, state_resolved_subs, targets_info, target_sector, filter_mode = args
+    profile = bool(os.environ.get("BEAM_PROFILE_CSV"))
+    profile_data = None
+    if profile:
+        profile_data = {
+            'state_idx': state_idx,
+            'len_subs': len(state_subs),
+            'len_resolved': len(state_resolved_subs),
+            'sum_resolved_value_sizes': sum(len(v) for v in state_resolved_subs.values()),
+            'n_targets': len(targets_info),
+        }
 
     # Filter subs for this state
+    t0 = time.time() if profile else 0
     if target_sector is not None:
         filtered_subs = filter_subs_to_exact_sector(state_subs, target_sector)
         filtered_resolved = filter_resolved_subs_to_exact_sector(state_resolved_subs, target_sector)
     else:
         filtered_subs = state_subs
         filtered_resolved = state_resolved_subs
+    if profile:
+        profile_data['t_filter'] = time.time() - t0
+        profile_data['len_filtered_subs'] = len(filtered_subs)
+        profile_data['len_filtered_resolved'] = len(filtered_resolved)
+        profile_data['sum_filtered_resolved_value_sizes'] = sum(
+            len(v) for v in filtered_resolved.values())
 
     # Compute indirect cache ONCE for this state
+    t0 = time.time() if profile else 0
     indirect_cache = _worker_env.compute_indirect_cache(filtered_subs, filtered_resolved)
+    if profile:
+        profile_data['t_compute_indirect_cache'] = time.time() - t0
+        profile_data['len_indirect_cache'] = len(indirect_cache)
 
     # Get valid actions for each target
     results = []
+    t_get_valid_total = 0.0
+    if profile:
+        # Clear any prior accumulator in this worker process so we only
+        # capture per-state get-valid profile rows.
+        from sailir import ibp_env as _ibp_env_mod
+        _ibp_env_mod._GETVALID_PROFILE = []
     for task_idx, target in targets_info:
+        t0 = time.time() if profile else 0
         valid_actions = _worker_env.get_valid_actions_with_cache(
             target, indirect_cache, filtered_subs, filtered_resolved,
             filter_mode=filter_mode, verbose_timing=False
         )
+        if profile:
+            t_get_valid_total += time.time() - t0
         results.append((task_idx, valid_actions))
 
-    return results
+    if profile:
+        profile_data['t_get_valid_total'] = t_get_valid_total
+        # Aggregate get-valid sub-counters across all targets in this state.
+        agg = {
+            'n_calls': 0, 'n_indirect_checked': 0,
+            'n_pass_sc1': 0, 'n_pass_sc2': 0, 'n_pass_filter': 0,
+            't_sc1': 0.0, 't_sc2': 0.0, 't_filter_in_loop': 0.0,
+            't_p1a_direct': 0.0, 't_p1b_indirect': 0.0,
+            'sum_cached_size_at_sc2': 0, 'sum_cached_size_at_filter': 0,
+        }
+        for row in _ibp_env_mod._GETVALID_PROFILE:
+            agg['n_calls'] += 1
+            for k in agg:
+                if k == 'n_calls':
+                    continue
+                agg[k] += row[k]
+        profile_data['getvalid'] = agg
+
+    return (results, state_idx, profile_data)
 
 
 def apply_actions_worker(args):
@@ -120,7 +174,8 @@ def apply_actions_worker(args):
         n_non_masters = 0
         for integral in new_expr.keys():
             if target_sector is not None:
-                sector = tuple(1 if integral[i] > 0 else 0 for i in range(6))
+                sector = tuple(1 if integral[i] > 0 else 0
+                                for i in range(ibp_env.N_DENOMINATORS))
                 if sector != target_sector:
                     continue
             if not is_master(integral):
@@ -149,23 +204,26 @@ def prepare_batched_input_v5(batch_data, device):
     max_actions = max(len(d[2]) for d in batch_data)
     max_actions = min(max_actions, 900)
 
+    N = ibp_env.N_INDICES
+    D = ibp_env.N_DENOMINATORS
+
     # Allocate numpy arrays
-    expr_integrals_np = np.zeros((batch_size, max_terms, 7), dtype=np.int64)
+    expr_integrals_np = np.zeros((batch_size, max_terms, N), dtype=np.int64)
     expr_coeffs_np = np.zeros((batch_size, max_terms), dtype=np.int64)
     expr_mask_np = np.zeros((batch_size, max_terms), dtype=np.bool_)
 
-    sub_keys_np = np.zeros((batch_size, max_subs, 7), dtype=np.int64)
-    sub_repl_ints_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS, 7), dtype=np.int64)
+    sub_keys_np = np.zeros((batch_size, max_subs, N), dtype=np.int64)
+    sub_repl_ints_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS, N), dtype=np.int64)
     sub_repl_coeffs_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS), dtype=np.int64)
     sub_repl_mask_np = np.zeros((batch_size, max_subs, MAX_REPLACEMENT_TERMS), dtype=np.bool_)
     sub_mask_np = np.zeros((batch_size, max_subs), dtype=np.bool_)
 
     action_ibp_ops_np = np.zeros((batch_size, max_actions), dtype=np.int64)
-    action_deltas_np = np.zeros((batch_size, max_actions, 7), dtype=np.int64)
+    action_deltas_np = np.zeros((batch_size, max_actions, N), dtype=np.int64)
     action_mask_np = np.zeros((batch_size, max_actions), dtype=np.bool_)
 
-    sector_masks_np = np.zeros((batch_size, 6), dtype=np.int64)
-    target_integrals_np = np.zeros((batch_size, 7), dtype=np.int64)
+    sector_masks_np = np.zeros((batch_size, D), dtype=np.int64)
+    target_integrals_np = np.zeros((batch_size, N), dtype=np.int64)
 
     n_valid_actions = []
 
@@ -225,7 +283,9 @@ def prepare_batched_input_v5(batch_data, device):
 def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cpu', verbose=True,
                 target_sector=None, filter_mode='subsector', track_integrals=None,
                 use_resolved_subs=True, n_workers=16, prime=1009, patience=None,
-                stop_on_weight_improvement=False, random_target=False, beam_sort='weight'):
+                stop_on_weight_improvement=False, random_target=False, beam_sort='weight',
+                checkpoint_path=None, checkpoint_interval=50, checkpoint_time_seconds=300,
+                resume_from=None):
     """Beam search with state-level parallelization.
 
     Args:
@@ -335,6 +395,31 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
     best_weight_ever = max_weight(start_expr, target_sector)
     initial_weight = best_weight_ever
     steps_since_improvement = 0
+    resumed_step = 0  # set non-zero if we loaded from a checkpoint
+
+    # Resume from checkpoint if requested. Checkpoint format:
+    #   {step, beam, best_weight_ever, best_solution, steps_since_improvement,
+    #    weight_beam_end, initial_weight}
+    # written atomically by the same beam_search loop below.
+    if resume_from is not None:
+        import pickle
+        from pathlib import Path
+        cp = Path(resume_from)
+        if cp.exists():
+            with open(cp, 'rb') as f:
+                ck = pickle.load(f)
+            resumed_step = int(ck['step'])
+            beam = list(ck['beam'])
+            best_weight_ever = ck['best_weight_ever']
+            best_solution = ck.get('best_solution')
+            steps_since_improvement = int(ck.get('steps_since_improvement', 0))
+            weight_beam_end = int(ck.get('weight_beam_end', len(beam)))
+            initial_weight = ck.get('initial_weight', initial_weight)
+            if verbose:
+                print(f"  Resumed from {resume_from} at step {resumed_step}, "
+                      f"beam={len(beam)}, best_weight_ever={best_weight_ever}", flush=True)
+        else:
+            print(f"  WARNING: resume_from={resume_from} does not exist; starting fresh.", flush=True)
 
     # Initialize worker pool
     pool = None
@@ -342,8 +427,33 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
         pool = mp.Pool(processes=n_workers, initializer=init_worker, initargs=(prime,))
         print(f"  Initialized worker pool with {n_workers} workers", flush=True)
 
+    def _save_checkpoint(step_now):
+        """Atomically dump current beam_search state to checkpoint_path."""
+        if not checkpoint_path:
+            return
+        import pickle
+        from pathlib import Path
+        cp = Path(checkpoint_path)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cp.with_suffix(cp.suffix + '.tmp')
+        with open(tmp, 'wb') as f:
+            pickle.dump({
+                'step': step_now,
+                'beam': beam,
+                'best_weight_ever': best_weight_ever,
+                'best_solution': best_solution,
+                'steps_since_improvement': steps_since_improvement,
+                'weight_beam_end': weight_beam_end,
+                'initial_weight': initial_weight,
+            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(cp)
+        if verbose:
+            print(f"  Checkpoint saved at step {step_now} -> {cp}", flush=True)
+
+    last_checkpoint_time = time.time()
+
     try:
-        step = 0
+        step = resumed_step
         while True:
             # Check stopping conditions
             if patience is not None:
@@ -445,9 +555,55 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 t_parallel_elapsed = time.time() - t_parallel
 
                 # Collect results
-                for state_results in all_results:
+                import os
+                _profile_csv = os.environ.get("BEAM_PROFILE_CSV")
+                for entry in all_results:
+                    state_results, _state_idx, profile_data = entry
                     for task_idx, valid_actions in state_results:
                         valid_actions_list[task_idx] = valid_actions
+                    # Optional per-state profile row.
+                    if _profile_csv and profile_data is not None:
+                        new_file = not os.path.exists(_profile_csv)
+                        gv = profile_data.get('getvalid') or {}
+                        with open(_profile_csv, 'a') as _f:
+                            cols = ['step', 'state_idx', 'len_subs', 'len_resolved',
+                                    'sum_resolved_value_sizes', 'len_filtered_subs',
+                                    'len_filtered_resolved', 'sum_filtered_resolved_value_sizes',
+                                    'len_indirect_cache', 'n_targets', 't_filter',
+                                    't_compute_indirect_cache', 't_get_valid_total',
+                                    # Get-valid drill-down counters (summed over targets in this state)
+                                    'gv_n_calls', 'gv_n_indirect_checked',
+                                    'gv_n_pass_sc1', 'gv_n_pass_sc2', 'gv_n_pass_filter',
+                                    'gv_t_sc1', 'gv_t_sc2', 'gv_t_filter_in_loop',
+                                    'gv_t_p1a_direct', 'gv_t_p1b_indirect',
+                                    'gv_sum_cached_size_at_sc2', 'gv_sum_cached_size_at_filter']
+                            if new_file:
+                                _f.write(','.join(cols) + '\n')
+                            row = [str(step), str(profile_data['state_idx']),
+                                   str(profile_data['len_subs']),
+                                   str(profile_data['len_resolved']),
+                                   str(profile_data['sum_resolved_value_sizes']),
+                                   str(profile_data['len_filtered_subs']),
+                                   str(profile_data['len_filtered_resolved']),
+                                   str(profile_data['sum_filtered_resolved_value_sizes']),
+                                   str(profile_data['len_indirect_cache']),
+                                   str(profile_data['n_targets']),
+                                   f"{profile_data['t_filter']:.4f}",
+                                   f"{profile_data['t_compute_indirect_cache']:.4f}",
+                                   f"{profile_data['t_get_valid_total']:.4f}",
+                                   str(gv.get('n_calls', 0)),
+                                   str(gv.get('n_indirect_checked', 0)),
+                                   str(gv.get('n_pass_sc1', 0)),
+                                   str(gv.get('n_pass_sc2', 0)),
+                                   str(gv.get('n_pass_filter', 0)),
+                                   f"{gv.get('t_sc1', 0.0):.4f}",
+                                   f"{gv.get('t_sc2', 0.0):.4f}",
+                                   f"{gv.get('t_filter_in_loop', 0.0):.4f}",
+                                   f"{gv.get('t_p1a_direct', 0.0):.4f}",
+                                   f"{gv.get('t_p1b_indirect', 0.0):.4f}",
+                                   str(gv.get('sum_cached_size_at_sc2', 0)),
+                                   str(gv.get('sum_cached_size_at_filter', 0))]
+                            _f.write(','.join(row) + '\n')
 
                 if verbose and step % 10 == 0:
                     print(f"    [P1 parallel] {n_unique_states} states across {n_workers} workers in {t_parallel_elapsed:.3f}s", flush=True)
@@ -649,7 +805,9 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
                         new_non_masters = get_non_masters(new_expr, target_sector)
                         new_path = state.path + [(target, ibp_op, delta)]
-                        new_score = state.score + torch.log(torch.tensor(action_prob + 1e-10)).item()
+                        # NOTE: must match parallel apply_actions_worker exactly (math.log,
+                        # float64) so 1-CPU and N-CPU runs follow identical beam trajectories.
+                        new_score = state.score + math.log(action_prob + 1e-10)
 
                         candidates.append(State(
                             expr=new_expr,
@@ -718,6 +876,21 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
             step += 1
 
+            # Periodic checkpoint so an 8-CPU straggler resubmit can pick up
+            # where the killed 1-CPU worker left off (rather than restarting
+            # the beam search from scratch). Trigger on EITHER:
+            #   - step interval (cheap-many-step runs), OR
+            #   - time interval (bloated runs where each step takes minutes).
+            if checkpoint_path:
+                step_trigger = (checkpoint_interval and step > 0
+                                and step % checkpoint_interval == 0)
+                now = time.time()
+                time_trigger = (checkpoint_time_seconds
+                                and now - last_checkpoint_time >= checkpoint_time_seconds)
+                if step_trigger or time_trigger:
+                    _save_checkpoint(step)
+                    last_checkpoint_time = now
+
     finally:
         if pool is not None:
             pool.close()
@@ -728,6 +901,8 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
 def main():
     parser = argparse.ArgumentParser(description='Beam search reduction with classifier v5 (parallel, memory-optimized)')
+    parser.add_argument('--topology', type=str, required=True,
+                        help='Path to topology_input/<family>/ directory')
     parser.add_argument('--integral', type=str, default='2,0,1,0,2,0,0',
                         help='Starting integral indices (comma-separated)')
     parser.add_argument('--checkpoint', type=str,
@@ -759,7 +934,9 @@ def main():
         print(f'  {k}: {v}', flush=True)
     print(flush=True)
 
-    # Set prime
+    # Configure topology, then prime.
+    topology = Topology.from_dir(args.topology)
+    ibp_env.init_from_topology(topology)
     set_prime(args.prime)
     print(f'Using PRIME = {args.prime}', flush=True)
 
@@ -779,7 +956,10 @@ def main():
         n_expr_layers=ckpt_args.get('n_expr_layers', 2),
         n_cross_layers=ckpt_args.get('n_cross_layers', 2),
         n_subs_layers=ckpt_args.get('n_subs_layers', 2),
-        prime=ckpt_args.get('prime', args.prime)
+        prime=ckpt_args.get('prime', args.prime),
+        n_indices=topology.n_indices,
+        n_denominators=topology.n_denominators,
+        n_ibp_ops=topology.n_actions
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()

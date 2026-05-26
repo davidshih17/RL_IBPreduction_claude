@@ -30,9 +30,11 @@ import resource
 from pathlib import Path
 from collections import defaultdict
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent.parent))
+sys.path.insert(0, str(_HERE.parent))
 
-from ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
+from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
 
 REPO_DIR = Path(__file__).parent.parent.parent.resolve()
@@ -83,22 +85,64 @@ def get_non_masters(expr):
     return {i for i, c in expr.items() if c != 0 and not is_master(i)}
 
 
+def full_weight(integral):
+    """Return (level, r, s) for lex-ordering. level (number of denominators in
+    the sector mask) dominates because reductions are hierarchical: an L8
+    integral with low (r,s) gates an L7 integral with high (r,s)."""
+    level = sum(get_sector_mask(integral))
+    r, s = weight(integral)[:2]
+    return (level, r, s)
+
+
+def work_units(integrals):
+    """Scalar progress metric: large enough field for each component that
+    level dominates r, r dominates s — no collisions across realistic
+    pentagon-box ranges (level<=8, r<=20, s<=20)."""
+    total = 0
+    for i in integrals:
+        L, r, s = full_weight(i)
+        total += L * 1_000_000 + r * 1000 + s
+    return total
+
+
 def create_condor_submit(work_dir, integral, job_name, output_file,
                          model_checkpoint, beam_width, max_steps, prime,
-                         paper_masters_only=False, cpus=1, beam_sort='weight'):
-    """Create a Condor submit file for a single-integral one-step reduction."""
+                         topology_dir,
+                         paper_masters_only=False, cpus=1, beam_sort='weight',
+                         checkpoint_path=None, checkpoint_interval=50,
+                         checkpoint_time_seconds=300, resume_from=None):
+    """Create a Condor submit file for a single-integral one-step reduction.
+
+    If checkpoint_path is set, the worker saves its beam state there every
+    checkpoint_interval steps. If resume_from is set, the worker loads that
+    checkpoint and continues — used by straggler resubmits to skip work the
+    killed 1-CPU worker already did.
+    """
 
     integral_str = ','.join(str(x) for x in integral)
     paper_masters_flag = ' --paper-masters-only' if paper_masters_only else ''
     n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
     beam_sort_flag = f' --beam-sort {beam_sort}' if beam_sort != 'weight' else ''
+    cp_flag = (f' --checkpoint-path {checkpoint_path}'
+               f' --checkpoint-interval {checkpoint_interval}'
+               f' --checkpoint-time-seconds {checkpoint_time_seconds}') if checkpoint_path else ''
+    resume_flag = f' --resume-from {resume_from}' if resume_from else ''
     memory = 4 * cpus  # Scale memory with CPUs
+
+    # Schedule by hierarchical weight (level, r, s) — level dominates because
+    # reductions are sector-by-sector, so an L8 integral with low (r,s) must
+    # clear before its L7 descendants can be finalized. Stragglers (cpus > 1)
+    # get a small bonus so a promoted hard target stays ahead of equal-weight
+    # 1-CPU jobs.
+    level = sum(get_sector_mask(integral))
+    r, s = weight(integral)[:2]
+    job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
 
     # Use v13 one-step worker - reduces by one weight level then returns
     # The async loop will cache and resubmit as needed
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
-arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}
+arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --topology {topology_dir} --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}{cp_flag}{resume_flag}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log
@@ -106,6 +150,7 @@ request_cpus = {cpus}
 request_memory = {memory}GB
 request_disk = 1GB
 Requirements = (TARGET.KFlops > 3000000)
+priority = {job_priority}
 +JobFlavour = "workday"
 queue
 """
@@ -137,6 +182,39 @@ def submit_condor_job(submit_file):
         return None
 
 
+def query_job_start_times(cluster_ids):
+    """Query Condor for JobStartDate (unix time) of each cluster_id.
+
+    Returns dict {cluster_id_str: unix_start_time}. Jobs that are still queued
+    (have JobStartDate of 0 or undefined) are NOT included in the result, so
+    callers can treat them as having zero running time.
+    """
+    if not cluster_ids:
+        return {}
+    try:
+        result = subprocess.run(
+            ['condor_q'] + [str(c) for c in cluster_ids]
+                + ['-af', 'ClusterId', 'JobStartDate'],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            cid, start = parts
+            if start in ('undefined', '0'):
+                continue  # not yet started
+            try:
+                out[cid] = int(start)
+            except ValueError:
+                continue
+        return out
+    except Exception as e:
+        print(f"Error querying JobStartDate: {e}")
+        return {}
+
+
 def check_job_status(cluster_ids):
     """Check status of Condor jobs. Returns set of completed cluster IDs."""
     if not cluster_ids:
@@ -156,6 +234,9 @@ def check_job_status(cluster_ids):
 
 def main():
     parser = argparse.ArgumentParser(description='Async hierarchical reduction with memoization (v13)')
+    parser.add_argument('--topology', type=str, required=True,
+                        help='Path to topology_input/<family>/ directory; '
+                             'passed through to each onestep_worker submission.')
     parser.add_argument('--integral', type=str, required=True,
                         help='Starting integral indices (comma-separated)')
     parser.add_argument('--output', type=str, required=True,
@@ -177,10 +258,18 @@ def main():
                         help='Maximum concurrent Condor jobs')
     parser.add_argument('--paper-masters-only', action='store_true',
                         help='Reduce to paper masters only (no corner integrals)')
-    parser.add_argument('--straggler-timeout', type=int, default=1800,
-                        help='Seconds before a job is considered a straggler (default 30 min)')
+    parser.add_argument('--straggler-timeout', type=int, default=3600,
+                        help='Seconds of actual Condor RUN time (excluding queue wait) before a '
+                             'job is considered a straggler (default 60 min)')
     parser.add_argument('--straggler-cpus', type=int, default=8,
                         help='CPUs to allocate when resubmitting stragglers')
+    parser.add_argument('--checkpoint-interval', type=int, default=50,
+                        help='Steps between beam-search checkpoints (saved next to '
+                             'each worker output). Straggler resubmits use the '
+                             'previous checkpoint to skip work already done.')
+    parser.add_argument('--checkpoint-time-seconds', type=int, default=300,
+                        help='Also checkpoint if this many seconds have elapsed; '
+                             'protects against very large per-step times.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Create submit files but do not submit')
     parser.add_argument('--beam-sort', type=str, default='weight',
@@ -202,6 +291,11 @@ def main():
     (work_dir / 'logs').mkdir(exist_ok=True)
     (work_dir / 'results').mkdir(exist_ok=True)
 
+    # Configure topology first so ibp_env globals are populated.
+    from sailir.topology import Topology
+    from sailir import ibp_env
+    topology = Topology.from_dir(args.topology)
+    ibp_env.init_from_topology(topology)
     set_prime(args.prime)
     if args.paper_masters_only:
         set_paper_masters_only(True)
@@ -219,6 +313,13 @@ def main():
     cache = {}  # integral -> reduced expression (memoization)
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
+    # integral -> path of its most-recent worker's .checkpoint file. Persists
+    # across pending lifecycle (does NOT get cleared by obsolete-cancel) so a
+    # re-entering straggler integral can resume from its last saved beam state.
+    last_checkpoint = {}
+
+    # Rolling (timestamp, work_units) window for ETA estimation in status print.
+    work_history = []
     depth = {}  # integral -> dependency depth (for reporting)
     parent = {}  # integral -> parent integral that discovered it
     ideal_finish = {}  # integral -> earliest possible finish time on critical path
@@ -243,6 +344,37 @@ def main():
         # Count cache hits (integrals that were substituted)
         # This is approximate - we count how many integrals were removed
 
+        # Cancel IDLE pending jobs whose integral is no longer in expr (its
+        # coefficient was zeroed mod prime by another substitution). We only
+        # kill jobs that have NOT yet started running on Condor — already-
+        # running jobs are left alone so their eventual cache entry can short-
+        # circuit any future re-occurrence of the same integral.
+        if pending:
+            pending_cids = [cid for (cid, _, _, _) in pending.values() if cid]
+            start_times = query_job_start_times(pending_cids)
+            cancelled_obsolete = 0
+            for integral in list(pending.keys()):
+                if integral in expr:
+                    continue  # still needed
+                cluster_id, output_file, _, _ = pending[integral]
+                if output_file.exists():
+                    continue  # result already on disk — let normal handling take it
+                if not cluster_id:
+                    continue
+                if str(cluster_id) in start_times:
+                    continue  # already running — let it finish for the cache entry
+                # Idle and obsolete — drop it
+                try:
+                    subprocess.run(['condor_rm', str(cluster_id)],
+                                   capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
+                del pending[integral]
+                cancelled_obsolete += 1
+            if cancelled_obsolete:
+                print(f"[Iter {iteration}] Cancelled {cancelled_obsolete} idle pending jobs "
+                      f"whose integrals are no longer needed", flush=True)
+
         # Find non-masters that need reduction
         non_masters = get_non_masters(expr)
 
@@ -252,8 +384,9 @@ def main():
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
         if available_slots < len(to_submit):
-            # Prioritize by weight (higher weight first - they're more likely to produce useful cache entries)
-            to_submit = sorted(to_submit, key=lambda i: (-weight(i)[0], -weight(i)[1]))
+            # Prioritize by full hierarchical weight (level, r, s); level
+            # dominates so upstream sectors clear before downstream ones.
+            to_submit = sorted(to_submit, key=lambda i: tuple(-x for x in full_weight(i)))
             to_submit = set(to_submit[:available_slots])
 
         # Submit new jobs
@@ -261,25 +394,54 @@ def main():
         for integral in to_submit:
             if integral not in depth:
                 depth[integral] = 0  # Top-level integral from initial expression
-            job_name = f"async_{total_jobs}_{integral_to_str(integral)}"
+
+            # If this integral was previously promoted to a straggler but then
+            # left `pending` (e.g. obsolete-cancelled while idle in the 8-CPU
+            # queue), the original straggler-promotion path at the 60-min
+            # timeout will refuse to re-promote it (the `not in
+            # straggler_integrals` guard blocks it), so a fresh 1-CPU resubmit
+            # would run forever. Promote straight to N CPUs and resume from
+            # the last saved checkpoint if one exists.
+            is_re_entry = integral in straggler_integrals
+            if is_re_entry:
+                cpus = args.straggler_cpus
+                job_name = f"straggler_{total_jobs}_{integral_to_str(integral)}"
+                prev_cp = last_checkpoint.get(integral)
+                resume_from = prev_cp if (prev_cp and Path(prev_cp).exists()) else None
+            else:
+                cpus = 1
+                job_name = f"async_{total_jobs}_{integral_to_str(integral)}"
+                resume_from = None
+
             output_file = work_dir / 'results' / f'{job_name}.pkl'
+            checkpoint_path = str(output_file) + '.checkpoint'
+            last_checkpoint[integral] = checkpoint_path
 
             submit_file = create_condor_submit(
                 work_dir, integral, job_name, output_file,
                 args.model_checkpoint, args.beam_width, args.max_steps, args.prime,
-                args.paper_masters_only, cpus=1, beam_sort=args.beam_sort
+                topology_dir=args.topology,
+                paper_masters_only=args.paper_masters_only, cpus=cpus,
+                beam_sort=args.beam_sort,
+                checkpoint_path=checkpoint_path,
+                checkpoint_interval=args.checkpoint_interval,
+                checkpoint_time_seconds=args.checkpoint_time_seconds,
+                resume_from=resume_from,
             )
 
             if args.dry_run:
-                pending[integral] = (None, output_file, time.time(), 1)
+                pending[integral] = (None, output_file, time.time(), cpus)
                 total_jobs += 1
                 newly_submitted += 1
             else:
                 cluster_id = submit_condor_job(submit_file)
                 if cluster_id:
-                    pending[integral] = (cluster_id, output_file, time.time(), 1)
+                    pending[integral] = (cluster_id, output_file, time.time(), cpus)
                     total_jobs += 1
                     newly_submitted += 1
+                    if is_re_entry:
+                        print(f"  RE-ENTRY: Re-submitted I{list(integral)} with {cpus} CPUs "
+                              f"(resume={'yes' if resume_from else 'no'})", flush=True)
                 else:
                     print(f"  WARNING: Failed to submit I{list(integral)}")
 
@@ -298,10 +460,17 @@ def main():
         # Wait a bit
         time.sleep(args.check_interval)
 
-        # Check for stragglers (jobs running too long) and resubmit with more CPUs
+        # Check for stragglers (jobs that have been RUNNING on Condor too long
+        # — queue/idle wait time is excluded). Resubmit them with more CPUs.
         current_time = time.time()
+        pending_cluster_ids = [cid for (cid, _, _, _) in pending.values() if cid]
+        start_times = query_job_start_times(pending_cluster_ids)
         for integral, (cluster_id, output_file, submit_time, cpus) in list(pending.items()):
-            job_runtime = current_time - submit_time
+            # Job runtime is wall time since Condor *started* executing the job.
+            # If the job is still queued (no JobStartDate yet) treat runtime as 0
+            # so the straggler logic only ever fires on jobs that actually ran.
+            start = start_times.get(str(cluster_id)) if cluster_id else None
+            job_runtime = (current_time - start) if start else 0
             # Only resubmit as straggler if: running too long, not already a straggler, and using single CPU
             if (job_runtime > args.straggler_timeout and
                 integral not in straggler_integrals and
@@ -327,14 +496,26 @@ def main():
                     except:
                         pass
 
-                # Resubmit with more CPUs
+                # Resubmit with more CPUs, resuming from the killed worker's
+                # checkpoint if one exists (saves the ~60 min of beam search
+                # the killed 1-CPU job already did).
                 job_name = f"straggler_{total_jobs}_{integral_to_str(integral)}"
                 new_output_file = work_dir / 'results' / f'{job_name}.pkl'
+                prev_cp = last_checkpoint.get(integral) or (str(output_file) + '.checkpoint')
+                resume_from = prev_cp if Path(prev_cp).exists() else None
+                new_checkpoint = str(new_output_file) + '.checkpoint'
+                last_checkpoint[integral] = new_checkpoint
 
                 submit_file = create_condor_submit(
                     work_dir, integral, job_name, new_output_file,
                     args.model_checkpoint, args.beam_width, args.max_steps, args.prime,
-                    args.paper_masters_only, cpus=args.straggler_cpus, beam_sort=args.beam_sort
+                    topology_dir=args.topology,
+                    paper_masters_only=args.paper_masters_only,
+                    cpus=args.straggler_cpus, beam_sort=args.beam_sort,
+                    checkpoint_path=new_checkpoint,
+                    checkpoint_interval=args.checkpoint_interval,
+                    checkpoint_time_seconds=args.checkpoint_time_seconds,
+                    resume_from=resume_from,
                 )
 
                 new_cluster_id = submit_condor_job(submit_file)
@@ -415,19 +596,47 @@ def main():
         for integral in completed_integrals:
             del pending[integral]
 
-        # Status update with level breakdown
+        # Status update with hierarchical (level, r) breakdown.
         masters_count = sum(1 for i, c in expr.items() if c != 0 and is_master(i))
         non_masters_count = len(non_masters)
 
-        # Count non-masters by level
-        level_counts = {}
-        for i in non_masters:
-            level = sum(get_sector_mask(i))
-            level_counts[level] = level_counts.get(level, 0) + 1
-        level_str = " ".join(f"L{l}:{c}" for l, c in sorted(level_counts.items(), reverse=True))
+        # Frontier: max full_weight tuple still pending, and count at that tuple.
+        if non_masters:
+            frontier = max(full_weight(i) for i in non_masters)
+            n_at_frontier = sum(1 for i in non_masters if full_weight(i) == frontier)
+            work = work_units(non_masters)
 
-        print(f"[Iter {iteration}] {masters_count} masters, {non_masters_count} non-masters ({level_str}) | "
-              f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+            # Top-N (L, r) buckets — collapse s since it's secondary.
+            Lr_counts = {}
+            for i in non_masters:
+                L, r, _ = full_weight(i)
+                key = (L, r)
+                Lr_counts[key] = Lr_counts.get(key, 0) + 1
+            top = sorted(Lr_counts.items(), key=lambda kv: (-kv[0][0], -kv[0][1]))[:15]
+            hist_str = " ".join(f"L{L}r{r}:{n}" for (L, r), n in top)
+
+            # Rolling work-rate ETA over the last ~10 status prints.
+            work_history.append((time.time(), work))
+            if len(work_history) > 20:
+                work_history.pop(0)
+            eta_str = "ETA --"
+            if len(work_history) >= 2:
+                t0, w0 = work_history[0]
+                dt = time.time() - t0
+                dw = w0 - work
+                if dt > 0 and dw > 0:
+                    rate = dw / dt  # work units per second
+                    eta_sec = work / rate if rate > 0 else 0
+                    eta_str = f"-{dw/dt*60:.0f}/min, ETA {eta_sec/3600:.1f}h"
+
+            print(f"[Iter {iteration}] {masters_count} masters, {non_masters_count} non-masters | "
+                  f"frontier=(L={frontier[0]},r={frontier[1]},s={frontier[2]}) x {n_at_frontier} | "
+                  f"work={work} ({eta_str}) | "
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+            print(f"           [hist] {hist_str}")
+        else:
+            print(f"[Iter {iteration}] {masters_count} masters, 0 non-masters | "
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
 
     # Final substitution
     expr = apply_substitutions(expr, cache, args.prime)
