@@ -1,6 +1,63 @@
 #!/usr/bin/env python3
 """
-Beam search reduction using classifier v5 with full parallelization.
+=============================================================================
+beam_search_full.py — PRE-OPTION-F PATH preserved for (8,4) reduction
+=============================================================================
+
+This file is the FROZEN reference path that reproduces the canonical
+wide_beam_dedup_v1 (Condor cluster 1462640, submitted 2026-05-26T12:48Z)
+which cracked the (8,4) pentagon-box integral
+    I[-1, 2, 1, 0, 1, 2, 1, 1, -3, 0, 0]
+in exactly 261 steps, weight (8,4) -> (8,3).
+
+Bit-identical replay verified 2026-05-28 by cluster 1478819:
+  paths identical: True,  final_expr identical: True,  steps: 261.
+
+WHY THIS FILE EXISTS (vs. beam_search.py)
+-----------------------------------------
+beam_search.py is the production code path with Option F + resolved_subs
+storage stripping (target-sector-only sols + IBP replay at worker end).
+That path is ~21% faster on (7,4) but, empirically, FAILS to crack (8,4).
+beam_search_full.py is the historical path that DOES crack (8,4). Keep
+both; do NOT delete this file.
+
+THE LOAD-BEARING / NON-OBVIOUS PART: DEDUP KEY
+----------------------------------------------
+The dedup function `_take_top_unique_by_content` keys on
+    frozenset((sub_int, frozenset(sol.items()))
+              for sub_int, sol in s.resolved_subs.items())
+i.e. the FULL resolved_subs values, INCLUDING sub-sector terms.
+
+This is NOT principled. Sub-sector content is passenger data that does
+not influence target-sector future evolution — putting it in the dedup
+key just makes the fingerprint more discriminating, which lets MORE
+near-duplicates survive in the beam. There is no a-priori reason this
+should be better than (e.g.) a target-sector expr projection key. We
+tried that variant (transcript L9921, 2026-05-26T04:06Z) — it did NOT
+crack (8,4). The L10155 edit at 2026-05-26T12:46Z replaced it with the
+full-resolved_subs key, and submitting 2 minutes later cracked (8,4).
+
+So this is an EMPIRICAL choice. It is preserved verbatim. Do not
+"clean it up" without an ablation that proves the cleaner variant still
+solves (8,4).
+
+OTHER NON-OBVIOUS DIFFERENCES FROM beam_search.py
+--------------------------------------------------
+* apply_actions_worker uses `apply_action_resolved` (keeps full sols)
+  instead of `apply_action_resolved_target_only` (strips to target).
+* Initial-state split into expr_t + sub_accum is a no-op here because
+  apply_action_resolved returns the full expr at the next step. The
+  split is left in for State namedtuple compatibility, not for speed.
+* No visited_exprs tabu list (added later, not part of wide_beam_dedup_v1).
+* The DEDUP_VARIANT / DEDUP_DEBUG / DEDUP_DUMP_PAIR env-var machinery
+  from beam_search.py is intentionally NOT carried over — dedup here is
+  hard-coded to the resolved_subs fingerprint that wide_beam_dedup_v1 used.
+
+HOW TO RUN THIS (8,4) REPRODUCER
+---------------------------------
+  bash scripts/eval/probe_84_full.sh        # uses onestep_worker_full.py
+
+Below is the original v13/v11 changelog kept for context.
 
 v13 changes from v11:
 - P2 sub-batching: process model inference in chunks of 50 states to limit
@@ -9,9 +66,6 @@ v13 changes from v11:
 v11 changes from v7:
 - Remove max_terms=200 limit (model sees full expression)
 - Take LAST 50 subs instead of first 50 (most recent = most relevant for current weight)
-
-Usage:
-    python -u scripts/eval/beam_search.py --beam_width 10 --max_steps 100 --n_workers 16
 """
 
 import sys
@@ -181,10 +235,14 @@ def apply_actions_worker(args):
     results = []
 
     for expr_t, subs, resolved_subs, target, ibp_op, delta, action_prob, path, score in action_batch:
+        # FULL version (pre-Option-F semantics): apply_action_resolved keeps
+        # FULL sols in subs/resolved_subs (no storage stripping). new_expr
+        # contains both target-sector AND sub-sector content. This is what
+        # wide_beam_dedup_v1 used to crack (8,4).
         new_expr_t, new_subs, new_resolved_subs, success = (
-            _worker_env.apply_action_resolved_target_only(
+            _worker_env.apply_action_resolved(
                 dict(expr_t), dict(subs), resolved_subs,
-                target, ibp_op, delta, target_sector,
+                target, ibp_op, delta,
             )
         )
 
@@ -192,9 +250,14 @@ def apply_actions_worker(args):
             results.append(None)
             continue
 
-        # n_non_masters = non-master keys in target-sector expr_t (which is
-        # exactly the target-sector content by construction).
-        n_non_masters = sum(1 for integral in new_expr_t.keys() if not is_master(integral))
+        # n_non_masters = non-master keys IN TARGET SECTOR. new_expr_t now
+        # contains both sectors, so filter explicitly.
+        from beam_search_utils import get_sector_mask as _gsm
+        n_non_masters = sum(
+            1 for integral in new_expr_t.keys()
+            if not is_master(integral)
+            and tuple(_gsm(integral)) == target_sector
+        )
 
         new_path = path + [(target, ibp_op, delta)]
         import math
@@ -398,39 +461,22 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
             print(f"    I{list(i)} = {c}", flush=True)
 
     initial_non_masters = get_non_masters(start_expr, target_sector)
-    # Split start_expr into target-sector and sub-sector parts.
-    # The split state.expr only ever carries target-sector content; sub-sector
-    # terms live in state.sub_accum as passengers (never read by next-step
-    # decisions; only re-attached when worker returns final result).
-    if target_sector is not None:
-        _init_expr_t = {k: v for k, v in start_expr.items()
-                        if tuple(1 if k[i] > 0 else 0
-                                  for i in range(ibp_env.N_DENOMINATORS)) == target_sector}
-        _init_sub_accum = {k: v for k, v in start_expr.items()
-                           if k not in _init_expr_t}
-    else:
-        _init_expr_t = dict(start_expr)
-        _init_sub_accum = {}
+    # FULL version: state.expr carries the COMBINED expression (target-sector
+    # + sub-sector). No splitting. sub_accum field unused (kept as None for
+    # State namedtuple compatibility).
     initial_state = State(
-        expr=_init_expr_t,
+        expr=dict(start_expr),
         subs={},
         resolved_subs={},
         score=0.0,
         path=[],
         n_non_masters=len(initial_non_masters),
         indirect_aux=None,
-        sub_accum=_init_sub_accum,
+        sub_accum=None,
     )
 
-    # Tabu list of expr-hashes (target-sector exprs) that have appeared in the
-    # beam at any previous step. Used by the dedup to prevent the search from
-    # revisiting the same expr-region — which empirically formed long cycles
-    # (e.g. expr 8f3116afda revisited 20+ times across 200 steps under plain
-    # dedup-by-expr). This loses the rs-diversity that dedup-OFF preserves,
-    # but the user judged that contribution minor compared to breaking cycles.
-    visited_exprs = set()
-    visited_exprs.add(frozenset(initial_state.expr.items()))
-
+    # FULL version: no tabu list (was added later, not part of historical
+    # wide_beam_dedup_v1 setup).
     beam = [initial_state]
     weight_beam_end = len(beam)  # For mixed mode: boundary between weight/total halves
     best_solution = None
@@ -784,17 +830,11 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
             t3 = time.time()
             candidates = []
             candidate_halves = []  # For mixed mode: 0=weight beam, 1=total beam
-            # candidate_parents: id(state)->parent state_idx (in PREVIOUS beam).
-            # Used by _take_top_unique_by_content when MAX_CHILDREN_PER_PARENT
-            # env var is set, to limit how many children any single parent can
-            # contribute to the next beam (beam diversity preservation).
-            candidate_parents = {}
 
             if use_resolved_subs and pool is not None:
                 # Collect all actions to apply
                 all_actions = []
                 all_action_halves = []  # For mixed mode: track source beam
-                all_action_parents = []  # parent state_idx parallel to all_actions
                 for i, (state_idx, target, valid_actions, n_tied_targets) in enumerate(batch_meta):
                     state = beam[state_idx]
                     n_valid = n_valid_actions[i]
@@ -820,7 +860,6 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                             state.path, state.score
                         ))
                         all_action_halves.append(action_half)
-                        all_action_parents.append(state_idx)
 
                 # Distribute actions across workers
                 if all_actions:
@@ -842,7 +881,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         for result in chunk_results:
                             if result is not None:
                                 new_expr_t, new_subs, new_resolved_subs, new_path, new_score, n_non_masters = result
-                                _cand = State(
+                                candidates.append(State(
                                     expr=new_expr_t,
                                     subs=new_subs,
                                     resolved_subs=new_resolved_subs,
@@ -851,10 +890,8 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                                     n_non_masters=n_non_masters,
                                     indirect_aux=None,
                                     sub_accum=None,  # Option F: no sub_accum tracking; reconstruct at end
-                                )
-                                candidates.append(_cand)
+                                ))
                                 candidate_halves.append(all_action_halves[flat_idx])
-                                candidate_parents[id(_cand)] = all_action_parents[flat_idx]
                             flat_idx += 1
 
                     if verbose and step % 10 == 0:
@@ -874,28 +911,32 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         ibp_op, delta = valid_actions[idx]
                         action_prob = probs[i, idx].item()
 
-                        # Option F: only target-sector content tracked during
-                        # beam_search; sub-sector terms reconstructed at the
-                        # end by replaying path through state.subs against the
-                        # original start_expr (see onestep_worker._full_expr).
+                        # FULL version: apply_action_resolved keeps full sols.
+                        # new_expr_t contains both target-sector and sub-sector
+                        # content.
                         new_expr_t, new_subs, new_resolved_subs, success = (
-                            env.apply_action_resolved_target_only(
+                            env.apply_action_resolved(
                                 dict(state.expr), dict(state.subs),
                                 state.resolved_subs,
-                                target, ibp_op, delta, target_sector,
+                                target, ibp_op, delta,
                             )
                         )
 
                         if not success:
                             continue
 
-                        n_nm = sum(1 for k in new_expr_t.keys() if not is_master(k))
+                        from beam_search_utils import get_sector_mask as _gsm
+                        n_nm = sum(
+                            1 for k in new_expr_t.keys()
+                            if not is_master(k)
+                            and tuple(_gsm(k)) == target_sector
+                        )
                         new_path = state.path + [(target, ibp_op, delta)]
                         # NOTE: must match parallel apply_actions_worker exactly (math.log,
                         # float64) so 1-CPU and N-CPU runs follow identical beam trajectories.
                         new_score = state.score + math.log(action_prob + 1e-10)
 
-                        _cand = State(
+                        candidates.append(State(
                             expr=new_expr_t,
                             subs=new_subs,
                             resolved_subs=new_resolved_subs,
@@ -904,138 +945,69 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                             n_non_masters=n_nm,
                             indirect_aux=None,
                             sub_accum=None,  # Option F: reconstructed at worker end
-                        )
-                        candidates.append(_cand)
+                        ))
                         candidate_halves.append(action_half)
-                        candidate_parents[id(_cand)] = state_idx
 
             def _take_top_unique_by_content(sorted_cands, k):
-                """Take up to k candidates from a sorted list, keeping only the
-                first occurrence of each unique (target_sector_expr,
-                resolved_subs) future-equivalence class.
+                """LOAD-BEARING dedup for (8,4) reproduction. DO NOT "CLEAN UP".
 
-                Identity for future evolution under Option F + storage stripping:
-                  - target_sector_expr determines target selection and the
-                    expr-side context the model sees.
-                  - resolved_subs determines `cached = apply_resolved_subs(raw,
-                    resolved_subs)` and thus the sol returned by solve_ibp_for
-                    for any chosen action — i.e., the next step's expr.
-                  - The model itself doesn't use subs values, so two states with
-                    the same expr and same resolved_subs will produce the same
-                    candidates with the same coefficients next step (truly
-                    identical futures).
+                Key = frozenset over resolved_subs.items(), with each value
+                hashed as frozenset(sol.items()). resolved_subs values here
+                contain FULL sols (target-sector + sub-sector terms) because
+                this file uses the original apply_action_resolved (no Option
+                F stripping).
 
-                Since resolved_subs values are now stripped to target-sector
-                content at storage time, the full hash
-                  frozenset((k, frozenset(v.items())) for k, v in resolved_subs.items())
-                is cheap. Earlier dedup attempts (expr-only or resolved_subs-only)
-                under-/over-merged because either side alone misses real
-                future-diverging diversity.
+                Why this is non-obvious:
+                  Sub-sector content is "passenger" data. It does not affect
+                  which targets get selected, what valid_actions look like,
+                  or how the model scores them. So including sub-sector
+                  content in the dedup key only makes the fingerprint MORE
+                  discriminating — which lets more near-duplicate states
+                  survive in the beam. A principled "future-equivalence"
+                  key would project to target-sector content only.
 
-                If fewer than k unique are available, pad with the best
-                duplicates so the beam never shrinks.
+                Why we keep it anyway:
+                  Empirically, the cleaner target-sector expr-projection key
+                  (which lived briefly at transcript L9921, 2026-05-26T04:06Z)
+                  did NOT crack (8,4). The full-resolved_subs key at L10155
+                  (2026-05-26T12:46Z) DID — within 2 minutes the wide_beam_
+                  dedup_v1 job (cluster 1462640) was submitted and finished
+                  the (8,4) reduction in 261 steps. Bit-identical replay
+                  confirmed by cluster 1478819 on 2026-05-28.
+
+                  Best guess: the extra discrimination preserves a kind of
+                  beam diversity that the model+search needs to escape the
+                  (8,4) plateau. This is not proven. If anyone wants to
+                  "fix" this, run an ablation that ALSO solves (8,4) end-to-
+                  end first; do not just refactor because it looks weird.
+
+                Padding: if fewer than k unique are available, pad with the
+                best duplicates so the beam never shrinks.
                 """
-                import os as _os_dbg
-                _dbg = bool(_os_dbg.environ.get('DEDUP_DEBUG'))
-                _dump = _os_dbg.environ.get('DEDUP_DUMP_PAIR')
-                # DEDUP_VARIANT controls the dedup key:
-                #   'expr' (default): frozenset(expr.items()) — current
-                #   'rs'            : frozenset(resolved_subs items, fully
-                #                     canonicalized) — historical variant 2,
-                #                     empirically cracked (8,4)
-                #   'expr_rs'       : both — strictest, tested and worse
-                _variant = _os_dbg.environ.get('DEDUP_VARIANT', 'expr')
-                # NO_TABU=1 disables the visited_exprs tabu check below
-                # (the tabu was added later to break expr-cycles seen with
-                # the 'expr' variant; the original wide_beam_dedup_v1 had
-                # no tabu, so to reproduce its behavior under Option F set
-                # NO_TABU=1).
-                _no_tabu = bool(_os_dbg.environ.get('NO_TABU'))
-                # MAX_CHILDREN_PER_PARENT=N caps how many children any single
-                # parent state (in the PREVIOUS beam) can contribute to the
-                # NEXT beam. Encourages beam-state diversity at small beam
-                # widths: prevents one strong parent from dominating all
-                # slots. Unset / 0 → no cap. Uses the candidate_parents map
-                # built in the outer scope of each step.
-                _max_per_parent_str = _os_dbg.environ.get('MAX_CHILDREN_PER_PARENT')
-                _max_per_parent = int(_max_per_parent_str) if _max_per_parent_str and int(_max_per_parent_str) > 0 else None
-                _parent_count = {} if _max_per_parent is not None else None
+                # EXACT historical wide_beam_dedup_v1 dedup key (from
+                # transcript line 10155, 2026-05-26T12:46:37Z, edited just
+                # 2 min BEFORE the cluster-1462640 submission at 12:48:35Z
+                # that produced the canonical 261-step (8,4) success):
+                # frozenset of (sub_int, frozenset(sol.items())) over
+                # resolved_subs — NOT the target-sector projection of expr
+                # that L9921 wrote earlier. No tabu list.
                 seen = set()
-                seen_first = {}
                 unique = []
                 leftovers = []
-                dup_samples = []
-                _dumped = False
-                # Dedup by chosen key AND exclude previously-visited exprs
-                # (tabu list). Tabu always uses expr-key, regardless of dedup
-                # variant — we don't want to revisit literal expr regions.
                 for s in sorted_cands:
-                    if _variant == 'rs':
-                        key = frozenset(
-                            (sk, frozenset(sv.items()))
-                            for sk, sv in s.resolved_subs.items()
-                        )
-                    elif _variant == 'expr_rs':
-                        rs_key = frozenset(
-                            (sk, frozenset(sv.items()))
-                            for sk, sv in s.resolved_subs.items()
-                        )
-                        key = (frozenset(s.expr.items()), rs_key)
-                    else:  # 'expr' (default)
-                        key = frozenset(s.expr.items())
-                    expr_key_for_tabu = frozenset(s.expr.items())
-                    is_tabu = (not _no_tabu) and (expr_key_for_tabu in visited_exprs)
-                    # Parent-quota rejection: track parent of s (None if unknown,
-                    # which only happens for resumed/migrated states from old
-                    # checkpoints — in that case the quota does not apply to s).
-                    _p = candidate_parents.get(id(s)) if _parent_count is not None else None
-                    _over_quota = (_parent_count is not None and _p is not None
-                                   and _parent_count.get(_p, 0) >= _max_per_parent)
-                    if is_tabu or key in seen or _over_quota:
+                    key = frozenset(
+                        (kk, frozenset(vv.items()))
+                        for kk, vv in s.resolved_subs.items()
+                    )
+                    if key in seen:
                         leftovers.append(s)
-                        if _dbg and len(dup_samples) < 3:
-                            dup_samples.append((len(s.expr), len(s.resolved_subs),
-                                                s.score, s.n_non_masters))
-                        # Dump the FIRST duplicate pair to a file for offline
-                        # comparison (set DEDUP_DUMP_PAIR=<path>).
-                        if _dump and not _dumped:
-                            import pickle as _pkl
-                            try:
-                                with open(_dump, 'wb') as _f:
-                                    _pkl.dump({
-                                        'state_kept': seen_first[key],
-                                        'state_skipped': s,
-                                        'target_sector': target_sector,
-                                    }, _f, protocol=_pkl.HIGHEST_PROTOCOL)
-                                print(f"  [DEDUP] dumped colliding pair to {_dump}",
-                                      flush=True)
-                                _dumped = True
-                            except Exception as _e:
-                                print(f"  [DEDUP] dump failed: {_e}", flush=True)
                         continue
                     seen.add(key)
-                    seen_first[key] = s
                     unique.append(s)
-                    if _parent_count is not None and _p is not None:
-                        _parent_count[_p] = _parent_count.get(_p, 0) + 1
-                    if not _dbg and len(unique) >= k:
+                    if len(unique) >= k:
                         break
                 if len(unique) < k:
                     unique.extend(leftovers[: k - len(unique)])
-                if _dbg:
-                    n_total = len(sorted_cands)
-                    n_unique_keys = len(seen)
-                    n_duplicate = n_total - n_unique_keys
-                    print(
-                        f"  [DEDUP] cands={n_total} unique_keys={n_unique_keys} "
-                        f"duplicates={n_duplicate} kept_in_beam={len(unique[:k])} "
-                        f"(of those {sum(1 for s in unique[:k] if s in unique)}/k unique)",
-                        flush=True,
-                    )
-                    if dup_samples:
-                        print(f"    dup_samples (|expr|, |rs|, score, NM): {dup_samples}",
-                              flush=True)
-                    unique = unique[:k]
                 return unique
 
             # Select top beam_width candidates
@@ -1093,16 +1065,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                     beam = _take_top_unique_by_content(candidates, beam_width)
                 else:
                     beam = candidates[:beam_width]
-            # Register the new beam's exprs in the tabu set so they can't be
-            # revisited on future steps. Done AFTER selection so that the
-            # current step's beam can include exprs from the current
-            # candidate pool that aren't already tabu.
-            # Gated by env NO_TABU=1: when set, skip tabu maintenance entirely.
-            import os as _os_tabu_upd
-            _no_tabu_upd = bool(_os_tabu_upd.environ.get('NO_TABU'))
-            if dedup_beam_by_content and not _no_tabu_upd:
-                for _s in beam:
-                    visited_exprs.add(frozenset(_s.expr.items()))
+            # FULL version: no tabu update (wide_beam_dedup_v1 had no tabu).
             t3_elapsed = time.time() - t3
             step_elapsed = time.time() - step_start
 

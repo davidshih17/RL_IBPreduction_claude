@@ -19,10 +19,14 @@ import time
 from pathlib import Path
 from collections import defaultdict
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+_HERE = Path(__file__).resolve()
+sys.path.insert(0, str(_HERE.parent.parent.parent))
+sys.path.insert(0, str(_HERE.parent))
 
 # Import EXACTLY what v13 imports - DO NOT REIMPLEMENT
-from ibp_env import IBPEnvironment, set_prime, set_kinematics, is_master, weight, PRIME
+from sailir import ibp_env
+from sailir.ibp_env import IBPEnvironment, set_prime, set_kinematics, is_master, weight, PRIME
+from sailir.topology import Topology
 
 # Import from same modules as v13
 from beam_search_utils import (
@@ -194,6 +198,8 @@ def print_expression_summary(expr, title="Expression"):
 
 def main():
     parser = argparse.ArgumentParser(description='Replay reduction path with different prime')
+    parser.add_argument('--topology', type=str, required=True,
+                        help='Path to topology_input/<family>/ directory')
     parser.add_argument('--path', type=str, required=True,
                         help='Pickle file: a single onestep_worker output (verifies that one '
                              'worker), OR an orchestrator output (combined with --work-dir, '
@@ -209,15 +215,31 @@ def main():
                         help='Prime for modular arithmetic (different from original)')
     parser.add_argument('--d', type=int, default=41,
                         help='Spacetime dimension for kinematics')
-    parser.add_argument('--m1', type=int, default=1,
-                        help='Mass m1 for kinematics')
-    parser.add_argument('--m2', type=int, default=31,
-                        help='Mass m2 for kinematics')
-    parser.add_argument('--m3', type=int, default=47,
-                        help='Mass m3 for kinematics')
+    parser.add_argument('--kinematics', type=str, default=None,
+                        help='Override numeric kinematic invariants as comma-separated '
+                             '"name=value" pairs, e.g. "m2=31,m3=47" or '
+                             '"s12=31,s23=47,s34=53,s45=59,s51=61". If omitted, the '
+                             'defaults from the topology are used.')
     parser.add_argument('--no-verbose', '-q', action='store_false', dest='verbose',
                         help='Suppress detailed output')
     args = parser.parse_args()
+
+    # Configure topology FIRST so ibp_env globals (N_INDICES, KINEMATICS, etc.) are set.
+    topology = Topology.from_dir(args.topology)
+    ibp_env.init_from_topology(topology)
+    # Parse --kinematics override, if any.
+    kin_override = {"d": args.d}
+    if args.kinematics:
+        for piece in args.kinematics.split(','):
+            piece = piece.strip()
+            if not piece:
+                continue
+            name, _, val = piece.partition('=')
+            kin_override[name.strip()] = int(val.strip())
+    # Only pass keys the topology recognises.
+    valid = {k: v for k, v in kin_override.items() if k in ibp_env.KINEMATICS}
+    if valid:
+        set_kinematics(**valid)
 
     if args.work_dir is not None:
         return orchestrator_mode(args)
@@ -251,11 +273,10 @@ def main():
     if args.prime == original_prime:
         print("WARNING: Replay prime is same as original - this just verifies the path is consistent")
 
-    # Set new prime and kinematics
+    # Set new prime (topology + kinematics were configured at the top of main).
     set_prime(args.prime)
-    set_kinematics(d=args.d, m1=args.m1, m2=args.m2, m3=args.m3)
     print(f"Using PRIME = {args.prime}")
-    print(f"Using kinematics: d={args.d}, m1={args.m1}, m2={args.m2}, m3={args.m3}")
+    print(f"Using kinematics: {ibp_env.KINEMATICS}")
 
     # Load IBP environment
     print("Loading IBP environment...")
@@ -431,7 +452,7 @@ def orchestrator_mode(args):
     original_prime = orch['prime']
 
     set_prime(args.prime)
-    set_kinematics(d=args.d, m1=args.m1, m2=args.m2, m3=args.m3)
+    # Kinematics were already configured at the top of main() — don't override.
     env = IBPEnvironment()
 
     print(f"\nStart integral: I{list(start_integral)}")

@@ -209,6 +209,102 @@ def apply_substitution(expr, sub_int, sol):
     return {k: v for k, v in new_expr.items() if v != 0}
 
 
+def apply_substitution_target_only(expr_t, sub_int, sol, target_sector):
+    """Apply substitution, evolving ONLY the target-sector content. Sub-sector
+    contributions from sol are DISCARDED here. The caller is responsible for
+    reconstructing the full expression at the end by replaying the path of
+    applied substitutions against the original start_expr.
+
+    This is Option F's cheap-per-step path: no sub_accum to copy, no
+    sub-sector dict ops at all. Per-step cost drops to O(|expr_t| + |sol|)
+    with no |sub_accum| factor.
+
+    Args:
+        expr_t: target-sector-only expression dict
+        sub_int: integral being substituted (must be target-sector)
+        sol: replacement linear combination
+        target_sector: tuple sector mask defining target-sector membership
+
+    Returns:
+        new_expr_t (new dict; caller's expr_t not mutated).
+    """
+    if sub_int not in expr_t:
+        return expr_t
+    coeff = expr_t[sub_int]
+    new_expr_t = {k: v for k, v in expr_t.items() if k != sub_int}
+    nd = N_DENOMINATORS
+    for integral, sub_coeff in sol.items():
+        new_coeff = (coeff * sub_coeff) % PRIME
+        if new_coeff == 0:
+            continue
+        # Skip non-target-sector contributions — they're "passenger" terms
+        # that will be reconstructed at the end by the caller.
+        in_target = True
+        for i in range(nd):
+            if ((1 if integral[i] > 0 else 0) != target_sector[i]):
+                in_target = False
+                break
+        if not in_target:
+            continue
+        if integral in new_expr_t:
+            s = (new_expr_t[integral] + new_coeff) % PRIME
+            if s == 0:
+                del new_expr_t[integral]
+            else:
+                new_expr_t[integral] = s
+        else:
+            new_expr_t[integral] = new_coeff
+    return new_expr_t
+
+
+def apply_substitution_split(expr_t, sub_accum, sub_int, sol, target_sector):
+    """Apply substitution, splitting result by sector.
+
+    Like apply_substitution but separates target-sector terms from sub-sector
+    terms. expr_t is the active target-sector expression; sub_accum holds the
+    sub-sector "passenger" terms that don't affect search decisions but must
+    be tracked for the final output. This saves O(|sub_accum|) per call by
+    not iterating sub_accum at all (it's only added to, never read here).
+
+    Args:
+        expr_t: target-sector-only expression dict (modified to remove sub_int
+                if present, and to receive any target-sector terms from sol)
+        sub_accum: sub-sector accumulator dict (sub-sector terms from sol added)
+        sub_int: the integral being substituted (must be in target sector)
+        sol: replacement linear combination (mix of target/sub-sector)
+        target_sector: tuple sector mask defining what counts as "target sector"
+
+    Returns:
+        (new_expr_t, new_sub_accum) — both NEW dicts (caller's not mutated).
+    """
+    if sub_int not in expr_t:
+        return expr_t, sub_accum
+    coeff = expr_t[sub_int]
+    new_expr_t = {k: v for k, v in expr_t.items() if k != sub_int}
+    new_sub_accum = dict(sub_accum)
+    nd = N_DENOMINATORS
+    for integral, sub_coeff in sol.items():
+        new_coeff = (coeff * sub_coeff) % PRIME
+        if new_coeff == 0:
+            continue
+        # Inline sector mask compare for hot-loop speed (avoid tuple alloc).
+        in_target_sector = True
+        for i in range(nd):
+            if ((1 if integral[i] > 0 else 0) != target_sector[i]):
+                in_target_sector = False
+                break
+        d = new_expr_t if in_target_sector else new_sub_accum
+        if integral in d:
+            s = (d[integral] + new_coeff) % PRIME
+            if s == 0:
+                del d[integral]
+            else:
+                d[integral] = s
+        else:
+            d[integral] = new_coeff
+    return new_expr_t, new_sub_accum
+
+
 def apply_all_substitutions(expr, subs):
     """Apply all substitutions until fixed point."""
     if not subs:
@@ -1724,6 +1820,118 @@ class IBPEnvironment:
         new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol)
 
         return new_expr, new_subs, new_resolved_subs, True
+
+    def apply_action_resolved_target_only(self, expr_t, subs, resolved_subs,
+                                            target, ibp_op, delta, target_sector):
+        """Like apply_action_resolved but tracks ONLY target-sector content
+        in expr AND in subs/resolved_subs.
+
+        Sub-sector contributions are stripped from sol before storing in subs
+        and resolved_subs. This is safe for beam evolution because:
+          - target-sector(new_expr_t) depends only on target-sector(cached),
+            which depends only on target-sector portions of resolved_subs values
+          - the model context doesn't use subs values to affect predictions
+          - therefore stripping sub-sector content from resolved_subs values
+            doesn't change the next step's target-sector beam evolution
+
+        The caller is responsible for reconstructing the FULL final_expr
+        (including sub-sector content) at worker end by replaying the path
+        through raw IBP templates from scratch (see replay_path_to_full_expr).
+
+        Returns:
+            (new_expr_t, new_subs, new_resolved_subs, success)
+        """
+        seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
+        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        cached = apply_resolved_subs(raw, resolved_subs)
+
+        if target not in cached or cached[target] == 0:
+            return expr_t, subs, resolved_subs, False
+
+        sol = solve_ibp_for(cached, target)
+        if sol is None:
+            return expr_t, subs, resolved_subs, False
+
+        # Strip sol to target-sector before storing. target-sector(new_expr_t)
+        # is unaffected because apply_substitution_target_only already drops
+        # non-target terms. Storing the stripped version keeps subs and
+        # resolved_subs strictly target-sector-content-only.
+        sol_target = {k: v for k, v in sol.items()
+                      if integral_in_exact_sector(k, target_sector)}
+
+        new_subs = dict(subs)
+        new_subs[target] = sol_target
+        new_expr_t = apply_substitution_target_only(expr_t, target, sol_target, target_sector)
+        new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol_target)
+
+        return new_expr_t, new_subs, new_resolved_subs, True
+
+    def replay_path_to_full_expr(self, start_expr, path):
+        """Reconstruct the FULL final_expr (target + sub-sector) by replaying
+        path through raw IBP templates from scratch.
+
+        Under Option F + resolved_subs stripping, beam_search only tracks
+        target-sector content. To recover the complete final expression for
+        the orchestrator's cache, the WINNING trajectory's path is replayed
+        here against fresh raw IBPs, rebuilding full subs/resolved_subs only
+        for this one path (cheap, since it's a single trajectory, not the
+        whole beam).
+
+        Args:
+            start_expr: initial expression passed into beam_search (typically
+                a single-integral dict like {input_integral: 1}).
+            path: list of (target, ibp_op, delta) tuples produced by beam_search.
+
+        Returns:
+            full_expr dict (integral -> coeff mod PRIME), with both
+            target-sector AND sub-sector content correctly accumulated.
+        """
+        full_resolved_subs = {}
+        full_expr = dict(start_expr)
+        for target, ibp_op, delta in path:
+            seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
+            raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+            cached = apply_resolved_subs(raw, full_resolved_subs)
+            if target not in cached or cached[target] == 0:
+                continue
+            sol = solve_ibp_for(cached, target)
+            if sol is None:
+                continue
+            full_resolved_subs = add_sub_to_resolved(full_resolved_subs, target, sol)
+            full_expr = apply_substitution(full_expr, target, sol)
+        return full_expr
+
+    def apply_action_resolved_split(self, expr_t, sub_accum, subs, resolved_subs,
+                                     target, ibp_op, delta, target_sector):
+        """Same as apply_action_resolved but with sub-sector content factored
+        out of expr. expr_t is target-sector content only; sub_accum holds the
+        passenger sub-sector terms.
+
+        Saves O(|sub_accum|) per call vs apply_action_resolved at late stages.
+
+        Returns:
+            (new_expr_t, new_sub_accum, new_subs, new_resolved_subs, success)
+        """
+        seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
+        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        cached = apply_resolved_subs(raw, resolved_subs)
+
+        if target not in cached or cached[target] == 0:
+            return expr_t, sub_accum, subs, resolved_subs, False
+
+        sol = solve_ibp_for(cached, target)
+        if sol is None:
+            return expr_t, sub_accum, subs, resolved_subs, False
+
+        new_subs = dict(subs)
+        new_subs[target] = sol
+        new_expr_t, new_sub_accum = apply_substitution_split(
+            expr_t, sub_accum, target, sol, target_sector
+        )
+
+        new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol)
+
+        return new_expr_t, new_sub_accum, new_subs, new_resolved_subs, True
 
     def get_valid_actions(self, target, subs, filter_mode='subsector'):
         """Get list of valid actions for target.

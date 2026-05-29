@@ -49,35 +49,10 @@ from sailir.ibp_env import (
     IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight,
 )
 from sailir.classifier import IBPActionClassifier
-from beam_search import beam_search
+# FULL version: imports beam_search_full (which uses apply_action_resolved
+# with full sols, matching wide_beam_dedup_v1 semantics).
+from beam_search_full import beam_search
 from beam_search_utils import get_sector_mask, max_weight
-
-
-def reconstruct_full_expr(env, start_expr, state):
-    """Reconstruct full final expression by replaying state.path through raw
-    IBP templates against start_expr.
-
-    Under Option F + resolved_subs stripping, beam_search's stored subs only
-    contain target-sector content (sub-sector terms are dropped at storage
-    time for cheap dedup hashing and cheap apply_resolved_subs). To recover
-    the full final_expr (with sub-sector terms required by the orchestrator's
-    cache), we replay state.path here through fresh raw IBP templates,
-    rebuilding full subs/resolved_subs only for this single winning trajectory.
-
-    Cost: O(N_steps * apply_resolved_subs_cost) on one path, not the whole
-    beam — so adding this end-of-worker replay is cheap compared to the
-    beam_search itself.
-
-    Args:
-        env: IBPEnvironment (provides ibp_t, li_t for raw IBP construction)
-        start_expr: full expression passed into beam_search
-        state: beam_search State whose .path we replay
-
-    Returns:
-        full expr dict (integral -> coeff mod PRIME), bit-identical to what
-        the old "track full subs in beam" code path would have produced.
-    """
-    return env.replay_path_to_full_expr(start_expr, state.path)
 
 
 def get_non_masters_in_sector(expr, target_sector):
@@ -235,12 +210,9 @@ def main():
             _default_cp_path = args.checkpoint_path or (str(args.output) + '.checkpoint')
         cp_path = _default_cp_path if restart_count == 1 else None
         resume_from = args.resume_from if restart_count == 1 else None
-        # Snapshot expr BEFORE beam_search: reconstruct_full_expr replays
-        # state.path against this snapshot to rebuild the full final expr
-        # (target-sector + sub-sector). Option F discards sub-sector content
-        # inside the beam search; this snapshot is the only reference needed
-        # to recover it deterministically.
-        this_call_start_expr = dict(expr)
+        # FULL version: state.expr already contains both target-sector and
+        # sub-sector content (no stripping), so no replay reconstruction
+        # needed.
         solution, final_beam, best_weight = beam_search(
             env, model, expr,
             beam_width=args.beam_width,
@@ -263,12 +235,10 @@ def main():
             dedup_beam_by_content=args.dedup_beam_by_content,
         )
 
-        # Option F (+ resolved_subs stripping): beam_search state.expr is
-        # target-sector only AND state.subs values are target-sector-only.
-        # Rebuild full expr (including sub-sector passengers) by replaying
-        # state.path through raw IBP templates against this_call_start_expr.
+        # FULL version: state.expr is the full expression (target + sub-sector).
+        # No reconstruction needed.
         def _full_expr(state):
-            return reconstruct_full_expr(env, this_call_start_expr, state)
+            return state.expr
 
         if solution:
             # Fully reduced to masters

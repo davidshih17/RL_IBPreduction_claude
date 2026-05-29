@@ -108,10 +108,14 @@ def work_units(integrals):
 def create_condor_submit(work_dir, integral, job_name, output_file,
                          model_checkpoint, beam_width, max_steps, prime,
                          topology_dir,
-                         paper_masters_only=False, cpus=1, beam_sort='weight',
+                         paper_masters_only=True, cpus=1, beam_sort='mixed',
                          checkpoint_path=None, checkpoint_interval=50,
-                         checkpoint_time_seconds=300, resume_from=None):
+                         checkpoint_time_seconds=300, resume_from=None,
+                         dedup_beam_by_content=False):
     """Create a Condor submit file for a single-integral one-step reduction.
+
+    PAPER DEFAULTS (matches trianglebox-paper recipe):
+      paper_masters_only=True, beam_sort='mixed', dedup_beam_by_content=False.
 
     If checkpoint_path is set, the worker saves its beam state there every
     checkpoint_interval steps. If resume_from is set, the worker loads that
@@ -120,13 +124,17 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     """
 
     integral_str = ','.join(str(x) for x in integral)
-    paper_masters_flag = ' --paper-masters-only' if paper_masters_only else ''
+    # Worker now defaults to --paper-masters-only ON. Only emit a flag if we want to disable.
+    paper_masters_flag = '' if paper_masters_only else ' --no-paper-masters-only'
     n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
-    beam_sort_flag = f' --beam-sort {beam_sort}' if beam_sort != 'weight' else ''
+    # Worker now defaults to --beam-sort mixed. Only emit a flag if non-default.
+    beam_sort_flag = f' --beam-sort {beam_sort}' if beam_sort != 'mixed' else ''
     cp_flag = (f' --checkpoint-path {checkpoint_path}'
                f' --checkpoint-interval {checkpoint_interval}'
                f' --checkpoint-time-seconds {checkpoint_time_seconds}') if checkpoint_path else ''
     resume_flag = f' --resume-from {resume_from}' if resume_from else ''
+    # Worker now defaults to dedup OFF. Only emit a flag if we want to ENABLE dedup.
+    dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
     memory = 4 * cpus  # Scale memory with CPUs
 
     # Schedule by hierarchical weight (level, r, s) — level dominates because
@@ -142,7 +150,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     # The async loop will cache and resubmit as needed
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
-arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --topology {topology_dir} --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}{cp_flag}{resume_flag}
+arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --topology {topology_dir} --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}{cp_flag}{resume_flag}{dedup_flag}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log
@@ -256,13 +264,26 @@ def main():
                         help='Seconds between job status checks')
     parser.add_argument('--max-concurrent', type=int, default=10000,
                         help='Maximum concurrent Condor jobs')
-    parser.add_argument('--paper-masters-only', action='store_true',
-                        help='Reduce to paper masters only (no corner integrals)')
+    # PAPER DEFAULT: ON (trianglebox-paper recipe).
+    parser.add_argument('--paper-masters-only', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Reduce to paper masters only (no corner integrals). '
+                             'Default: ON (trianglebox paper recipe).')
     parser.add_argument('--straggler-timeout', type=int, default=3600,
                         help='Seconds of actual Condor RUN time (excluding queue wait) before a '
                              'job is considered a straggler (default 60 min)')
     parser.add_argument('--straggler-cpus', type=int, default=8,
                         help='CPUs to allocate when resubmitting stragglers')
+    parser.add_argument('--straggler2-timeout', type=int, default=10800,
+                        help='Seconds of actual Condor RUN time on an 8-CPU straggler '
+                             'before second escalation kicks in (default 3h)')
+    parser.add_argument('--straggler2-cpus', type=int, default=16,
+                        help='CPUs to allocate when resubmitting straggler2 (wider '
+                             'parallelism for genuinely stuck integrals)')
+    parser.add_argument('--straggler2-beam-width', type=int, default=40,
+                        help='Beam width for straggler2 worker (wider beam to escape '
+                             'model-stuck states; combined with --worker-dedup-beam-'
+                             'by-content this gives real diversity)')
     parser.add_argument('--checkpoint-interval', type=int, default=50,
                         help='Steps between beam-search checkpoints (saved next to '
                              'each worker output). Straggler resubmits use the '
@@ -272,9 +293,28 @@ def main():
                              'protects against very large per-step times.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Create submit files but do not submit')
-    parser.add_argument('--beam-sort', type=str, default='weight',
+    # PAPER DEFAULT: mixed (trianglebox-paper recipe — two parallel sub-beams,
+    # one sorted by max-weight, one by total sum of weights).
+    parser.add_argument('--beam-sort', type=str, default='mixed',
                         choices=['weight', 'nterms', 'score', 'totalweight', 'mixed'],
-                        help='Beam sort key for worker jobs (default: weight)')
+                        help='Beam sort key for worker jobs. Default: mixed '
+                             '(trianglebox paper recipe).')
+    # PAPER DEFAULT: dedup OFF (trianglebox-paper recipe).
+    parser.add_argument('--worker-dedup-beam-by-content',
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help='Beam dedup in worker jobs. Default: OFF '
+                             '(trianglebox paper recipe). When ON, workers receive '
+                             '--dedup-beam-by-content (resolved_subs-fingerprint key) '
+                             'and the search keeps only one beam slot per distinct '
+                             'fingerprint. Turn ON for hard integrals like (8,4) '
+                             'pentagon-box; see memory/sailir_84_full_resolved_subs_dedup.md.')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume: on startup, scan work_dir/results/*.pkl and '
+                             'load each completed worker as a cache entry. Then '
+                             'apply substitutions to start_expr and continue the '
+                             'orchestrator loop. Drops any pending jobs (will be '
+                             'resubmitted). Use after stopping the orchestrator + '
+                             'killing all its workers (condor_rm).')
     args = parser.parse_args()
 
     print('='*70)
@@ -313,6 +353,51 @@ def main():
     cache = {}  # integral -> reduced expression (memoization)
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
+    straggler2_integrals = set()  # integrals that have hit the second-level escalation
+
+    # --resume: scan work_dir/results/*.pkl, load each successful worker output
+    # as a cache entry. Apply substitutions to start_expr to recover current expr.
+    # Pending is dropped (any in-flight workers should be condor_rm'd before
+    # restarting the orchestrator). This is the orchestrator-level resume; the
+    # worker-level resume (per-integral) is independent.
+    if args.resume:
+        import glob
+        t_resume = time.time()
+        results_dir = work_dir / 'results'
+        pkl_files = sorted(glob.glob(str(results_dir / '*.pkl')))
+        # Skip per-worker checkpoint files (they end in .pkl.checkpoint, glob
+        # matches both — filter explicitly).
+        pkl_files = [p for p in pkl_files if not p.endswith('.checkpoint')]
+        print(f'[RESUME] Loading {len(pkl_files)} worker pickles from {results_dir} ...',
+              flush=True)
+        n_loaded = 0
+        n_skipped = 0
+        for i, pf in enumerate(pkl_files):
+            try:
+                with open(pf, 'rb') as f:
+                    r = pickle.load(f)
+            except Exception as e:
+                n_skipped += 1
+                continue
+            integ = r.get('original_integral')
+            if integ is None:
+                n_skipped += 1
+                continue
+            if r.get('success'):
+                cache[integ] = r.get('final_expr', r.get('expr', {integ: 1}))
+            else:
+                # Failed worker: identity cache so we don't re-try and loop.
+                cache[integ] = {integ: 1}
+            n_loaded += 1
+            if (i + 1) % 5000 == 0:
+                print(f'  [RESUME]   ... {i+1}/{len(pkl_files)} loaded', flush=True)
+        print(f'[RESUME] Loaded {n_loaded} cache entries ({n_skipped} skipped) '
+              f'in {time.time()-t_resume:.1f}s', flush=True)
+        # Apply all cached substitutions to start_expr to recover current state.
+        t_apply = time.time()
+        expr = apply_substitutions(expr, cache, args.prime)
+        print(f'[RESUME] Applied substitutions to expr in {time.time()-t_apply:.1f}s; '
+              f'|expr|={len(expr)}, |cache|={len(cache)}', flush=True)
     # integral -> path of its most-recent worker's .checkpoint file. Persists
     # across pending lifecycle (does NOT get cleared by obsolete-cancel) so a
     # re-entering straggler integral can resume from its last saved beam state.
@@ -427,6 +512,7 @@ def main():
                 checkpoint_interval=args.checkpoint_interval,
                 checkpoint_time_seconds=args.checkpoint_time_seconds,
                 resume_from=resume_from,
+                dedup_beam_by_content=args.worker_dedup_beam_by_content,
             )
 
             if args.dry_run:
@@ -516,6 +602,7 @@ def main():
                     checkpoint_interval=args.checkpoint_interval,
                     checkpoint_time_seconds=args.checkpoint_time_seconds,
                     resume_from=resume_from,
+                    dedup_beam_by_content=args.worker_dedup_beam_by_content,
                 )
 
                 new_cluster_id = submit_condor_job(submit_file)
@@ -528,6 +615,68 @@ def main():
                           f"(was running {job_runtime/60:.1f} min)")
                 else:
                     print(f"  WARNING: Failed to resubmit straggler I{list(integral)}")
+
+        # Second-level escalation: an integral that has been an 8-CPU straggler
+        # for --straggler2-timeout (default 3h) and is STILL running gets
+        # promoted to --straggler2-cpus (16) + --straggler2-beam-width (40) +
+        # dedup ON. Resumes from the latest checkpoint to preserve progress.
+        for integral, (cluster_id, output_file, submit_time, cpus) in list(pending.items()):
+            start = start_times.get(str(cluster_id)) if cluster_id else None
+            job_runtime = (current_time - start) if start else 0
+            if (job_runtime > args.straggler2_timeout
+                and integral in straggler_integrals
+                and integral not in straggler2_integrals
+                and cpus == args.straggler_cpus):
+                # Kill the 8-CPU job
+                if cluster_id:
+                    try:
+                        kill_result = subprocess.run(['condor_rm', str(cluster_id)],
+                                                     capture_output=True, text=True, timeout=10)
+                        if kill_result.returncode == 0:
+                            print(f"  Killed straggler2 job {cluster_id}", flush=True)
+                    except Exception as e:
+                        print(f"  WARNING: condor_rm {cluster_id} exception: {e}", flush=True)
+
+                # Remove partial output if any
+                if output_file.exists():
+                    try: output_file.unlink()
+                    except: pass
+
+                # Resubmit at higher level: wider beam + more CPUs + dedup on.
+                # Resume from last_checkpoint so we don't lose the 3h of work.
+                job_name = f"straggler2_{total_jobs}_{integral_to_str(integral)}"
+                new_output_file = work_dir / 'results' / f'{job_name}.pkl'
+                prev_cp = last_checkpoint.get(integral) or (str(output_file) + '.checkpoint')
+                resume_from = prev_cp if Path(prev_cp).exists() else None
+                new_checkpoint = str(new_output_file) + '.checkpoint'
+                last_checkpoint[integral] = new_checkpoint
+
+                submit_file = create_condor_submit(
+                    work_dir, integral, job_name, new_output_file,
+                    args.model_checkpoint,
+                    args.straggler2_beam_width,  # wider beam
+                    args.max_steps, args.prime,
+                    topology_dir=args.topology,
+                    paper_masters_only=args.paper_masters_only,
+                    cpus=args.straggler2_cpus,   # more CPUs
+                    beam_sort=args.beam_sort,
+                    checkpoint_path=new_checkpoint,
+                    checkpoint_interval=args.checkpoint_interval,
+                    checkpoint_time_seconds=args.checkpoint_time_seconds,
+                    resume_from=resume_from,
+                    dedup_beam_by_content=True,  # force dedup at this level
+                )
+
+                new_cluster_id = submit_condor_job(submit_file)
+                if new_cluster_id:
+                    pending[integral] = (new_cluster_id, new_output_file, time.time(), args.straggler2_cpus)
+                    straggler2_integrals.add(integral)
+                    total_jobs += 1
+                    print(f"  STRAGGLER2: Resubmitted I{list(integral)} with "
+                          f"{args.straggler2_cpus} CPUs, beam={args.straggler2_beam_width}, "
+                          f"dedup ON (was running {job_runtime/3600:.1f}h)")
+                else:
+                    print(f"  WARNING: Failed to resubmit straggler2 I{list(integral)}")
 
         # Check for completed jobs
         completed_integrals = []
