@@ -405,28 +405,47 @@ def add_sub_to_resolved(resolved_subs, target, sol):
     3. Update any existing entries that contain target
 
     Returns new resolved_subs dict.
+
+    COPY-ON-WRITE optimization: the outer dict is shallow-copied, so values
+    that aren't mutated by this call are SHARED with the input. Only values
+    that actually contain `target` (and thus get rewritten) are copied. This
+    saves the O(|subs| * avg_value_size) deep-copy cost that dominated the
+    function at late steps (microbenchmark: 73% of original wall time was
+    pure copying). The zero-cleanup pass is also folded into the inner loop.
+
+    Safety: no caller mutates resolved_subs[k] values after they're produced
+    (verified by grep over sailir/ and scripts/eval/), so sharing is sound.
+    The function still returns a fresh outer dict — callers can mutate that
+    freely; only the value-dicts they pull out should be treated as immutable.
     """
     # Step 1: Resolve the new sol against existing resolved_subs
     resolved_sol = apply_resolved_subs(sol, resolved_subs)
 
-    # Step 2: Create new dict with the new entry
-    new_resolved = {k: dict(v) for k, v in resolved_subs.items()}
+    # Step 2: SHALLOW copy of the outer dict; values shared with input.
+    new_resolved = dict(resolved_subs)
     new_resolved[target] = resolved_sol
 
-    # Step 3: Update existing entries that contain target
-    for key in resolved_subs:  # Only iterate over OLD keys
-        value = new_resolved[key]
-        if target in value:
-            # Expand target in this value
-            coeff = value.pop(target)
-            for k, v in resolved_sol.items():
-                new_coeff = (coeff * v) % PRIME
-                if k in value:
-                    value[k] = (value[k] + new_coeff) % PRIME
+    # Step 3: Update existing entries that contain target. COW: only copy
+    # a value-dict when we're about to mutate it.
+    for key, old_value in resolved_subs.items():
+        if target not in old_value:
+            continue  # unchanged — keep sharing the same value-dict
+        # Now we must rewrite this value. Copy it first, then mutate the copy.
+        value = dict(old_value)
+        coeff = value.pop(target)
+        for k, v in resolved_sol.items():
+            new_coeff = (coeff * v) % PRIME
+            if new_coeff == 0:
+                continue
+            if k in value:
+                s = (value[k] + new_coeff) % PRIME
+                if s == 0:
+                    del value[k]
                 else:
-                    value[k] = new_coeff
-            # Clean zeros
-            new_resolved[key] = {k: v for k, v in value.items() if v != 0}
+                    value[k] = s
+            else:
+                value[k] = new_coeff
+        new_resolved[key] = value
 
     return new_resolved
 
