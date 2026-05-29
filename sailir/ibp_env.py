@@ -1795,7 +1795,7 @@ class IBPEnvironment:
             (new_expr, new_subs, success)
         """
         seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
-        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        raw = self.get_raw_equation_cached(ibp_op, seed)
         cached = apply_all_substitutions(raw, subs)
 
         if target not in cached or cached[target] == 0:
@@ -1820,7 +1820,7 @@ class IBPEnvironment:
             (new_expr, new_subs, new_resolved_subs, success)
         """
         seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
-        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        raw = self.get_raw_equation_cached(ibp_op, seed)
         # Use single-pass application
         cached = apply_resolved_subs(raw, resolved_subs)
 
@@ -1861,7 +1861,7 @@ class IBPEnvironment:
             (new_expr_t, new_subs, new_resolved_subs, success)
         """
         seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
-        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        raw = self.get_raw_equation_cached(ibp_op, seed)
         cached = apply_resolved_subs(raw, resolved_subs)
 
         if target not in cached or cached[target] == 0:
@@ -1909,7 +1909,7 @@ class IBPEnvironment:
         full_expr = dict(start_expr)
         for target, ibp_op, delta in path:
             seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
-            raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+            raw = self.get_raw_equation_cached(ibp_op, seed)
             cached = apply_resolved_subs(raw, full_resolved_subs)
             if target not in cached or cached[target] == 0:
                 continue
@@ -1932,7 +1932,7 @@ class IBPEnvironment:
             (new_expr_t, new_sub_accum, new_subs, new_resolved_subs, success)
         """
         seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
-        raw = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+        raw = self.get_raw_equation_cached(ibp_op, seed)
         cached = apply_resolved_subs(raw, resolved_subs)
 
         if target not in cached or cached[target] == 0:

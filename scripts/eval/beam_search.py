@@ -181,9 +181,14 @@ def apply_actions_worker(args):
     results = []
 
     for expr_t, subs, resolved_subs, target, ibp_op, delta, action_prob, path, score in action_batch:
+        # Pass expr_t / subs directly (no dict() wrapper). The callee makes its
+        # own copies internally (new_subs = dict(subs)), and uses
+        # apply_substitution_target_only / add_sub_to_resolved which both return
+        # fresh dicts. So the outer dict() wraps were ~60 µs of pure waste per
+        # action at |subs|=300 (microbenchmark: 75% "residual" overhead).
         new_expr_t, new_subs, new_resolved_subs, success = (
             _worker_env.apply_action_resolved_target_only(
-                dict(expr_t), dict(subs), resolved_subs,
+                expr_t, subs, resolved_subs,
                 target, ibp_op, delta, target_sector,
             )
         )
@@ -197,7 +202,6 @@ def apply_actions_worker(args):
         n_non_masters = sum(1 for integral in new_expr_t.keys() if not is_master(integral))
 
         new_path = path + [(target, ibp_op, delta)]
-        import math
         new_score = score + math.log(action_prob + 1e-10)
 
         results.append((new_expr_t, new_subs, new_resolved_subs,
@@ -880,7 +884,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         # original start_expr (see onestep_worker._full_expr).
                         new_expr_t, new_subs, new_resolved_subs, success = (
                             env.apply_action_resolved_target_only(
-                                dict(state.expr), dict(state.subs),
+                                state.expr, state.subs,
                                 state.resolved_subs,
                                 target, ibp_op, delta, target_sector,
                             )
