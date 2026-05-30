@@ -1,0 +1,425 @@
+"""Serial (n_workers=1), delta-tracking beam search.
+
+Every beam state stores ONLY (parent_ref, delta=(target, sol_target)). All
+heavy fields are recomputed incrementally from parent + delta — no full
+rebuilds from scratch each step.
+
+Design (per user pref: optimize for SPEED, memory secondary):
+  - Eager at candidate construction: expr, max_w, n_non_masters, score.
+    These are cheap and used by sort/eval.
+  - Lazy via @property:
+        subs, resolved_subs   — needed by P1 of the NEXT step (survivors only)
+                                 and by DEDUP_VARIANT=rs key (in sort order, so
+                                 only the top ~beam_width candidates get hit)
+        indirect_aux, indirect_cache_list — built by
+                                 compute_indirect_substituted_incremental from
+                                 the parent's aux; only paid for survivors.
+  - End-of-step memory cleanup: for each survivor in the new beam, drop the
+    parent's heavy fields (expr/subs/resolved_subs/aux). Path reconstruction
+    needs only parent.action + parent.parent, which we never clear.
+
+  This means *no IPC, no pickle dance* (worker pool overhead is what killed
+  the original incremental-aux idea), and live memory is bounded to roughly
+  one beam's worth of states.
+"""
+import math
+import random
+import time
+
+import torch
+
+from sailir import ibp_env  # for live N_INDICES / PRIME after init_from_topology
+from sailir.ibp_env import (
+    is_master, weight,
+    apply_resolved_subs, solve_ibp_for, apply_substitution_target_only,
+    add_sub_to_resolved,
+    compute_indirect_substituted_incremental,
+    filter_subs_to_exact_sector, filter_resolved_subs_to_exact_sector,
+    integral_in_exact_sector,
+)
+
+from beam_search_utils import get_non_masters
+
+
+# =============================================================================
+# DeltaState
+# =============================================================================
+class DeltaState:
+    """Beam state defined by (parent, delta) plus eager-cheap fields."""
+    __slots__ = (
+        'parent', 'action', 'score', 'path_len',
+        'expr', 'max_w', 'n_non_masters',
+        '_delta_target', '_delta_sol',
+        '_subs', '_resolved_subs',
+        '_indirect_aux', '_indirect_cache_list',
+        '_env', '_target_sector',
+    )
+
+    def __init__(self, parent, delta_target, delta_sol, action, score, env, target_sector,
+                 expr, max_w, n_non_masters,
+                 subs=None, resolved_subs=None, indirect_aux=None,
+                 indirect_cache_list=None):
+        self.parent = parent
+        self._delta_target = delta_target
+        self._delta_sol = delta_sol
+        self.action = action
+        self.score = score
+        self.path_len = (parent.path_len + 1) if parent is not None else 0
+        self.expr = expr
+        self.max_w = max_w
+        self.n_non_masters = n_non_masters
+        self._subs = subs
+        self._resolved_subs = resolved_subs
+        self._indirect_aux = indirect_aux
+        self._indirect_cache_list = indirect_cache_list
+        self._env = env
+        self._target_sector = target_sector
+
+    # ------------------------------------------------------------------------
+    # Root state
+    # ------------------------------------------------------------------------
+    @classmethod
+    def root(cls, env, start_expr, target_sector):
+        expr = dict(start_expr)
+        mw, nm = _compute_max_w_and_nm(expr)
+        return cls(
+            parent=None, delta_target=None, delta_sol=None, action=None,
+            score=0.0, env=env, target_sector=target_sector,
+            expr=expr, max_w=mw, n_non_masters=nm,
+            subs={}, resolved_subs={},
+            indirect_aux=([], [], {}, []),
+            indirect_cache_list=[],
+        )
+
+    # ------------------------------------------------------------------------
+    # Lazy fields (materialized on first access; folded into self's slots)
+    # ------------------------------------------------------------------------
+    @property
+    def subs(self):
+        if self._subs is None:
+            new = dict(self.parent.subs)
+            new[self._delta_target] = self._delta_sol
+            self._subs = new
+        return self._subs
+
+    @property
+    def resolved_subs(self):
+        if self._resolved_subs is None:
+            self._resolved_subs = add_sub_to_resolved(
+                self.parent.resolved_subs, self._delta_target, self._delta_sol,
+            )
+        return self._resolved_subs
+
+    @property
+    def indirect_aux(self):
+        if self._indirect_aux is None:
+            self._materialize_aux()
+        return self._indirect_aux
+
+    @property
+    def indirect_cache_list(self):
+        if self._indirect_cache_list is None:
+            self._materialize_aux()
+        return self._indirect_cache_list
+
+    def _materialize_aux(self):
+        parent_rs = self.parent.resolved_subs
+        new_resolved_sol = apply_resolved_subs(self._delta_sol, parent_rs)
+        new_rs = self.resolved_subs  # force materialization
+        env = self._env
+        result, aux = compute_indirect_substituted_incremental(
+            self.parent.indirect_aux, self._delta_target, new_resolved_sol, new_rs,
+            env.ibp_t, env.li_t, env.shifts, env._raw_eq_cache,
+        )
+        self._indirect_aux = aux
+        self._indirect_cache_list = result
+
+    # ------------------------------------------------------------------------
+    # Path reconstruction (walks chain — only at finalization)
+    # ------------------------------------------------------------------------
+    def reconstruct_path(self):
+        actions = []
+        s = self
+        while s.parent is not None:
+            actions.append(s.action)
+            s = s.parent
+        actions.reverse()
+        return actions
+
+    @property
+    def path(self):
+        """API-compatibility: production State.path is a list. Lazy build."""
+        return self.reconstruct_path()
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _compute_max_w_and_nm(expr):
+    nm = 0
+    mw = (0, 0)
+    for k, v in expr.items():
+        if v == 0:
+            continue
+        if not is_master(k):
+            nm += 1
+            w = weight(k)
+            wp = (w[0], w[1])
+            if wp > mw:
+                mw = wp
+    return mw, nm
+
+
+def _sort_key(s):
+    """Production '--beam-sort weight' sort key."""
+    return (s.max_w, s.n_non_masters, -s.score)
+
+
+def _dedup_key_rs(s):
+    """Production DEDUP_VARIANT=rs fingerprint."""
+    return frozenset(
+        (sk, frozenset(sv.items()))
+        for sk, sv in s.resolved_subs.items()
+    )
+
+
+# =============================================================================
+# Apply one action → child DeltaState (eager-cheap fields, lazy-heavy)
+# =============================================================================
+def _apply_action(state, target, ibp_op, delta_shift, action_prob, target_sector):
+    env = state._env
+    seed = tuple(target[i] + delta_shift[i] for i in range(ibp_env.N_INDICES))
+    raw = env.get_raw_equation_cached(ibp_op, seed)
+    cached = apply_resolved_subs(raw, state.resolved_subs)
+    if target not in cached or cached[target] == 0:
+        return None
+    sol = solve_ibp_for(cached, target)
+    if sol is None:
+        return None
+    sol_target = {k: v for k, v in sol.items()
+                  if integral_in_exact_sector(k, target_sector)}
+    new_expr = apply_substitution_target_only(state.expr, target, sol_target, target_sector)
+    mw, nm = _compute_max_w_and_nm(new_expr)
+    new_score = state.score + math.log(action_prob + 1e-10)
+    return DeltaState(
+        parent=state,
+        delta_target=target,
+        delta_sol=sol_target,
+        action=(target, ibp_op, delta_shift),
+        score=new_score,
+        env=env,
+        target_sector=target_sector,
+        expr=new_expr,
+        max_w=mw,
+        n_non_masters=nm,
+    )
+
+
+# =============================================================================
+# Beam search
+# =============================================================================
+def beam_search_delta(env, model, start_expr, target_sector,
+                     beam_width=40, max_steps=5000, prime=None,
+                     verbose=True, stop_on_weight_improvement=True,
+                     filter_mode='subsector', device='cpu'):
+    """Serial delta-tracking beam search. Matches production semantics for
+    --beam-sort weight + --dedup-beam-by-content + DEDUP_VARIANT=rs + NO_TABU.
+    Returns (solution, beam, best_weight).
+    """
+    initial_state = DeltaState.root(env, start_expr, target_sector)
+    beam = [initial_state]
+    best_solution = None
+    initial_weight = initial_state.max_w
+    best_weight_ever = initial_weight
+
+    # Lazy import to avoid circular load.
+    from beam_search import prepare_batched_input_v5
+
+    for step in range(max_steps):
+        t_step = time.time()
+
+        # ---- success check ----
+        # Production semantics: `solution` is only non-None when an integral is
+        # fully reduced to masters (n_non_masters == 0). Stopping on weight
+        # improvement returns solution=None — the caller picks the best beam
+        # state via `min(final_beam, key=max_weight)`.
+        weight_improved = False
+        for s in beam:
+            if s.max_w < best_weight_ever:
+                best_weight_ever = s.max_w
+                weight_improved = True
+                if verbose:
+                    print(f'Step {step}: NEW BEST WEIGHT {best_weight_ever} '
+                          f'(started at {initial_weight})', flush=True)
+            if s.n_non_masters == 0:
+                if best_solution is None or s.path_len < best_solution.path_len:
+                    best_solution = s
+        if weight_improved and stop_on_weight_improvement:
+            if verbose:
+                print(f'Step {step}: STOPPING - weight improved', flush=True)
+            return best_solution, beam, best_weight_ever
+        if best_solution is not None:
+            return best_solution, beam, best_weight_ever
+
+        # ---- P1: build tasks + valid actions ----
+        # P1_INSTRUMENT=1 emits per-step wall-clock breakdown of P1 phases:
+        #   nm_tied : get_non_masters + tied-targets selection
+        #   filter  : filter_subs / filter_resolved_subs (per state, once)
+        #   aux     : state.indirect_cache_list materialization (lazy first hit)
+        #   gv      : env.get_valid_actions_with_cache (per target)
+        import os as _os_p1
+        _p1_instr = _os_p1.environ.get('P1_INSTRUMENT') == '1'
+        _p1_t = {'nm_tied': 0.0, 'filter': 0.0, 'aux': 0.0, 'gv': 0.0} if _p1_instr else None
+        t1 = time.time()
+        tasks = []  # list of (state, target, valid_actions)
+        for state in beam:
+            if _p1_instr:
+                _tt = time.perf_counter()
+            non_masters = get_non_masters(state.expr, target_sector)
+            if not non_masters:
+                if _p1_instr:
+                    _p1_t['nm_tied'] += time.perf_counter() - _tt
+                continue
+            mw = state.max_w
+            tied = [k for k in non_masters.keys()
+                    if (weight(k)[0], weight(k)[1]) == mw]
+            if _p1_instr:
+                _p1_t['nm_tied'] += time.perf_counter() - _tt
+            if not tied:
+                continue
+            if _p1_instr:
+                _tt = time.perf_counter()
+            if target_sector is not None:
+                f_subs = filter_subs_to_exact_sector(state.subs, target_sector)
+                f_rs = filter_resolved_subs_to_exact_sector(state.resolved_subs, target_sector)
+            else:
+                f_subs = state.subs
+                f_rs = state.resolved_subs
+            if _p1_instr:
+                _p1_t['filter'] += time.perf_counter() - _tt
+                _tt = time.perf_counter()
+            indirect_cache = state.indirect_cache_list
+            if _p1_instr:
+                _p1_t['aux'] += time.perf_counter() - _tt
+            for target in tied:
+                if _p1_instr:
+                    _tt = time.perf_counter()
+                va = env.get_valid_actions_with_cache(
+                    target, indirect_cache, f_subs, f_rs,
+                    filter_mode=filter_mode, verbose_timing=False,
+                )
+                if _p1_instr:
+                    _p1_t['gv'] += time.perf_counter() - _tt
+                if va:
+                    tasks.append((state, target, va, len(tied)))
+        t1_elapsed = time.time() - t1
+        if _p1_instr:
+            _p1_sum = sum(_p1_t.values())
+            print(f'P1_INSTRUMENT\tstep={step}\tt1={t1_elapsed:.4f}\t'
+                  f'residual={t1_elapsed - _p1_sum:.4f}\t'
+                  f"nm_tied={_p1_t['nm_tied']:.4f}\t"
+                  f"filter={_p1_t['filter']:.4f}\t"
+                  f"aux={_p1_t['aux']:.4f}\t"
+                  f"gv={_p1_t['gv']:.4f}", flush=True)
+
+        if not tasks:
+            if verbose:
+                print(f'Step {step}: no valid actions, stopping', flush=True)
+            break
+
+        # ---- P2: batched model scoring ----
+        t2 = time.time()
+        batch_data = [(s.expr, s.subs, va, target_sector, tg)
+                      for (s, tg, va, _) in tasks]
+        batch, n_valid_actions = prepare_batched_input_v5(batch_data, device)
+        with torch.no_grad():
+            logits, probs = model(
+                batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+                batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'],
+                batch['sub_repl_mask'], batch['sub_mask'],
+                batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+                batch['sector_mask'], batch['target_integral'],
+            )
+        t2_elapsed = time.time() - t2
+
+        # ---- P3: build candidates, sort, dedup ----
+        t3 = time.time()
+        candidates = []
+        for i, (state, target, valid_actions, n_tied) in enumerate(tasks):
+            n_valid = n_valid_actions[i]
+            k_per = max(1, beam_width // n_tied)
+            top_k = min(k_per, n_valid)
+            top_idx = torch.argsort(logits[i, :n_valid], descending=True)[:top_k].tolist()
+            for idx in top_idx:
+                ibp_op, delta_shift = valid_actions[idx]
+                action_prob = probs[i, idx].item()
+                child = _apply_action(state, target, ibp_op, delta_shift,
+                                      action_prob, target_sector)
+                if child is not None:
+                    candidates.append(child)
+
+        candidates.sort(key=_sort_key)
+
+        # Walk in sort order; materialize resolved_subs lazily.
+        seen = set()
+        survivors = []
+        leftovers = []
+        for cand in candidates:
+            key = _dedup_key_rs(cand)  # triggers RS materialization
+            if key in seen:
+                leftovers.append(cand)
+                continue
+            seen.add(key)
+            survivors.append(cand)
+            if len(survivors) >= beam_width:
+                break
+        if len(survivors) < beam_width:
+            survivors.extend(leftovers[:beam_width - len(survivors)])
+        new_beam = survivors[:beam_width]
+        t3_elapsed = time.time() - t3
+
+        # ---- Memory cleanup: drop parent heavy fields ----
+        # Survivors' parents are no longer needed for incremental materialization
+        # because survivors will lazily compute aux/subs/rs from their own state
+        # going forward. Children's properties already cached their parent-derived
+        # dicts (or will, when next step accesses them).
+        #
+        # Concretely: each survivor S has parent P. S.subs is built from P.subs;
+        # next step uses S.subs, not P.subs. Same for resolved_subs and aux.
+        # By forcing materialization of all heavy fields on S now, we can free P.
+        for s in new_beam:
+            _ = s.subs           # force
+            _ = s.resolved_subs  # force
+            _ = s.indirect_cache_list  # force (also fills _indirect_aux)
+        # Now drop parent heavy fields. Parent's action/parent are preserved.
+        seen_parents = set()
+        for s in new_beam:
+            p = s.parent
+            if p is None or id(p) in seen_parents:
+                continue
+            seen_parents.add(id(p))
+            p._subs = None
+            p._resolved_subs = None
+            p._indirect_aux = None
+            p._indirect_cache_list = None
+            p.expr = None  # path reconstruction doesn't need expr
+
+        beam = new_beam
+
+        # ---- Verbose progress ----
+        step_total = time.time() - t_step
+        if verbose:
+            best = min(beam, key=lambda s: s.max_w)
+            print(f'Step {step}: P1={t1_elapsed:.2f}s P2={t2_elapsed:.2f}s '
+                  f'P3={t3_elapsed:.2f}s total={step_total:.2f}s '
+                  f'tasks={len(tasks)} cands={len(candidates)} '
+                  f'best_max_w={best.max_w} nm={best.n_non_masters}',
+                  flush=True)
+            if step < 20:
+                nms = get_non_masters(best.expr, target_sector)
+                for nm in sorted(nms.keys(),
+                                 key=lambda x: (weight(x)[0], weight(x)[1]),
+                                 reverse=True)[:5]:
+                    print(f'    I{list(nm)} weight={weight(nm)[:2]}', flush=True)
+
+    return best_solution, beam, best_weight_ever
