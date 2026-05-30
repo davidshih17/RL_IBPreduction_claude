@@ -418,8 +418,39 @@ def add_sub_to_resolved(resolved_subs, target, sol):
     The function still returns a fresh outer dict — callers can mutate that
     freely; only the value-dicts they pull out should be treated as immutable.
     """
+    # === instrumentation gated by PROD_PROFILE=1 ===
+    # Module-level _ADD_SUB_PROFILE accumulates per-worker counters.
+    # Components measured:
+    #   t_apply_rs_at_entry  cost of apply_resolved_subs(sol, resolved_subs) at step 1
+    #   t_outer_iter         walking resolved_subs and the membership check (skip path)
+    #   t_substitution_work  the per-hit value rewrite (dict-copy + inner k,v loop)
+    # Counters:
+    #   n_calls, n_keys_iterated (sum |resolved_subs|), n_hits (target found),
+    #   n_inner_loop_iters (k,v iterations across all hits)
+    import os as _os_pp
+    _prof = _os_pp.environ.get('PROD_PROFILE') == '1'
+    if _prof:
+        from time import perf_counter as _pc
+        global _ADD_SUB_PROFILE
+        try:
+            _ASP = _ADD_SUB_PROFILE
+        except NameError:
+            _ADD_SUB_PROFILE = {
+                'n_calls': 0, 'n_keys_iterated': 0, 'n_hits': 0,
+                'n_inner_loop_iters': 0,
+                't_total': 0.0, 't_apply_rs_at_entry': 0.0,
+                't_outer_iter': 0.0, 't_substitution_work': 0.0,
+            }
+            _ASP = _ADD_SUB_PROFILE
+        _t_call = _pc()
+
     # Step 1: Resolve the new sol against existing resolved_subs
-    resolved_sol = apply_resolved_subs(sol, resolved_subs)
+    if _prof:
+        _t0 = _pc()
+        resolved_sol = apply_resolved_subs(sol, resolved_subs)
+        _ASP['t_apply_rs_at_entry'] += _pc() - _t0
+    else:
+        resolved_sol = apply_resolved_subs(sol, resolved_subs)
 
     # Step 2: SHALLOW copy of the outer dict; values shared with input.
     new_resolved = dict(resolved_subs)
@@ -427,13 +458,22 @@ def add_sub_to_resolved(resolved_subs, target, sol):
 
     # Step 3: Update existing entries that contain target. COW: only copy
     # a value-dict when we're about to mutate it.
+    if _prof:
+        _ASP['n_keys_iterated'] += len(resolved_subs)
+        _t_sub_work_total = 0.0
+        _t_loop_start = _pc()
     for key, old_value in resolved_subs.items():
         if target not in old_value:
             continue  # unchanged — keep sharing the same value-dict
         # Now we must rewrite this value. Copy it first, then mutate the copy.
+        if _prof:
+            _ASP['n_hits'] += 1
+            _t_inner_start = _pc()
         value = dict(old_value)
         coeff = value.pop(target)
         for k, v in resolved_sol.items():
+            if _prof:
+                _ASP['n_inner_loop_iters'] += 1
             new_coeff = (coeff * v) % PRIME
             if new_coeff == 0:
                 continue
@@ -446,6 +486,15 @@ def add_sub_to_resolved(resolved_subs, target, sol):
             else:
                 value[k] = new_coeff
         new_resolved[key] = value
+        if _prof:
+            _t_sub_work_total += _pc() - _t_inner_start
+
+    if _prof:
+        _t_loop_total = _pc() - _t_loop_start
+        _ASP['t_outer_iter'] += _t_loop_total - _t_sub_work_total
+        _ASP['t_substitution_work'] += _t_sub_work_total
+        _ASP['n_calls'] += 1
+        _ASP['t_total'] += _pc() - _t_call
 
     return new_resolved
 
@@ -1860,6 +1909,69 @@ class IBPEnvironment:
         Returns:
             (new_expr_t, new_subs, new_resolved_subs, success)
         """
+        # === PROD instrumentation gated by env var PROD_PROFILE=1 ===
+        # Accumulates per-worker counters into self._prod_profile (initialized
+        # lazily). Each component timed with perf_counter. Cache hit/miss tracked
+        # by peeking at self._raw_eq_cache BEFORE the lookup. Negligible overhead
+        # when PROD_PROFILE is unset (single env-var check).
+        import os as _os_pp
+        if _os_pp.environ.get('PROD_PROFILE') == '1':
+            from time import perf_counter as _pc
+            if not hasattr(self, '_prod_profile'):
+                self._prod_profile = {
+                    'n_calls': 0, 'n_cache_hit': 0, 'n_cache_miss': 0,
+                    'n_fail_target_zero': 0, 'n_fail_sol_none': 0, 'n_success': 0,
+                    't_total': 0.0, 't_seed': 0.0, 't_get_raw': 0.0,
+                    't_apply_rs': 0.0, 't_solve': 0.0, 't_sol_target': 0.0,
+                    't_new_subs': 0.0, 't_apply_sub': 0.0, 't_add_sub': 0.0,
+                }
+            _pp = self._prod_profile
+            _pp['n_calls'] += 1
+            _t_tot = _pc()
+            _t0 = _pc()
+            seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
+            _pp['t_seed'] += _pc() - _t0
+            _t0 = _pc()
+            _cache_key = (ibp_op, seed)
+            if _cache_key in self._raw_eq_cache:
+                _pp['n_cache_hit'] += 1
+            else:
+                _pp['n_cache_miss'] += 1
+            raw = self.get_raw_equation_cached(ibp_op, seed)
+            _pp['t_get_raw'] += _pc() - _t0
+            _t0 = _pc()
+            cached = apply_resolved_subs(raw, resolved_subs)
+            _pp['t_apply_rs'] += _pc() - _t0
+            if target not in cached or cached[target] == 0:
+                _pp['n_fail_target_zero'] += 1
+                _pp['t_total'] += _pc() - _t_tot
+                return expr_t, subs, resolved_subs, False
+            _t0 = _pc()
+            sol = solve_ibp_for(cached, target)
+            _pp['t_solve'] += _pc() - _t0
+            if sol is None:
+                _pp['n_fail_sol_none'] += 1
+                _pp['t_total'] += _pc() - _t_tot
+                return expr_t, subs, resolved_subs, False
+            _t0 = _pc()
+            sol_target = {k: v for k, v in sol.items()
+                          if integral_in_exact_sector(k, target_sector)}
+            _pp['t_sol_target'] += _pc() - _t0
+            _t0 = _pc()
+            new_subs = dict(subs)
+            new_subs[target] = sol_target
+            _pp['t_new_subs'] += _pc() - _t0
+            _t0 = _pc()
+            new_expr_t = apply_substitution_target_only(expr_t, target, sol_target, target_sector)
+            _pp['t_apply_sub'] += _pc() - _t0
+            _t0 = _pc()
+            new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol_target)
+            _pp['t_add_sub'] += _pc() - _t0
+            _pp['n_success'] += 1
+            _pp['t_total'] += _pc() - _t_tot
+            return new_expr_t, new_subs, new_resolved_subs, True
+        # === end instrumentation block ===
+
         seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
         raw = self.get_raw_equation_cached(ibp_op, seed)
         cached = apply_resolved_subs(raw, resolved_subs)
@@ -1884,6 +1996,42 @@ class IBPEnvironment:
         new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol_target)
 
         return new_expr_t, new_subs, new_resolved_subs, True
+
+    def apply_action_resolved_target_only_lazy_rs(self, expr_t, subs, resolved_subs,
+                                                   target, ibp_op, delta, target_sector):
+        """Like apply_action_resolved_target_only but DEFERS add_sub_to_resolved.
+
+        Returns (new_expr_t, new_subs, sol_target, success). The caller is
+        responsible for computing new_resolved_subs lazily — only for the
+        candidates that survive beam dedup/selection — via:
+            new_resolved_subs = add_sub_to_resolved(resolved_subs, target, sol_target)
+
+        This is the "LAZY_RS" optimization: skip the expensive add_sub_to_resolved
+        for the ~1500 candidates per step that get discarded by dedup or
+        beam-width truncation, only materializing it for the ~40 survivors.
+        """
+        seed = tuple(target[i] + delta[i] for i in range(N_INDICES))
+        raw = self.get_raw_equation_cached(ibp_op, seed)
+        cached = apply_resolved_subs(raw, resolved_subs)
+
+        if target not in cached or cached[target] == 0:
+            return expr_t, subs, None, False
+
+        sol = solve_ibp_for(cached, target)
+        if sol is None:
+            return expr_t, subs, None, False
+
+        sol_target = {k: v for k, v in sol.items()
+                      if integral_in_exact_sector(k, target_sector)}
+
+        new_subs = dict(subs)
+        new_subs[target] = sol_target
+        new_expr_t = apply_substitution_target_only(expr_t, target, sol_target, target_sector)
+
+        # Caller will run add_sub_to_resolved(resolved_subs, target, sol_target)
+        # IF this candidate survives dedup/selection. sol_target is returned so
+        # the caller has everything needed for the materialization.
+        return new_expr_t, new_subs, sol_target, True
 
     def replay_path_to_full_expr(self, start_expr, path):
         """Reconstruct the FULL final_expr (target + sub-sector) by replaying

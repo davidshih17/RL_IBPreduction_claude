@@ -30,8 +30,20 @@ import torch
 from sailir import ibp_env
 from sailir.ibp_env import (
     IBPEnvironment, set_prime, filter_top_sector, is_master, weight, resolve_subs,
-    filter_subs_to_exact_sector, filter_resolved_subs_to_exact_sector
+    filter_subs_to_exact_sector, filter_resolved_subs_to_exact_sector,
+    add_sub_to_resolved,
 )
+
+
+def _materialize_state_rs(s):
+    """If s has deferred resolved_subs (LAZY_RS optimization), compute it.
+    Returns a new State with resolved_subs populated and deferred_rs_info=None.
+    No-op if s already has resolved_subs."""
+    if s.resolved_subs is None and s.deferred_rs_info is not None:
+        parent_rs, target, sol_target = s.deferred_rs_info
+        new_rs = add_sub_to_resolved(parent_rs, target, sol_target)
+        return s._replace(resolved_subs=new_rs, deferred_rs_info=None)
+    return s
 from sailir.classifier import IBPActionClassifier
 from sailir.topology import Topology
 
@@ -56,8 +68,17 @@ from beam_search_utils import (
 # full expr only when the worker returns its final result to the orchestrator.
 State = namedtuple('State',
                    ['expr', 'subs', 'resolved_subs', 'score', 'path', 'n_non_masters',
-                    'indirect_aux', 'sub_accum'])
-State.__new__.__defaults__ = (None, None)  # both default to None
+                    'indirect_aux', 'sub_accum', 'deferred_rs_info', 'max_w'])
+# Defaults: indirect_aux=None, sub_accum=None, deferred_rs_info=None, max_w=None.
+# deferred_rs_info: when set to (parent_resolved_subs, target, sol_target),
+# resolved_subs is None and gets materialized lazily during dedup or before
+# the candidate becomes a beam state. Enables the LAZY_RS optimization: skip
+# add_sub_to_resolved for the ~1500 candidates discarded by dedup/beam-select.
+# max_w: cached max_weight((r,s)) over target-sector non-masters. Computed
+# in the worker at construction (free, in same pass as n_non_masters) so the
+# sort key for ~1500 candidates avoids re-walking each expr 1500 times.
+# When None (e.g., resumed/initial state), falls back to computing on demand.
+State.__new__.__defaults__ = (None, None, None, None)
 
 MAX_REPLACEMENT_TERMS = 20  # Must match training
 
@@ -180,32 +201,97 @@ def apply_actions_worker(args):
     action_batch, target_sector = args
     results = []
 
+    # LAZY_RS=1: skip add_sub_to_resolved in the worker; return sol_target so
+    # the main process can materialize new_resolved_subs lazily ONLY for
+    # candidates that survive dedup/beam-select. Slot 2 of the result tuple
+    # carries new_resolved_subs (eager) or a (None, parent_resolved_subs,
+    # target, sol_target) tuple (lazy).
+    import os as _os_lr
+    _lazy_rs = _os_lr.environ.get('LAZY_RS') == '1'
+
     for expr_t, subs, resolved_subs, target, ibp_op, delta, action_prob, path, score in action_batch:
-        # Pass expr_t / subs directly (no dict() wrapper). The callee makes its
-        # own copies internally (new_subs = dict(subs)), and uses
-        # apply_substitution_target_only / add_sub_to_resolved which both return
-        # fresh dicts. So the outer dict() wraps were ~60 µs of pure waste per
-        # action at |subs|=300 (microbenchmark: 75% "residual" overhead).
-        new_expr_t, new_subs, new_resolved_subs, success = (
-            _worker_env.apply_action_resolved_target_only(
-                expr_t, subs, resolved_subs,
-                target, ibp_op, delta, target_sector,
+        if _lazy_rs:
+            new_expr_t, new_subs, sol_target, success = (
+                _worker_env.apply_action_resolved_target_only_lazy_rs(
+                    expr_t, subs, resolved_subs,
+                    target, ibp_op, delta, target_sector,
+                )
             )
-        )
+        else:
+            # Pass expr_t / subs directly (no dict() wrapper). The callee makes its
+            # own copies internally (new_subs = dict(subs)), and uses
+            # apply_substitution_target_only / add_sub_to_resolved which both return
+            # fresh dicts.
+            new_expr_t, new_subs, new_resolved_subs, success = (
+                _worker_env.apply_action_resolved_target_only(
+                    expr_t, subs, resolved_subs,
+                    target, ibp_op, delta, target_sector,
+                )
+            )
 
         if not success:
             results.append(None)
             continue
 
-        # n_non_masters = non-master keys in target-sector expr_t (which is
-        # exactly the target-sector content by construction).
-        n_non_masters = sum(1 for integral in new_expr_t.keys() if not is_master(integral))
+        # Single pass over new_expr_t.keys() computes BOTH n_non_masters and
+        # max_w (max (r,s) weight over non-masters). max_w cached so the sort
+        # in main process doesn't re-walk each expr; see State.max_w docstring.
+        n_non_masters = 0
+        max_w = (0, 0)
+        for integral in new_expr_t.keys():
+            if not is_master(integral):
+                n_non_masters += 1
+                w = weight(integral)
+                wp = (w[0], w[1])
+                if wp > max_w:
+                    max_w = wp
 
         new_path = path + [(target, ibp_op, delta)]
         new_score = score + math.log(action_prob + 1e-10)
 
-        results.append((new_expr_t, new_subs, new_resolved_subs,
-                        new_path, new_score, n_non_masters))
+        if _lazy_rs:
+            # Slot 2 = LAZY sentinel tuple carrying everything needed to
+            # materialize new_resolved_subs later. parent_resolved_subs is the
+            # `resolved_subs` we just consumed — many candidates share the
+            # same parent, so pickle memo de-dupes the IPC payload across
+            # siblings.
+            lazy_rs_recipe = ('LAZY_RS', resolved_subs, target, sol_target)
+            results.append((new_expr_t, new_subs, lazy_rs_recipe,
+                            new_path, new_score, n_non_masters, max_w))
+        else:
+            results.append((new_expr_t, new_subs, new_resolved_subs,
+                            new_path, new_score, n_non_masters, max_w))
+
+    # PROD_PROFILE: emit per-batch cumulative stats from this worker's env
+    import os as _os_pp
+    if _os_pp.environ.get('PROD_PROFILE') == '1' and hasattr(_worker_env, '_prod_profile'):
+        _pp = _worker_env._prod_profile
+        _pid = _os_pp.getpid()
+        # Single tab-separated line per batch so they're parseable
+        print(f'PROD_PROFILE\tpid={_pid}\tbatch_size={len(action_batch)}\t'
+              f'n_calls={_pp["n_calls"]}\t'
+              f'hits={_pp["n_cache_hit"]}\tmiss={_pp["n_cache_miss"]}\t'
+              f'success={_pp["n_success"]}\tfail_tgt0={_pp["n_fail_target_zero"]}\tfail_solN={_pp["n_fail_sol_none"]}\t'
+              f't_total={_pp["t_total"]:.4f}\tt_seed={_pp["t_seed"]:.4f}\t'
+              f't_get_raw={_pp["t_get_raw"]:.4f}\tt_apply_rs={_pp["t_apply_rs"]:.4f}\t'
+              f't_solve={_pp["t_solve"]:.4f}\tt_sol_target={_pp["t_sol_target"]:.4f}\t'
+              f't_new_subs={_pp["t_new_subs"]:.4f}\tt_apply_sub={_pp["t_apply_sub"]:.4f}\t'
+              f't_add_sub={_pp["t_add_sub"]:.4f}',
+              flush=True)
+        # Also emit add_sub_to_resolved sub-breakdown
+        from sailir import ibp_env as _ibp_mod
+        _asp = getattr(_ibp_mod, '_ADD_SUB_PROFILE', None)
+        if _asp:
+            print(f'ADD_SUB_PROFILE\tpid={_pid}\t'
+                  f'n_calls={_asp["n_calls"]}\t'
+                  f'n_keys_iterated={_asp["n_keys_iterated"]}\t'
+                  f'n_hits={_asp["n_hits"]}\t'
+                  f'n_inner_loop_iters={_asp["n_inner_loop_iters"]}\t'
+                  f't_total={_asp["t_total"]:.4f}\t'
+                  f't_apply_rs_at_entry={_asp["t_apply_rs_at_entry"]:.4f}\t'
+                  f't_outer_iter={_asp["t_outer_iter"]:.4f}\t'
+                  f't_substitution_work={_asp["t_substitution_work"]:.4f}',
+                  flush=True)
 
     return results
 
@@ -334,7 +420,10 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
         return (sum(weight(k)[0] for k in nms), sum(weight(k)[1] for k in nms))
 
     def _sort_key_weight(s):
-        mw = max_weight(s.expr, target_sector)
+        # Use cached s.max_w when populated (set by worker; avoids re-walking
+        # expr 1500 times during sort). Falls back to on-demand compute for
+        # states that lack it (initial state, resumed checkpoints).
+        mw = s.max_w if s.max_w is not None else max_weight(s.expr, target_sector)
         return (mw, s.n_non_masters, -s.score)
 
     def _sort_key_totalweight(s):
@@ -342,7 +431,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
         return (tw, s.n_non_masters, -s.score)
 
     def _sort_key(s):
-        mw = max_weight(s.expr, target_sector)
+        mw = s.max_w if s.max_w is not None else max_weight(s.expr, target_sector)
         if beam_sort == 'weight':
             return (mw, s.n_non_masters, -s.score)
         elif beam_sort == 'nterms':
@@ -574,6 +663,14 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
             # PHASE 1: Collect all (state, target) pairs and get valid actions
             t1 = time.time()
+            # P1_INSTRUMENT=1 emits a per-step breakdown of where P1 wall goes
+            # (build_tasks / group / pool_map / collect / build_batch). Residual
+            # must be small or there's unaccounted-for work.
+            import os as _os_p1i
+            _p1_instr = _os_p1i.environ.get('P1_INSTRUMENT') == '1'
+            _p1_t = {} if _p1_instr else None
+            _p1_t0 = time.perf_counter() if _p1_instr else 0
+            _t_build_tasks_start = time.perf_counter() if _p1_instr else 0
 
             # First pass: collect all (state_idx, state, target) tuples
             tasks = []
@@ -591,6 +688,10 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 else:
                     for target in tied_targets:
                         tasks.append((state_idx, state, target, len(tied_targets)))
+
+            if _p1_instr:
+                _p1_t['build_tasks'] = time.perf_counter() - _t_build_tasks_start
+                _t_group_start = time.perf_counter()
 
             # Get valid actions with parallel state processing
             if use_resolved_subs and pool is not None:
@@ -619,10 +720,16 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         filter_mode
                     ))
 
+                if _p1_instr:
+                    _p1_t['group'] = time.perf_counter() - _t_group_start
+                    _t_pool_start = time.perf_counter()
                 # Parallel execution
                 t_parallel = time.time()
                 all_results = pool.map(process_state_tasks, worker_args)
                 t_parallel_elapsed = time.time() - t_parallel
+                if _p1_instr:
+                    _p1_t['pool_map'] = time.perf_counter() - _t_pool_start
+                    _t_collect_start = time.perf_counter()
 
                 # Collect results
                 import os
@@ -677,9 +784,17 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
                 if verbose and step % 10 == 0:
                     print(f"    [P1 parallel] {n_unique_states} states across {n_workers} workers in {t_parallel_elapsed:.3f}s", flush=True)
+                if _p1_instr:
+                    _p1_t['collect'] = time.perf_counter() - _t_collect_start
 
             elif use_resolved_subs:
                 # Sequential fallback (single worker or n_workers=1)
+                if _p1_instr:
+                    _p1_t['group'] = time.perf_counter() - _t_group_start
+                    _t_seq_filter = 0.0
+                    _t_seq_compute_cache = 0.0
+                    _t_seq_get_valid = 0.0
+                    _t_pool_start = time.perf_counter()
                 valid_actions_list = [None] * len(tasks)
                 from collections import defaultdict
                 tasks_by_state = defaultdict(list)
@@ -690,14 +805,22 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 for state_idx, state_tasks in tasks_by_state.items():
                     state = state_tasks[0][1][1]
 
+                    if _p1_instr:
+                        _tt = time.perf_counter()
                     if target_sector is not None:
                         filtered_subs = filter_subs_to_exact_sector(state.subs, target_sector)
                         filtered_resolved = filter_resolved_subs_to_exact_sector(state.resolved_subs, target_sector)
                     else:
                         filtered_subs = state.subs
                         filtered_resolved = state.resolved_subs
+                    if _p1_instr:
+                        _t_seq_filter += time.perf_counter() - _tt
+                        _tt = time.perf_counter()
 
                     indirect_cache = env.compute_indirect_cache(filtered_subs, filtered_resolved)
+                    if _p1_instr:
+                        _t_seq_compute_cache += time.perf_counter() - _tt
+                        _tt = time.perf_counter()
 
                     for task_idx, t in state_tasks:
                         target = t[2]
@@ -705,6 +828,17 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                             target, indirect_cache, filtered_subs, filtered_resolved,
                             filter_mode=filter_mode, verbose_timing=False
                         )
+                    if _p1_instr:
+                        _t_seq_get_valid += time.perf_counter() - _tt
+                if _p1_instr:
+                    # In the n_workers=1 sequential branch, the "pool_map" bucket
+                    # represents the whole serial loop. Split it into filter +
+                    # compute_cache + get_valid sub-buckets.
+                    _p1_t['pool_map'] = time.perf_counter() - _t_pool_start
+                    _p1_t['seq_filter'] = _t_seq_filter
+                    _p1_t['seq_compute_cache'] = _t_seq_compute_cache
+                    _p1_t['seq_get_valid'] = _t_seq_get_valid
+                    _p1_t['collect'] = 0.0  # no separate collect in sequential branch
             else:
                 valid_actions_list = []
                 for t in tasks:
@@ -718,6 +852,8 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         env.get_valid_actions_cached(target, filtered_subs, filter_mode=filter_mode)
                     )
 
+            if _p1_instr:
+                _t_build_batch_start = time.perf_counter()
             # Build batch_data and batch_meta from results
             batch_data = []
             batch_meta = []
@@ -730,7 +866,30 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
             if not batch_data:
                 break
+            if _p1_instr:
+                _p1_t['build_batch'] = time.perf_counter() - _t_build_batch_start
             t1_elapsed = time.time() - t1
+            # P1_INSTRUMENT: emit per-step sub-phase breakdown with residual.
+            # Only TOP-LEVEL buckets (build_tasks, group, pool_map, collect,
+            # build_batch) count toward the sum/residual. The seq_* fields are
+            # informational sub-splits of pool_map for the n_workers=1 branch.
+            if _p1_instr:
+                _p1_total = time.perf_counter() - _p1_t0
+                _top_keys = ('build_tasks', 'group', 'pool_map', 'collect', 'build_batch')
+                _p1_sum = sum(_p1_t.get(k, 0.0) for k in _top_keys)
+                _p1_residual = _p1_total - _p1_sum
+                _fmt1 = lambda k: f"{k}={_p1_t.get(k, 0.0):.4f}"
+                print(
+                    f"P1_INSTRUMENT\tstep={step}\t"
+                    f"t1_elapsed={t1_elapsed:.4f}\t"
+                    f"perf_total={_p1_total:.4f}\t"
+                    f"residual={_p1_residual:.4f}\t"
+                    f"{_fmt1('build_tasks')}\t{_fmt1('group')}\t"
+                    f"{_fmt1('pool_map')}\t{_fmt1('collect')}\t"
+                    f"{_fmt1('build_batch')}\t"
+                    f"{_fmt1('seq_filter')}\t{_fmt1('seq_compute_cache')}\t{_fmt1('seq_get_valid')}",
+                    flush=True,
+                )
 
             # PHASE 2: Batched model inference (sub-batched to limit memory)
             t2 = time.time()
@@ -786,6 +945,13 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
 
             # PHASE 3: Extract top-k actions and create candidates (PARALLEL)
             t3 = time.time()
+            # P3_INSTRUMENT=1 emits a fine-grained per-step breakdown of where
+            # P3 wall time goes (build_actions / pool_map / result_collection
+            # / sort / dedup / lazy_materialize / tabu_update).
+            import os as _os_p3i
+            _p3_instr = _os_p3i.environ.get('P3_INSTRUMENT') == '1'
+            _p3_t = {} if _p3_instr else None
+            _p3_t0 = time.perf_counter() if _p3_instr else 0
             candidates = []
             candidate_halves = []  # For mixed mode: 0=weight beam, 1=total beam
             # candidate_parents: id(state)->parent state_idx (in PREVIOUS beam).
@@ -795,6 +961,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
             candidate_parents = {}
 
             if use_resolved_subs and pool is not None:
+                _t_build_start = time.perf_counter() if _p3_instr else 0
                 # Collect all actions to apply
                 all_actions = []
                 all_action_halves = []  # For mixed mode: track source beam
@@ -826,40 +993,63 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         all_action_halves.append(action_half)
                         all_action_parents.append(state_idx)
 
+                if _p3_instr:
+                    _p3_t['build_actions'] = time.perf_counter() - _t_build_start
+
                 # Distribute actions across workers
                 if all_actions:
+                    if _p3_instr:
+                        _t_chunk_start = time.perf_counter()
                     n_actions = len(all_actions)
                     chunk_size = max(1, n_actions // n_workers)
                     action_chunks = []
                     for j in range(0, n_actions, chunk_size):
                         chunk = all_actions[j:j + chunk_size]
                         action_chunks.append((chunk, target_sector))
+                    if _p3_instr:
+                        _p3_t['chunk'] = time.perf_counter() - _t_chunk_start
 
                     # Parallel execution
                     t_p3_parallel = time.time()
                     all_results = pool.map(apply_actions_worker, action_chunks)
                     t_p3_parallel_elapsed = time.time() - t_p3_parallel
+                    if _p3_instr:
+                        _p3_t['pool_map'] = t_p3_parallel_elapsed
 
                     # Collect results
+                    if _p3_instr:
+                        _t_collect_start = time.perf_counter()
                     flat_idx = 0
                     for chunk_results in all_results:
                         for result in chunk_results:
                             if result is not None:
-                                new_expr_t, new_subs, new_resolved_subs, new_path, new_score, n_non_masters = result
+                                new_expr_t, new_subs, slot2, new_path, new_score, n_non_masters, _mw = result
+                                # slot2 is either new_resolved_subs (eager) or
+                                # ('LAZY_RS', parent_rs, target, sol_target) (deferred).
+                                if isinstance(slot2, tuple) and len(slot2) == 4 and slot2[0] == 'LAZY_RS':
+                                    _new_rs = None
+                                    _deferred = (slot2[1], slot2[2], slot2[3])  # (parent_rs, target, sol_target)
+                                else:
+                                    _new_rs = slot2
+                                    _deferred = None
                                 _cand = State(
                                     expr=new_expr_t,
                                     subs=new_subs,
-                                    resolved_subs=new_resolved_subs,
+                                    resolved_subs=_new_rs,
                                     score=new_score,
                                     path=new_path,
                                     n_non_masters=n_non_masters,
                                     indirect_aux=None,
                                     sub_accum=None,  # Option F: no sub_accum tracking; reconstruct at end
+                                    deferred_rs_info=_deferred,
+                                    max_w=_mw,
                                 )
                                 candidates.append(_cand)
                                 candidate_halves.append(all_action_halves[flat_idx])
                                 candidate_parents[id(_cand)] = all_action_parents[flat_idx]
                             flat_idx += 1
+                    if _p3_instr:
+                        _p3_t['collect'] = time.perf_counter() - _t_collect_start
 
                     if verbose and step % 10 == 0:
                         print(f"    [P3 parallel] {n_actions} actions across {len(action_chunks)} chunks in {t_p3_parallel_elapsed:.3f}s", flush=True)
@@ -970,10 +1160,28 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 leftovers = []
                 dup_samples = []
                 _dumped = False
+                _variant_needs_rs = _variant in ('rs', 'expr_rs')
                 # Dedup by chosen key AND exclude previously-visited exprs
                 # (tabu list). Tabu always uses expr-key, regardless of dedup
                 # variant — we don't want to revisit literal expr regions.
                 for s in sorted_cands:
+                    # Look up parent BEFORE any State replacement (id(s) changes).
+                    _p = candidate_parents.get(id(s)) if _parent_count is not None else None
+
+                    # Cheap rejections first (don't materialize for these).
+                    expr_key_for_tabu = frozenset(s.expr.items())
+                    is_tabu = (not _no_tabu) and (expr_key_for_tabu in visited_exprs)
+                    _over_quota = (_parent_count is not None and _p is not None
+                                   and _parent_count.get(_p, 0) >= _max_per_parent)
+                    if is_tabu or _over_quota:
+                        leftovers.append(s)
+                        continue
+
+                    # LAZY_RS: materialize resolved_subs only when about to compute
+                    # an rs-based dedup key. Skipped for 'expr' variant.
+                    if _variant_needs_rs and s.resolved_subs is None and s.deferred_rs_info is not None:
+                        s = _materialize_state_rs(s)
+
                     if _variant == 'rs':
                         key = frozenset(
                             (sk, frozenset(sv.items()))
@@ -987,15 +1195,7 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                         key = (frozenset(s.expr.items()), rs_key)
                     else:  # 'expr' (default)
                         key = frozenset(s.expr.items())
-                    expr_key_for_tabu = frozenset(s.expr.items())
-                    is_tabu = (not _no_tabu) and (expr_key_for_tabu in visited_exprs)
-                    # Parent-quota rejection: track parent of s (None if unknown,
-                    # which only happens for resumed/migrated states from old
-                    # checkpoints — in that case the quota does not apply to s).
-                    _p = candidate_parents.get(id(s)) if _parent_count is not None else None
-                    _over_quota = (_parent_count is not None and _p is not None
-                                   and _parent_count.get(_p, 0) >= _max_per_parent)
-                    if is_tabu or key in seen or _over_quota:
+                    if key in seen:
                         leftovers.append(s)
                         if _dbg and len(dup_samples) < 3:
                             dup_samples.append((len(s.expr), len(s.resolved_subs),
@@ -1042,6 +1242,8 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                     unique = unique[:k]
                 return unique
 
+            if _p3_instr:
+                _t_select_start = time.perf_counter()
             # Select top beam_width candidates
             if beam_sort == 'mixed':
                 # Parallel beams: each beam independently selects top beam_width
@@ -1092,11 +1294,30 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
                 beam = h0_selected + h1_deduped
                 weight_beam_end = len(h0_selected)
             else:
+                if _p3_instr:
+                    _t_sort_only = time.perf_counter()
                 candidates.sort(key=_sort_key)
+                if _p3_instr:
+                    _p3_t['sort_only'] = time.perf_counter() - _t_sort_only
+                    _t_dedup_only = time.perf_counter()
                 if dedup_beam_by_content:
                     beam = _take_top_unique_by_content(candidates, beam_width)
                 else:
                     beam = candidates[:beam_width]
+                if _p3_instr:
+                    _p3_t['dedup_only'] = time.perf_counter() - _t_dedup_only
+            if _p3_instr:
+                _p3_t['sort_dedup_select'] = time.perf_counter() - _t_select_start
+                _t_mat_start = time.perf_counter()
+            # LAZY_RS post-selection: any survivor whose resolved_subs is still
+            # None (came in deferred and was either expr-only-deduped or padded
+            # in from leftovers, or this is a dedup-OFF path) must be
+            # materialized NOW — beam states need full resolved_subs for the
+            # next step's Phase 1 (compute_indirect_substituted).
+            beam = [_materialize_state_rs(_s) for _s in beam]
+            if _p3_instr:
+                _p3_t['lazy_materialize'] = time.perf_counter() - _t_mat_start
+                _t_tabu_start = time.perf_counter()
             # Register the new beam's exprs in the tabu set so they can't be
             # revisited on future steps. Done AFTER selection so that the
             # current step's beam can include exprs from the current
@@ -1107,7 +1328,28 @@ def beam_search(env, model, start_expr, beam_width=10, max_steps=100, device='cp
             if dedup_beam_by_content and not _no_tabu_upd:
                 for _s in beam:
                     visited_exprs.add(frozenset(_s.expr.items()))
+            if _p3_instr:
+                _p3_t['tabu_update'] = time.perf_counter() - _t_tabu_start
             t3_elapsed = time.time() - t3
+            # P3_INSTRUMENT: emit per-step sub-phase breakdown with residual.
+            # Sum of all buckets + residual MUST equal t3_elapsed exactly so
+            # we can verify no work in P3 is unaccounted for.
+            if _p3_instr:
+                _p3_total = time.perf_counter() - _p3_t0
+                _p3_sum = sum(_p3_t.values())
+                _p3_residual = _p3_total - _p3_sum
+                _fmt = lambda k: f"{k}={_p3_t.get(k, 0.0):.4f}"
+                print(
+                    f"P3_INSTRUMENT\tstep={step}\t"
+                    f"t3_elapsed={t3_elapsed:.4f}\t"
+                    f"perf_total={_p3_total:.4f}\t"
+                    f"residual={_p3_residual:.4f}\t"
+                    f"{_fmt('build_actions')}\t{_fmt('chunk')}\t"
+                    f"{_fmt('pool_map')}\t{_fmt('collect')}\t"
+                    f"{_fmt('sort_dedup_select')}\t{_fmt('sort_only')}\t{_fmt('dedup_only')}\t"
+                    f"{_fmt('lazy_materialize')}\t{_fmt('tabu_update')}",
+                    flush=True,
+                )
             step_elapsed = time.time() - step_start
 
             # Optional: dump every beam state's FULL contents per step.
