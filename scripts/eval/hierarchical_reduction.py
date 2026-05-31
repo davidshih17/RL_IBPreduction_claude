@@ -111,7 +111,8 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                          paper_masters_only=True, cpus=1, beam_sort='mixed',
                          checkpoint_path=None, checkpoint_interval=50,
                          checkpoint_time_seconds=300, resume_from=None,
-                         dedup_beam_by_content=False):
+                         dedup_beam_by_content=False,
+                         use_delta_worker=False, memory_gb=None):
     """Create a Condor submit file for a single-integral one-step reduction.
 
     PAPER DEFAULTS (matches trianglebox-paper recipe):
@@ -121,6 +122,15 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     checkpoint_interval steps. If resume_from is set, the worker loads that
     checkpoint and continues — used by straggler resubmits to skip work the
     killed 1-CPU worker already did.
+
+    use_delta_worker=True: dispatch to delta_onestep_worker.py instead of
+    onestep_worker.py. The delta worker only accepts a smaller set of flags:
+    paper_masters_only, beam_width, max_steps, prime, device. n_workers,
+    beam_sort, dedup_beam_by_content, checkpoint_path, resume_from are all
+    silently ignored (the delta beam search is serial 1-cpu, no checkpoint
+    needed because no straggler workflow when stragglers are disabled).
+
+    memory_gb: explicit memory request. If None, falls back to 4 * cpus.
     """
 
     integral_str = ','.join(str(x) for x in integral)
@@ -135,7 +145,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     resume_flag = f' --resume-from {resume_from}' if resume_from else ''
     # Worker now defaults to dedup OFF. Only emit a flag if we want to ENABLE dedup.
     dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
-    memory = 4 * cpus  # Scale memory with CPUs
+    memory = memory_gb if memory_gb is not None else 4 * cpus
 
     # Schedule by hierarchical weight (level, r, s) — level dominates because
     # reductions are sector-by-sector, so an L8 integral with low (r,s) must
@@ -146,11 +156,30 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     r, s = weight(integral)[:2]
     job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
 
-    # Use v13 one-step worker - reduces by one weight level then returns
-    # The async loop will cache and resubmit as needed
+    if use_delta_worker:
+        # delta_onestep_worker.py: serial 1-cpu, delta-tracking beam search
+        # with Cython phase1b + Phase A. CLI surface is smaller — drops
+        # checkpoint, resume, n_workers, beam_sort, dedup flags.
+        worker_script = 'delta_onestep_worker.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}')
+    else:
+        worker_script = 'onestep_worker.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}{n_workers_flag}{beam_sort_flag}'
+                       f'{cp_flag}{resume_flag}{dedup_flag}')
+
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
-arguments = -u {REPO_DIR}/scripts/eval/onestep_worker.py --topology {topology_dir} --integral='{integral_str}' --output {output_file} --model-checkpoint {model_checkpoint} --beam_width {beam_width} --max_steps {max_steps} --prime {prime} --device cpu -v{paper_masters_flag}{n_workers_flag}{beam_sort_flag}{cp_flag}{resume_flag}{dedup_flag}
+arguments = -u {REPO_DIR}/scripts/eval/{worker_script}{worker_args}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log
@@ -308,6 +337,19 @@ def main():
                              'and the search keeps only one beam slot per distinct '
                              'fingerprint. Turn ON for hard integrals like (8,4) '
                              'pentagon-box; see memory/sailir_84_full_resolved_subs_dedup.md.')
+    parser.add_argument('--use-delta-worker', action='store_true',
+                        help='Dispatch workers to delta_onestep_worker.py '
+                             '(serial 1-cpu delta-tracking + Cython). Drops '
+                             'flags the delta worker does not accept '
+                             '(n_workers, beam_sort, dedup, checkpoint, '
+                             'resume). Use with large --straggler-timeout '
+                             'and --straggler2-timeout to disable the '
+                             'straggler escalation entirely.')
+    parser.add_argument('--worker-memory-gb', type=int, default=None,
+                        help='Override per-worker memory request (GB). '
+                             'Default scales with cpus (4 * cpus). For the '
+                             'delta worker on heavy targets like (8,5), set '
+                             'to 16 or 32 to leave room for the aux growth.')
     parser.add_argument('--resume', action='store_true',
                         help='Resume: on startup, scan work_dir/results/*.pkl and '
                              'load each completed worker as a cache entry. Then '
@@ -513,6 +555,8 @@ def main():
                 checkpoint_time_seconds=args.checkpoint_time_seconds,
                 resume_from=resume_from,
                 dedup_beam_by_content=args.worker_dedup_beam_by_content,
+                use_delta_worker=args.use_delta_worker,
+                memory_gb=args.worker_memory_gb,
             )
 
             if args.dry_run:
@@ -603,6 +647,8 @@ def main():
                     checkpoint_time_seconds=args.checkpoint_time_seconds,
                     resume_from=resume_from,
                     dedup_beam_by_content=args.worker_dedup_beam_by_content,
+                    use_delta_worker=args.use_delta_worker,
+                    memory_gb=args.worker_memory_gb,
                 )
 
                 new_cluster_id = submit_condor_job(submit_file)
@@ -665,6 +711,8 @@ def main():
                     checkpoint_time_seconds=args.checkpoint_time_seconds,
                     resume_from=resume_from,
                     dedup_beam_by_content=True,  # force dedup at this level
+                    use_delta_worker=args.use_delta_worker,
+                    memory_gb=args.worker_memory_gb,
                 )
 
                 new_cluster_id = submit_condor_job(submit_file)
@@ -757,12 +805,24 @@ def main():
 
             # Top-N (L, r) buckets — collapse s since it's secondary.
             Lr_counts = {}
+            # Per-level: count of non-masters and max (r, s) weight.
+            L_counts = {}
+            L_maxw = {}
             for i in non_masters:
-                L, r, _ = full_weight(i)
+                L, r, s_ = full_weight(i)
                 key = (L, r)
                 Lr_counts[key] = Lr_counts.get(key, 0) + 1
+                L_counts[L] = L_counts.get(L, 0) + 1
+                prev = L_maxw.get(L)
+                if prev is None or (r, s_) > prev:
+                    L_maxw[L] = (r, s_)
             top = sorted(Lr_counts.items(), key=lambda kv: (-kv[0][0], -kv[0][1]))[:15]
             hist_str = " ".join(f"L{L}r{r}:{n}" for (L, r), n in top)
+            # Per-level max-weight summary, highest level first.
+            maxw_str = " ".join(
+                f"L{L}: n={L_counts[L]} max=(r={L_maxw[L][0]},s={L_maxw[L][1]})"
+                for L in sorted(L_counts, reverse=True)
+            )
 
             # Rolling work-rate ETA over the last ~10 status prints.
             work_history.append((time.time(), work))
@@ -783,6 +843,7 @@ def main():
                   f"work={work} ({eta_str}) | "
                   f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
             print(f"           [hist] {hist_str}")
+            print(f"           [maxw] {maxw_str}")
         else:
             print(f"[Iter {iteration}] {masters_count} masters, 0 non-masters | "
                   f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
