@@ -26,6 +26,25 @@ import torch
 from sailir import topology as _topology_module
 from sailir.topology import Topology
 
+# Optional Cython fast paths. Built via
+# `python sailir/_setup_cython.py build_ext --inplace`; .so files live at
+# the project root. Each falls back to pure-Python when missing.
+try:
+    from _enumerate_inner import phase1b_filter as _PHASE1B_CY
+except ImportError:
+    _PHASE1B_CY = None
+
+try:
+    from _cic_inner import (
+        phase_a_apply as _PHASE_A_CY,
+        build_result as _BUILD_RESULT_CY,
+        cached_union_bitmask_cy as _UBM_CY,
+    )
+except ImportError:
+    _PHASE_A_CY = None
+    _BUILD_RESULT_CY = None
+    _UBM_CY = None
+
 # Default prime - can be changed with set_prime()
 PRIME = 2147483647
 
@@ -1152,6 +1171,37 @@ def _substitute_one_in_cached(cached, sub_key, replacement):
     return new_cached
 
 
+# Per-call wall-clock breakdown accumulator. Populated when env
+# BEAM_PROFILE_CIC_INC=1 is set. The caller reads and resets between
+# steps — see beam_search_delta for the per-step aggregation pattern.
+_CIC_INC_PROFILE = {
+    'n_calls': 0,
+    't_unpack': 0.0,
+    't_phaseA_iter': 0.0,
+    't_phaseA_substitute': 0.0,
+    't_phaseA_bitmask': 0.0,
+    't_rid_copy': 0.0,
+    't_phaseB_subcache': 0.0,
+    't_phaseB_iraws_build': 0.0,
+    't_phaseB_dedup_raws': 0.0,
+    't_phaseB_apply_batch': 0.0,
+    't_phaseB_new_bitmask': 0.0,
+    't_iraws_concat': 0.0,
+    't_result_build': 0.0,
+    'n_phaseA_fast_path': 0,
+    'n_phaseA_substituted': 0,
+    'n_phaseB_new_raws': 0,
+    'n_phaseB_unique_raws': 0,
+    'len_prev_cu': 0,
+    'len_prev_iraws': 0,
+}
+
+def _cic_inc_reset():
+    """Zero the per-step accumulator."""
+    for k in _CIC_INC_PROFILE:
+        _CIC_INC_PROFILE[k] = 0 if isinstance(_CIC_INC_PROFILE[k], int) else 0.0
+
+
 def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved_sol,
                                               new_resolved_subs, ibp_t, li_t, shifts,
                                               raw_eq_cache):
@@ -1169,22 +1219,80 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
 
     Returns: (result, new_aux) in same shape as compute_indirect_substituted +
              returned aux for chaining further incremental calls.
+
+    BEAM_PROFILE_CIC_INC=1: accumulates per-phase wall-clock into
+    ibp_env._CIC_INC_PROFILE so the caller can audit where P4 time goes.
     """
+    import os as _os, time as _time
+    _prof = bool(_os.environ.get('BEAM_PROFILE_CIC_INC'))
+    _p = _CIC_INC_PROFILE
+
+    if _prof:
+        _t0 = _time.perf_counter()
     prev_cu, prev_ubm, prev_rid, prev_iraws = prev_aux
+    if _prof:
+        _p['t_unpack'] += _time.perf_counter() - _t0
+        _p['n_calls'] += 1
+        _p['len_prev_cu'] += len(prev_cu)
+        _p['len_prev_iraws'] += len(prev_iraws)
 
     # Phase A: update existing cached entries to substitute new_sub_int.
-    new_cu = []
-    new_ubm = []
-    for old_c, old_ub in zip(prev_cu, prev_ubm):
-        new_c = _substitute_one_in_cached(old_c, new_sub_int, new_resolved_sol)
-        if new_c is old_c:
-            new_cu.append(old_c)
-            new_ubm.append(old_ub)
-        else:
-            new_cu.append(new_c)
-            new_ubm.append(cached_union_bitmask(new_c))
+    # Cython fast path folds the per-iteration calls to
+    # _substitute_one_in_cached and cached_union_bitmask into native code.
+    if _PHASE_A_CY is not None:
+        if _prof:
+            _t_phaseA_start = _time.perf_counter()
+        new_cu, new_ubm, _n_fast, _n_sub = _PHASE_A_CY(
+            prev_cu, prev_ubm, new_sub_int, new_resolved_sol,
+            PRIME, _BITMASK_CACHE, N_INDICES,
+        )
+        if _prof:
+            # Whole Phase A in one bucket; sub-line breakdown isn't
+            # reachable from inside Cython without per-iter timing.
+            _p['t_phaseA_iter'] += _time.perf_counter() - _t_phaseA_start
+            _p['n_phaseA_fast_path'] += _n_fast
+            _p['n_phaseA_substituted'] += _n_sub
+    else:
+        if _prof:
+            _t_iter_start = _time.perf_counter()
+            _t_sub = 0.0
+            _t_bm = 0.0
+            _n_fast = 0
+            _n_sub = 0
+        new_cu = []
+        new_ubm = []
+        for old_c, old_ub in zip(prev_cu, prev_ubm):
+            if _prof:
+                _ts = _time.perf_counter()
+            new_c = _substitute_one_in_cached(old_c, new_sub_int, new_resolved_sol)
+            if _prof:
+                _t_sub += _time.perf_counter() - _ts
+            if new_c is old_c:
+                new_cu.append(old_c)
+                new_ubm.append(old_ub)
+                if _prof:
+                    _n_fast += 1
+            else:
+                new_cu.append(new_c)
+                if _prof:
+                    _tb = _time.perf_counter()
+                new_ubm.append(cached_union_bitmask(new_c))
+                if _prof:
+                    _t_bm += _time.perf_counter() - _tb
+                    _n_sub += 1
+        if _prof:
+            _t_iter = _time.perf_counter() - _t_iter_start
+            _p['t_phaseA_iter'] += _t_iter - _t_sub - _t_bm
+            _p['t_phaseA_substitute'] += _t_sub
+            _p['t_phaseA_bitmask'] += _t_bm
+            _p['n_phaseA_fast_path'] += _n_fast
+            _p['n_phaseA_substituted'] += _n_sub
 
+    if _prof:
+        _t = _time.perf_counter()
     new_rid = dict(prev_rid)
+    if _prof:
+        _p['t_rid_copy'] += _time.perf_counter() - _t
 
     # Phase B: add new raws coming from new_sub_int.
     if '_sub_cache' not in raw_eq_cache:
@@ -1197,6 +1305,8 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
             raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
         return raw_eq_cache[key]
 
+    if _prof:
+        _t = _time.perf_counter()
     if new_sub_int in sub_cache:
         new_raw_list = sub_cache[new_sub_int]
     else:
@@ -1208,9 +1318,17 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
                 if new_sub_int in raw and raw[new_sub_int] != 0:
                     new_raw_list.append((ibp_op, shift, raw))
         sub_cache[new_sub_int] = new_raw_list
+    if _prof:
+        _p['t_phaseB_subcache'] += _time.perf_counter() - _t
 
+    if _prof:
+        _t = _time.perf_counter()
     new_iraws_for_new = [(new_sub_int, op, sh, r) for op, sh, r in new_raw_list]
+    if _prof:
+        _p['t_phaseB_iraws_build'] += _time.perf_counter() - _t
 
+    if _prof:
+        _t = _time.perf_counter()
     raws_to_apply = []
     for sub_int, op, sh, raw in new_iraws_for_new:
         rid = id(raw)
@@ -1220,20 +1338,47 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
             # don't all collapse to the same len(new_cu) value.
             new_rid[rid] = len(new_cu) + len(raws_to_apply)
             raws_to_apply.append(raw)
+    if _prof:
+        _p['t_phaseB_dedup_raws'] += _time.perf_counter() - _t
+        _p['n_phaseB_new_raws'] += len(new_iraws_for_new)
+        _p['n_phaseB_unique_raws'] += len(raws_to_apply)
 
     if raws_to_apply:
+        if _prof:
+            _t = _time.perf_counter()
         new_cacheds = apply_resolved_subs_batch(raws_to_apply, new_resolved_subs)
-        for c in new_cacheds:
-            new_cu.append(c)
-            new_ubm.append(cached_union_bitmask(c))
+        if _prof:
+            _p['t_phaseB_apply_batch'] += _time.perf_counter() - _t
+            _t = _time.perf_counter()
+        if _UBM_CY is not None:
+            for c in new_cacheds:
+                new_cu.append(c)
+                new_ubm.append(_UBM_CY(c, _BITMASK_CACHE, N_INDICES))
+        else:
+            for c in new_cacheds:
+                new_cu.append(c)
+                new_ubm.append(cached_union_bitmask(c))
+        if _prof:
+            _p['t_phaseB_new_bitmask'] += _time.perf_counter() - _t
 
+    if _prof:
+        _t = _time.perf_counter()
     new_iraws = prev_iraws + new_iraws_for_new
+    if _prof:
+        _p['t_iraws_concat'] += _time.perf_counter() - _t
 
     # Build result list (same format as compute_indirect_substituted).
-    result = []
-    for sub_int, op, sh, raw in new_iraws:
-        idx = new_rid[id(raw)]
-        result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
+    if _prof:
+        _t = _time.perf_counter()
+    if _BUILD_RESULT_CY is not None:
+        result = _BUILD_RESULT_CY(new_iraws, new_rid, new_cu, new_ubm)
+    else:
+        result = []
+        for sub_int, op, sh, raw in new_iraws:
+            idx = new_rid[id(raw)]
+            result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
+    if _prof:
+        _p['t_result_build'] += _time.perf_counter() - _t
 
     return result, (new_cu, new_ubm, new_rid, new_iraws)
 
@@ -1493,6 +1638,21 @@ def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, re
     t1a_elapsed = _time.time() - t1a
 
     # Phase 1b: Filter precomputed indirect cache (target-dependent filtering only)
+    # Cython fast path: only available for the 'subsector' filter mode and when
+    # detailed profiling counters are off. Saves ~3-5x on the hot inner loop
+    # by eliminating Python interpreter overhead per indirect_cache entry.
+    if fast_subsector_filter and not _detailed_profile and _PHASE1B_CY is not None:
+        t1b = _time.time()
+        _PHASE1B_CY(indirect_cache, target, not_target_bm, seen, valid, N_INDICES)
+        t1b_elapsed = _time.time() - t1b
+        total_elapsed = _time.time() - t_start
+        if verbose_timing:
+            print(f"      [enumerate_cached] total={total_elapsed:.3f}s | "
+                  f"P1a(direct)={t1a_elapsed:.3f}s | "
+                  f"P1b(indirect_filter,cy)={t1b_elapsed:.3f}s | "
+                  f"valid={len(valid)}", flush=True)
+        return valid
+
     t1b = _time.time()
     n_indirect_checked = 0
     n_indirect_valid = 0

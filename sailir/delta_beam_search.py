@@ -378,20 +378,33 @@ def beam_search_delta(env, model, start_expr, target_sector,
         new_beam = survivors[:beam_width]
         t3_elapsed = time.time() - t3
 
-        # ---- Memory cleanup: drop parent heavy fields ----
-        # Survivors' parents are no longer needed for incremental materialization
-        # because survivors will lazily compute aux/subs/rs from their own state
-        # going forward. Children's properties already cached their parent-derived
-        # dicts (or will, when next step accesses them).
-        #
-        # Concretely: each survivor S has parent P. S.subs is built from P.subs;
-        # next step uses S.subs, not P.subs. Same for resolved_subs and aux.
-        # By forcing materialization of all heavy fields on S now, we can free P.
+        # ---- P4: eager survivor materialization (incremental aux) ----
+        # Force materialization of subs / resolved_subs / indirect_cache_list
+        # on the 40 survivors. The cost is dominated by indirect_cache_list
+        # which calls compute_indirect_substituted_incremental — the
+        # incremental aux update, scaling with |aux| × |affected entries|.
+        # This is paid here (not in next step's P1) because we then drop
+        # the parent heavy fields to bound memory.
+        import os as _os_p4
+        _p4_inc_prof = _os_p4.environ.get('BEAM_PROFILE_CIC_INC') == '1'
+        if _p4_inc_prof:
+            ibp_env._cic_inc_reset()
+        t4 = time.time()
+        t4_subs = 0.0
+        t4_rs = 0.0
+        t4_aux = 0.0
         for s in new_beam:
-            _ = s.subs           # force
-            _ = s.resolved_subs  # force
-            _ = s.indirect_cache_list  # force (also fills _indirect_aux)
-        # Now drop parent heavy fields. Parent's action/parent are preserved.
+            _t = time.time()
+            _ = s.subs
+            t4_subs += time.time() - _t
+            _t = time.time()
+            _ = s.resolved_subs
+            t4_rs += time.time() - _t
+            _t = time.time()
+            _ = s.indirect_cache_list
+            t4_aux += time.time() - _t
+        # Drop parent heavy fields. parent.action / parent.parent preserved
+        # for path reconstruction.
         seen_parents = set()
         for s in new_beam:
             p = s.parent
@@ -402,7 +415,8 @@ def beam_search_delta(env, model, start_expr, target_sector,
             p._resolved_subs = None
             p._indirect_aux = None
             p._indirect_cache_list = None
-            p.expr = None  # path reconstruction doesn't need expr
+            p.expr = None
+        t4_elapsed = time.time() - t4
 
         beam = new_beam
 
@@ -410,11 +424,38 @@ def beam_search_delta(env, model, start_expr, target_sector,
         step_total = time.time() - t_step
         if verbose:
             best = min(beam, key=lambda s: s.max_w)
-            print(f'Step {step}: P1={t1_elapsed:.2f}s P2={t2_elapsed:.2f}s '
-                  f'P3={t3_elapsed:.2f}s total={step_total:.2f}s '
+            residual = step_total - t1_elapsed - t2_elapsed - t3_elapsed - t4_elapsed
+            print(f'Step {step}: '
+                  f'P1(gv)={t1_elapsed:.2f}s '
+                  f'P2(model)={t2_elapsed:.2f}s '
+                  f'P3(apply+sort+dedup)={t3_elapsed:.2f}s '
+                  f'P4(survivor_materialize: subs={t4_subs:.2f}+rs={t4_rs:.2f}+aux={t4_aux:.2f}={t4_elapsed:.2f}s) '
+                  f'residual={residual:.2f}s '
+                  f'total={step_total:.2f}s '
                   f'tasks={len(tasks)} cands={len(candidates)} '
                   f'best_max_w={best.max_w} nm={best.n_non_masters}',
                   flush=True)
+            if _p4_inc_prof:
+                _p = ibp_env._CIC_INC_PROFILE
+                print(f'  P4_aux_CIC_INC step={step} n_calls={_p["n_calls"]} '
+                      f'avg_prev_cu={_p["len_prev_cu"]//max(1,_p["n_calls"])} '
+                      f'avg_prev_iraws={_p["len_prev_iraws"]//max(1,_p["n_calls"])} | '
+                      f'phaseA(iter={_p["t_phaseA_iter"]:.3f}s '
+                      f'substitute={_p["t_phaseA_substitute"]:.3f}s '
+                      f'bitmask={_p["t_phaseA_bitmask"]:.3f}s '
+                      f'n_fast={_p["n_phaseA_fast_path"]} '
+                      f'n_sub={_p["n_phaseA_substituted"]}) '
+                      f'rid_copy={_p["t_rid_copy"]:.3f}s '
+                      f'phaseB(subcache={_p["t_phaseB_subcache"]:.3f}s '
+                      f'iraws_build={_p["t_phaseB_iraws_build"]:.3f}s '
+                      f'dedup_raws={_p["t_phaseB_dedup_raws"]:.3f}s '
+                      f'apply_batch={_p["t_phaseB_apply_batch"]:.3f}s '
+                      f'new_bitmask={_p["t_phaseB_new_bitmask"]:.3f}s '
+                      f'n_new_raws={_p["n_phaseB_new_raws"]} '
+                      f'n_unique={_p["n_phaseB_unique_raws"]}) '
+                      f'iraws_concat={_p["t_iraws_concat"]:.3f}s '
+                      f'result_build={_p["t_result_build"]:.3f}s',
+                      flush=True)
             if step < 20:
                 nms = get_non_masters(best.expr, target_sector)
                 for nm in sorted(nms.keys(),
