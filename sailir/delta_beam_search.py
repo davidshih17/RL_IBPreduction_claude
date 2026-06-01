@@ -215,6 +215,102 @@ def _apply_action(state, target, ibp_op, delta_shift, action_prob, target_sector
     )
 
 
+def _apply_actions_parallel_fork(work, tasks, target_sector, n_workers):
+    """Apply a list of (i, idx, ibp_op, delta_shift, action_prob) actions to
+    their respective tasks[i] state via os.fork() over N_WORKERS children.
+
+    Each child gets a contiguous slice of `work` and computes child
+    DeltaStates serially. Children inherit master's beam-state memory via
+    fork-COW: state.resolved_subs, state.expr, env._raw_eq_cache etc. are
+    all available without any IPC. Only the small result tuples are sent
+    back via pipes.
+
+    Result order matches what serial would produce (work order = task_idx
+    ascending, then action_idx ascending), so downstream candidates.sort()
+    + dedup is bit-identical.
+
+    Each result tuple: (action, sol_target, expr, max_w, n_non_masters,
+    score). Parent / env / target_sector references are reattached in the
+    master process so DeltaState.parent points back to the actual beam
+    state object (which a worker fork only had a COW copy of).
+    """
+    import os as _os
+    import pickle as _pickle
+    import math as _math
+
+    n = len(work)
+    if n == 0:
+        return []
+
+    chunk = (n + n_workers - 1) // n_workers
+    children = []
+    for w_idx in range(n_workers):
+        lo = w_idx * chunk
+        hi = min(lo + chunk, n)
+        if lo >= hi:
+            break
+        r, w = _os.pipe()
+        pid = _os.fork()
+        if pid == 0:
+            # Child: compute slice [lo:hi], emit results, exit.
+            _os.close(r)
+            results = []
+            for (i, idx, ibp_op, delta_shift, action_prob) in work[lo:hi]:
+                state, target, _va, _nt = tasks[i]
+                child = _apply_action(state, target, ibp_op, delta_shift,
+                                      action_prob, target_sector)
+                if child is None:
+                    results.append((i, idx, None))
+                else:
+                    results.append((
+                        i, idx,
+                        (child.action, child._delta_sol, child.expr,
+                         child.max_w, child.n_non_masters, child.score),
+                    ))
+            try:
+                with _os.fdopen(w, 'wb') as f:
+                    _pickle.dump(results, f, protocol=_pickle.HIGHEST_PROTOCOL)
+            except BrokenPipeError:
+                pass
+            _os._exit(0)
+        else:
+            _os.close(w)
+            children.append((pid, r))
+
+    # Master: collect from each child in chunk order so result_list is in
+    # the same order as the original work list.
+    all_results = []
+    for (pid, r) in children:
+        with _os.fdopen(r, 'rb') as f:
+            chunk_results = _pickle.load(f)
+        all_results.extend(chunk_results)
+        _os.waitpid(pid, 0)
+
+    # Rebuild DeltaState objects in the master's address space so that
+    # `parent` refers to the actual beam-state object (the worker had a
+    # COW copy but the address-of-Python-object differs).
+    candidates = []
+    for (i, idx, payload) in all_results:
+        if payload is None:
+            continue
+        action, sol_target, expr, max_w, n_non_masters, score = payload
+        state = tasks[i][0]
+        env = state._env
+        candidates.append(DeltaState(
+            parent=state,
+            delta_target=action[0],
+            delta_sol=sol_target,
+            action=action,
+            score=score,
+            env=env,
+            target_sector=target_sector,
+            expr=expr,
+            max_w=max_w,
+            n_non_masters=n_non_masters,
+        ))
+    return candidates
+
+
 # =============================================================================
 # Beam search
 # =============================================================================
@@ -344,7 +440,11 @@ def beam_search_delta(env, model, start_expr, target_sector,
 
         # ---- P3: build candidates, sort, dedup ----
         t3 = time.time()
-        candidates = []
+        # Build the (task_idx, action_idx, ibp_op, delta_shift, action_prob)
+        # work list. task_idx + action_idx are kept as deterministic
+        # tie-breakers so a parallel and a serial run produce the same
+        # post-sort candidate ordering.
+        work = []
         for i, (state, target, valid_actions, n_tied) in enumerate(tasks):
             n_valid = n_valid_actions[i]
             k_per = max(1, beam_width // n_tied)
@@ -353,6 +453,18 @@ def beam_search_delta(env, model, start_expr, target_sector,
             for idx in top_idx:
                 ibp_op, delta_shift = valid_actions[idx]
                 action_prob = probs[i, idx].item()
+                work.append((i, idx, ibp_op, delta_shift, action_prob))
+
+        import os as _os_p3w
+        n_p3_workers = int(_os_p3w.environ.get('DELTA_P3_WORKERS', '1'))
+        if n_p3_workers > 1 and len(work) >= n_p3_workers:
+            candidates = _apply_actions_parallel_fork(
+                work, tasks, target_sector, n_p3_workers,
+            )
+        else:
+            candidates = []
+            for (i, idx, ibp_op, delta_shift, action_prob) in work:
+                state, target, _, _ = tasks[i]
                 child = _apply_action(state, target, ibp_op, delta_shift,
                                       action_prob, target_sector)
                 if child is not None:

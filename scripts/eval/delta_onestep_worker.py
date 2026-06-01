@@ -57,7 +57,20 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('--paper-masters-only', action=argparse.BooleanOptionalAction,
                         default=True)
+    parser.add_argument('--n_threads', type=int, default=1,
+                        help='Number of CPU threads for torch BLAS ops. '
+                             'P2 (model inference) speeds up roughly linearly '
+                             'with this if request_cpus matches. Default 1.')
     args = parser.parse_args()
+
+    # Set torch thread count BEFORE loading model. BLAS ops in the
+    # model forward pass (transformer attention, linear layers) will
+    # then use this many threads.
+    import torch as _t
+    _t.set_num_threads(args.n_threads)
+    _t.set_num_interop_threads(args.n_threads)
+    print(f'torch: n_threads={_t.get_num_threads()} '
+          f'interop_threads={_t.get_num_interop_threads()}', flush=True)
 
     start_time = time.time()
 
