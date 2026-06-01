@@ -312,20 +312,28 @@ def _apply_actions_parallel_fork(work, tasks, target_sector, n_workers):
 
 
 def _p4_aux_parallel_fork(new_beam, n_workers):
-    """Materialize indirect_aux for each survivor in parallel via fork().
+    """Materialize indirect_aux for each survivor in parallel via fork(),
+    shipping only the DELTA from parent.aux back to master.
 
-    The aux 4-tuple uses id(raw) as its `rid` dict key. id() is process-
-    local, so we cannot pickle aux directly — master would receive rid
-    keys pointing to worker addresses with no meaning in master memory.
+    Worker output per survivor:
+        (i, subs, rs, phase_a_changes, phase_b_new_cu_entries,
+         phase_b_iraws_meta)
 
-    Workaround: workers strip raws out before pickling, master rebuilds
-    them by re-resolving (ibp_op, seed) -> raw via env.get_raw_equation_
-    cached using ITS OWN raw_eq_cache. Then rid + iraws + indirect_cache_
-    list are reconstructed in master's address space.
+    - phase_a_changes: list of (cu_idx, new_cached, new_ubm) — only the
+      entries Phase A's substitution changed (most cu entries pass through
+      unchanged when sub_key not in cached, and the new_c IS old_c).
+    - phase_b_new_cu_entries: list of (new_cached, new_ubm) for the unique
+      new raws Phase B introduced, in insertion order.
+    - phase_b_iraws_meta: list of (sub_int, ibp_op, shift) for the new
+      iraws entries Phase B introduced (may contain raw duplicates).
 
-    Worker output per survivor: (i, subs, rs, cu, ubm, iraws_meta) where
-    iraws_meta = list of (sub_int, ibp_op, shift) — the (sub_int - shift)
-    pair uniquely identifies the raw via env's raw_eq_cache.
+    Master reconstructs child aux from parent.aux + delta. Master uses
+    its own env.get_raw_equation_cached to materialize raws, so id(raw)
+    keys live in master's address space.
+
+    Size: at depth 80, full aux per survivor is ~5 MB; the delta is
+    ~0.8 MB. At depth 500+, full aux ~50 MB, delta ~3 MB. The 15-50×
+    reduction in IPC payload is what makes parallel P4 viable at depth.
     """
     import os as _os
     import pickle as _pickle
@@ -349,13 +357,38 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
             results = []
             for i in range(lo, hi):
                 s = new_beam[i]
+                parent_cu, parent_ubm, _parent_rid, parent_iraws = \
+                    s.parent.indirect_aux
+                n_parent_cu = len(parent_cu)
+                n_parent_iraws = len(parent_iraws)
                 _ = s.subs
                 _ = s.resolved_subs
-                _ = s.indirect_cache_list  # forces aux + cache_list compute
-                cu, ubm, _rid, iraws = s._indirect_aux
-                iraws_meta = [(si, op, sh) for (si, op, sh, _raw) in iraws]
+                _ = s.indirect_cache_list  # forces aux + cache_list
+                child_cu, child_ubm, _child_rid, child_iraws = s._indirect_aux
+
+                # Phase A diff: cu entries that changed identity.
+                # Incremental code reuses parent dict refs when sub_key not
+                # in cached, so identity check correctly distinguishes
+                # changed from unchanged.
+                phase_a_changes = []
+                for j in range(n_parent_cu):
+                    if child_cu[j] is not parent_cu[j]:
+                        phase_a_changes.append((j, child_cu[j], child_ubm[j]))
+
+                # Phase B: newly-appended cu entries (unique new cacheds).
+                phase_b_new_cu_entries = list(zip(
+                    child_cu[n_parent_cu:], child_ubm[n_parent_cu:],
+                ))
+
+                # Phase B iraws metadata: appended entries beyond parent.
+                phase_b_iraws_meta = [
+                    (si, op, sh)
+                    for (si, op, sh, _raw) in child_iraws[n_parent_iraws:]
+                ]
                 results.append((
-                    i, s._subs, s._resolved_subs, cu, ubm, iraws_meta,
+                    i, s._subs, s._resolved_subs,
+                    phase_a_changes, phase_b_new_cu_entries,
+                    phase_b_iraws_meta,
                 ))
             try:
                 with _os.fdopen(w, 'wb') as f:
@@ -367,33 +400,54 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
             _os.close(w)
             children.append((pid, r))
 
-    # Master: rebuild aux in master's address space.
+    # Master: read each chunk, apply delta to parent.aux, build child aux.
     env = new_beam[0]._env
+    n_indices = _env_mod.N_INDICES
     for (pid, r) in children:
         with _os.fdopen(r, 'rb') as f:
             chunk_results = _pickle.load(f)
-        for (i, _subs, _rs, cu, ubm, iraws_meta) in chunk_results:
+        for (i, _subs, _rs, phase_a_changes, phase_b_new_cu_entries,
+                phase_b_iraws_meta) in chunk_results:
             s = new_beam[i]
-            # Rebuild iraws + rid with master's raws (via raw_eq_cache).
-            n_indices = _env_mod.N_INDICES
-            new_iraws = []
-            new_rid = {}
-            for (sub_int, op, sh) in iraws_meta:
+            parent_cu, parent_ubm, parent_rid, parent_iraws = \
+                s.parent.indirect_aux
+
+            # Start from parent.aux (shallow copies of the lists).
+            child_cu = list(parent_cu)
+            child_ubm = list(parent_ubm)
+            child_rid = dict(parent_rid)
+            child_iraws = list(parent_iraws)
+
+            # Apply Phase A diff.
+            for (cu_idx, new_c, new_ub) in phase_a_changes:
+                child_cu[cu_idx] = new_c
+                child_ubm[cu_idx] = new_ub
+
+            # Apply Phase B: append new unique cu entries + iraws.
+            new_cu_iter = iter(phase_b_new_cu_entries)
+            for (sub_int, op, sh) in phase_b_iraws_meta:
                 seed = tuple(sub_int[k] - sh[k] for k in range(n_indices))
                 raw = env.get_raw_equation_cached(op, seed)
-                new_iraws.append((sub_int, op, sh, raw))
                 rid_key = id(raw)
-                if rid_key not in new_rid:
-                    new_rid[rid_key] = len(new_rid)
-            # Rebuild indirect_cache_list with master's raws.
-            new_cache_list = []
-            for (sub_int, op, sh, raw) in new_iraws:
-                idx = new_rid[id(raw)]
-                new_cache_list.append((sub_int, op, sh, raw, cu[idx], ubm[idx]))
+                if rid_key not in child_rid:
+                    new_c, new_ub = next(new_cu_iter)
+                    child_rid[rid_key] = len(child_cu)
+                    child_cu.append(new_c)
+                    child_ubm.append(new_ub)
+                child_iraws.append((sub_int, op, sh, raw))
+
+            # Build indirect_cache_list.
+            child_cache_list = []
+            for (sub_int, op, sh, raw) in child_iraws:
+                idx = child_rid[id(raw)]
+                child_cache_list.append((
+                    sub_int, op, sh, raw, child_cu[idx], child_ubm[idx],
+                ))
+
             s._subs = _subs
             s._resolved_subs = _rs
-            s._indirect_aux = (cu, ubm, new_rid, new_iraws)
-            s._indirect_cache_list = new_cache_list
+            s._indirect_aux = (child_cu, child_ubm, child_rid, child_iraws)
+            s._indirect_cache_list = child_cache_list
         _os.waitpid(pid, 0)
 
 
