@@ -311,6 +311,162 @@ def _apply_actions_parallel_fork(work, tasks, target_sector, n_workers):
     return candidates
 
 
+def _p4_aux_parallel_fork(new_beam, n_workers):
+    """Materialize indirect_aux for each survivor in parallel via fork().
+
+    The aux 4-tuple uses id(raw) as its `rid` dict key. id() is process-
+    local, so we cannot pickle aux directly — master would receive rid
+    keys pointing to worker addresses with no meaning in master memory.
+
+    Workaround: workers strip raws out before pickling, master rebuilds
+    them by re-resolving (ibp_op, seed) -> raw via env.get_raw_equation_
+    cached using ITS OWN raw_eq_cache. Then rid + iraws + indirect_cache_
+    list are reconstructed in master's address space.
+
+    Worker output per survivor: (i, subs, rs, cu, ubm, iraws_meta) where
+    iraws_meta = list of (sub_int, ibp_op, shift) — the (sub_int - shift)
+    pair uniquely identifies the raw via env's raw_eq_cache.
+    """
+    import os as _os
+    import pickle as _pickle
+    from sailir import ibp_env as _env_mod
+
+    n = len(new_beam)
+    if n == 0:
+        return
+
+    chunk = (n + n_workers - 1) // n_workers
+    children = []
+    for w_idx in range(n_workers):
+        lo = w_idx * chunk
+        hi = min(lo + chunk, n)
+        if lo >= hi:
+            break
+        r, w = _os.pipe()
+        pid = _os.fork()
+        if pid == 0:
+            _os.close(r)
+            results = []
+            for i in range(lo, hi):
+                s = new_beam[i]
+                _ = s.subs
+                _ = s.resolved_subs
+                _ = s.indirect_cache_list  # forces aux + cache_list compute
+                cu, ubm, _rid, iraws = s._indirect_aux
+                iraws_meta = [(si, op, sh) for (si, op, sh, _raw) in iraws]
+                results.append((
+                    i, s._subs, s._resolved_subs, cu, ubm, iraws_meta,
+                ))
+            try:
+                with _os.fdopen(w, 'wb') as f:
+                    _pickle.dump(results, f, protocol=_pickle.HIGHEST_PROTOCOL)
+            except BrokenPipeError:
+                pass
+            _os._exit(0)
+        else:
+            _os.close(w)
+            children.append((pid, r))
+
+    # Master: rebuild aux in master's address space.
+    env = new_beam[0]._env
+    for (pid, r) in children:
+        with _os.fdopen(r, 'rb') as f:
+            chunk_results = _pickle.load(f)
+        for (i, _subs, _rs, cu, ubm, iraws_meta) in chunk_results:
+            s = new_beam[i]
+            # Rebuild iraws + rid with master's raws (via raw_eq_cache).
+            n_indices = _env_mod.N_INDICES
+            new_iraws = []
+            new_rid = {}
+            for (sub_int, op, sh) in iraws_meta:
+                seed = tuple(sub_int[k] - sh[k] for k in range(n_indices))
+                raw = env.get_raw_equation_cached(op, seed)
+                new_iraws.append((sub_int, op, sh, raw))
+                rid_key = id(raw)
+                if rid_key not in new_rid:
+                    new_rid[rid_key] = len(new_rid)
+            # Rebuild indirect_cache_list with master's raws.
+            new_cache_list = []
+            for (sub_int, op, sh, raw) in new_iraws:
+                idx = new_rid[id(raw)]
+                new_cache_list.append((sub_int, op, sh, raw, cu[idx], ubm[idx]))
+            s._subs = _subs
+            s._resolved_subs = _rs
+            s._indirect_aux = (cu, ubm, new_rid, new_iraws)
+            s._indirect_cache_list = new_cache_list
+        _os.waitpid(pid, 0)
+
+
+def _p1_gv_parallel_fork(p1_work, beam, target_sector, env, filter_mode, n_workers):
+    """Run a list of (state_idx, target) gv calls across N forked workers.
+
+    Pre-condition: each beam state's indirect_aux is materialized (workers
+    inherit it via COW). Each worker computes per-state filter_subs /
+    filter_resolved_subs once (cached within the chunk) and calls
+    env.get_valid_actions_with_aux for each (state_idx, target) in its slice.
+
+    Returns a list of (state_idx, target, valid_actions) in the same order
+    as `p1_work`, so the downstream tasks list is identical to serial.
+    """
+    import os as _os
+    import pickle as _pickle
+
+    n = len(p1_work)
+    if n == 0:
+        return []
+
+    chunk = (n + n_workers - 1) // n_workers
+    children = []
+    for w_idx in range(n_workers):
+        lo = w_idx * chunk
+        hi = min(lo + chunk, n)
+        if lo >= hi:
+            break
+        r, w = _os.pipe()
+        pid = _os.fork()
+        if pid == 0:
+            _os.close(r)
+            state_cache = {}  # state_idx -> (f_subs, f_rs, aux)
+            results = []
+            for (state_idx, target) in p1_work[lo:hi]:
+                entry = state_cache.get(state_idx)
+                if entry is None:
+                    state = beam[state_idx]
+                    if target_sector is not None:
+                        f_subs = filter_subs_to_exact_sector(state.subs, target_sector)
+                        f_rs = filter_resolved_subs_to_exact_sector(
+                            state.resolved_subs, target_sector)
+                    else:
+                        f_subs = state.subs
+                        f_rs = state.resolved_subs
+                    indirect_cache = state.indirect_cache_list
+                    entry = (f_subs, f_rs, indirect_cache)
+                    state_cache[state_idx] = entry
+                f_subs, f_rs, indirect_cache = entry
+                va = env.get_valid_actions_with_cache(
+                    target, indirect_cache, f_subs, f_rs,
+                    filter_mode=filter_mode, verbose_timing=False,
+                )
+                results.append((state_idx, target, va))
+            try:
+                with _os.fdopen(w, 'wb') as f:
+                    _pickle.dump(results, f, protocol=_pickle.HIGHEST_PROTOCOL)
+            except BrokenPipeError:
+                pass
+            _os._exit(0)
+        else:
+            _os.close(w)
+            children.append((pid, r))
+
+    all_results = []
+    for (pid, r) in children:
+        with _os.fdopen(r, 'rb') as f:
+            chunk_results = _pickle.load(f)
+        all_results.extend(chunk_results)
+        _os.waitpid(pid, 0)
+    return all_results
+
+
 # =============================================================================
 # Beam search
 # =============================================================================
@@ -363,51 +519,78 @@ def beam_search_delta(env, model, start_expr, target_sector,
         #   filter  : filter_subs / filter_resolved_subs (per state, once)
         #   aux     : state.indirect_cache_list materialization (lazy first hit)
         #   gv      : env.get_valid_actions_with_cache (per target)
+        # DELTA_P1_WORKERS=N forks N workers for the gv-call phase.
         import os as _os_p1
         _p1_instr = _os_p1.environ.get('P1_INSTRUMENT') == '1'
         _p1_t = {'nm_tied': 0.0, 'filter': 0.0, 'aux': 0.0, 'gv': 0.0} if _p1_instr else None
+        n_p1_workers = int(_os_p1.environ.get('DELTA_P1_WORKERS', '1'))
         t1 = time.time()
-        tasks = []  # list of (state, target, valid_actions)
-        for state in beam:
-            if _p1_instr:
-                _tt = time.perf_counter()
+        tasks = []  # list of (state, target, valid_actions, n_tied)
+
+        # Step 1 (master, serial): per-state nm/tied computation.
+        # Cheap (~ms total), no IPC concern; just enumerate targets to
+        # dispatch.
+        state_tied = []  # list of (state_idx, tied_targets)
+        for state_idx, state in enumerate(beam):
             non_masters = get_non_masters(state.expr, target_sector)
             if not non_masters:
-                if _p1_instr:
-                    _p1_t['nm_tied'] += time.perf_counter() - _tt
                 continue
             mw = state.max_w
             tied = [k for k in non_masters.keys()
                     if (weight(k)[0], weight(k)[1]) == mw]
-            if _p1_instr:
-                _p1_t['nm_tied'] += time.perf_counter() - _tt
-            if not tied:
-                continue
-            if _p1_instr:
-                _tt = time.perf_counter()
-            if target_sector is not None:
-                f_subs = filter_subs_to_exact_sector(state.subs, target_sector)
-                f_rs = filter_resolved_subs_to_exact_sector(state.resolved_subs, target_sector)
-            else:
-                f_subs = state.subs
-                f_rs = state.resolved_subs
-            if _p1_instr:
-                _p1_t['filter'] += time.perf_counter() - _tt
-                _tt = time.perf_counter()
-            indirect_cache = state.indirect_cache_list
-            if _p1_instr:
-                _p1_t['aux'] += time.perf_counter() - _tt
+            if tied:
+                state_tied.append((state_idx, tied))
+
+        # Step 2: gv calls. Build the flat (state_idx, target) work list.
+        # Order: state_idx ascending, then target order from tied[]. This
+        # matches the serial loop, so downstream tasks order is identical.
+        p1_work = []
+        for (state_idx, tied) in state_tied:
             for target in tied:
-                if _p1_instr:
-                    _tt = time.perf_counter()
+                p1_work.append((state_idx, target))
+
+        # Pre-materialize aux on master so workers' fork-COW snapshot has
+        # it (else each worker would re-materialize independently). At
+        # end-of-step P4 cleanup we already forced indirect_cache_list, so
+        # the property access is cheap here.
+        for (state_idx, _) in state_tied:
+            _ = beam[state_idx].indirect_cache_list
+
+        if n_p1_workers > 1 and len(p1_work) >= n_p1_workers:
+            gv_results = _p1_gv_parallel_fork(
+                p1_work, beam, target_sector, env, filter_mode, n_p1_workers,
+            )
+        else:
+            # Serial: cache per-state filter results, exactly like the worker.
+            state_cache = {}
+            gv_results = []
+            for (state_idx, target) in p1_work:
+                entry = state_cache.get(state_idx)
+                if entry is None:
+                    state = beam[state_idx]
+                    if target_sector is not None:
+                        f_subs = filter_subs_to_exact_sector(state.subs, target_sector)
+                        f_rs = filter_resolved_subs_to_exact_sector(
+                            state.resolved_subs, target_sector)
+                    else:
+                        f_subs = state.subs
+                        f_rs = state.resolved_subs
+                    indirect_cache = state.indirect_cache_list
+                    entry = (f_subs, f_rs, indirect_cache)
+                    state_cache[state_idx] = entry
+                f_subs, f_rs, indirect_cache = entry
                 va = env.get_valid_actions_with_cache(
                     target, indirect_cache, f_subs, f_rs,
                     filter_mode=filter_mode, verbose_timing=False,
                 )
-                if _p1_instr:
-                    _p1_t['gv'] += time.perf_counter() - _tt
-                if va:
-                    tasks.append((state, target, va, len(tied)))
+                gv_results.append((state_idx, target, va))
+
+        # Step 3 (master, serial): assemble tasks list. Each (state_idx,
+        # tied_targets) shared n_tied across its gv calls.
+        n_tied_per_state = {state_idx: len(tied) for (state_idx, tied) in state_tied}
+        for (state_idx, target, va) in gv_results:
+            if va:
+                tasks.append((beam[state_idx], target, va, n_tied_per_state[state_idx]))
         t1_elapsed = time.time() - t1
         if _p1_instr:
             _p1_sum = sum(_p1_t.values())
@@ -499,22 +682,32 @@ def beam_search_delta(env, model, start_expr, target_sector,
         # the parent heavy fields to bound memory.
         import os as _os_p4
         _p4_inc_prof = _os_p4.environ.get('BEAM_PROFILE_CIC_INC') == '1'
+        n_p4_workers = int(_os_p4.environ.get('DELTA_P4_WORKERS', '1'))
         if _p4_inc_prof:
             ibp_env._cic_inc_reset()
         t4 = time.time()
         t4_subs = 0.0
         t4_rs = 0.0
         t4_aux = 0.0
-        for s in new_beam:
+        if n_p4_workers > 1 and len(new_beam) >= n_p4_workers:
+            # Parallel fork: each child computes its slice of survivors'
+            # aux + cache_list and pickles back. Master attaches to states.
+            # Sub-time accounting is lost (workers do subs/rs/aux together);
+            # we put it all in t4_aux for now.
             _t = time.time()
-            _ = s.subs
-            t4_subs += time.time() - _t
-            _t = time.time()
-            _ = s.resolved_subs
-            t4_rs += time.time() - _t
-            _t = time.time()
-            _ = s.indirect_cache_list
-            t4_aux += time.time() - _t
+            _p4_aux_parallel_fork(new_beam, n_p4_workers)
+            t4_aux = time.time() - _t
+        else:
+            for s in new_beam:
+                _t = time.time()
+                _ = s.subs
+                t4_subs += time.time() - _t
+                _t = time.time()
+                _ = s.resolved_subs
+                t4_rs += time.time() - _t
+                _t = time.time()
+                _ = s.indirect_cache_list
+                t4_aux += time.time() - _t
         # Drop parent heavy fields. parent.action / parent.parent preserved
         # for path reconstruction.
         seen_parents = set()
