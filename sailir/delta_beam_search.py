@@ -337,7 +337,12 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
     """
     import os as _os
     import pickle as _pickle
+    import time as _time
     from sailir import ibp_env as _env_mod
+
+    _prof = _os.environ.get('DELTA_P4_INSTR') == '1'
+    _t_phase = {'fork': 0.0, 'pipe_read': 0.0, 'apply': 0.0,
+                'worker_work': 0.0, 'wait_for_first': 0.0}
 
     n = len(new_beam)
     if n == 0:
@@ -345,6 +350,8 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
 
     chunk = (n + n_workers - 1) // n_workers
     children = []
+    if _prof:
+        _t_fork_start = _time.time()
     for w_idx in range(n_workers):
         lo = w_idx * chunk
         hi = min(lo + chunk, n)
@@ -354,6 +361,7 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
         pid = _os.fork()
         if pid == 0:
             _os.close(r)
+            _worker_t0 = _time.time()
             results = []
             for i in range(lo, hi):
                 s = new_beam[i]
@@ -390,22 +398,43 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
                     phase_a_changes, phase_b_new_cu_entries,
                     phase_b_iraws_meta,
                 ))
+            _worker_compute_ms = int((_time.time() - _worker_t0) * 1000)
             try:
+                _pickle_t0 = _time.time()
+                pickled = _pickle.dumps((_worker_compute_ms, results),
+                                        protocol=_pickle.HIGHEST_PROTOCOL)
+                _pickle_ms = int((_time.time() - _pickle_t0) * 1000)
                 with _os.fdopen(w, 'wb') as f:
-                    _pickle.dump(results, f, protocol=_pickle.HIGHEST_PROTOCOL)
+                    f.write(pickled)
             except BrokenPipeError:
                 pass
             _os._exit(0)
         else:
             _os.close(w)
             children.append((pid, r))
+    if _prof:
+        _t_phase['fork'] = _time.time() - _t_fork_start
 
     # Master: read each chunk, apply delta to parent.aux, build child aux.
     env = new_beam[0]._env
     n_indices = _env_mod.N_INDICES
+    _wcm_max = 0
+    _first_pipe_t0 = _time.time() if _prof else 0
+    _first_read = True
     for (pid, r) in children:
+        if _prof:
+            _read_t0 = _time.time()
         with _os.fdopen(r, 'rb') as f:
-            chunk_results = _pickle.load(f)
+            _worker_compute_ms, chunk_results = _pickle.load(f)
+        if _prof:
+            _t_phase['pipe_read'] += _time.time() - _read_t0
+            if _first_read:
+                _t_phase['wait_for_first'] = _time.time() - _first_pipe_t0
+                _first_read = False
+            if _worker_compute_ms > _wcm_max:
+                _wcm_max = _worker_compute_ms
+        if _prof:
+            _apply_t0 = _time.time()
         for (i, _subs, _rs, phase_a_changes, phase_b_new_cu_entries,
                 phase_b_iraws_meta) in chunk_results:
             s = new_beam[i]
@@ -448,7 +477,18 @@ def _p4_aux_parallel_fork(new_beam, n_workers):
             s._resolved_subs = _rs
             s._indirect_aux = (child_cu, child_ubm, child_rid, child_iraws)
             s._indirect_cache_list = child_cache_list
+        if _prof:
+            _t_phase['apply'] += _time.time() - _apply_t0
         _os.waitpid(pid, 0)
+
+    if _prof:
+        _t_phase['worker_work'] = _wcm_max / 1000.0
+        print(f'P4_PARALLEL_INSTR\tn_workers={n_workers} '
+              f"fork={_t_phase['fork']:.3f}s "
+              f"wait_first={_t_phase['wait_for_first']:.3f}s "
+              f"worker_max={_t_phase['worker_work']:.3f}s "
+              f"pipe_read={_t_phase['pipe_read']:.3f}s "
+              f"master_apply={_t_phase['apply']:.3f}s", flush=True)
 
 
 def _p1_gv_parallel_fork(p1_work, beam, target_sector, env, filter_mode, n_workers):
@@ -537,6 +577,16 @@ def beam_search_delta(env, model, start_expr, target_sector,
     best_solution = None
     initial_weight = initial_state.max_w
     best_weight_ever = initial_weight
+
+    # Action-level tabu (OPT-IN via DELTA_TABU=1, default OFF):
+    # tabu[expr_key] = set of (target, ibp_op, delta_shift) tried previously
+    # from this expr. Same expression may be revisited later (different sub/RS
+    # history), but the same action will never be retried from it.
+    # Default OFF so the search behavior remains identical to all baselines
+    # (probe_84_*, the running (8,5) reduction) unless explicitly enabled.
+    import os as _os_tabu
+    _tabu_on = _os_tabu.environ.get('DELTA_TABU', '0') == '1'
+    tabu = {} if _tabu_on else None
 
     # Lazy import to avoid circular load.
     from beam_search import prepare_batched_input_v5
