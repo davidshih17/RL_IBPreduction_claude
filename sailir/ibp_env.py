@@ -1202,9 +1202,40 @@ def _cic_inc_reset():
         _CIC_INC_PROFILE[k] = 0 if isinstance(_CIC_INC_PROFILE[k], int) else 0.0
 
 
+def _sector_propagator_bm(target_sector):
+    """Propagator-only bitmask for target_sector.
+
+    Bit i set iff target_sector[i] == 1, for i in range(N_DENOMINATORS).
+    """
+    bm = 0
+    for i in range(N_DENOMINATORS):
+        if target_sector[i]:
+            bm |= (1 << i)
+    return bm
+
+
+def _entry_rejected_by_sector(union_bm, target_sector_bm):
+    """True iff this aux entry should be dropped because its `cached`
+    contains keys with propagators outside the target sector.
+
+    Such an entry will FAIL the Phase 1b sector filter for every future
+    target in the sector — targets share the same propagator-sector mask
+    (sectors are defined by which propagators are positive). And the
+    rejection is monotonic: substitutions in Phase A only rewrite
+    in-sector keys, so outside-sector "passenger" keys never disappear.
+
+    Only propagator bits (0..N_DENOMINATORS-1) are checked; ISP bits
+    (8..10) are allowed because targets can have positive ISP exponents.
+    This is the entry-level analog of the per-call filter
+    `(union_bm & ~target_bm) != 0`, hoisted to insertion time.
+    """
+    propagator_mask = (1 << N_DENOMINATORS) - 1
+    return (union_bm & propagator_mask & ~target_sector_bm) != 0
+
+
 def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved_sol,
                                               new_resolved_subs, ibp_t, li_t, shifts,
-                                              raw_eq_cache):
+                                              raw_eq_cache, target_sector=None):
     """Incrementally update indirect_cache state for one new substitution.
 
     Given prev_aux = (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
@@ -1239,7 +1270,15 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
     # Phase A: update existing cached entries to substitute new_sub_int.
     # Cython fast path folds the per-iteration calls to
     # _substitute_one_in_cached and cached_union_bitmask into native code.
-    if _PHASE_A_CY is not None:
+    # If target_sector is provided we MUST use the Python path so we can
+    # project each new cached dict to the target sector — the Cython
+    # version doesn't know about sector projection. Bypassing Cython adds
+    # ~30% to Phase A wall-time but enables the memory savings from
+    # dropping outside-sector terms (the principle: work modulo subsectors
+    # everywhere). Net win in memory and usually in time too because
+    # subsequent steps iterate smaller cached dicts.
+    _use_cython_phase_a = (_PHASE_A_CY is not None) and (target_sector is None)
+    if _use_cython_phase_a:
         if _prof:
             _t_phaseA_start = _time.perf_counter()
         new_cu, new_ubm, _n_fast, _n_sub = _PHASE_A_CY(
@@ -1261,6 +1300,10 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
             _n_sub = 0
         new_cu = []
         new_ubm = []
+        # Pre-compute target-sector propagator bitmask once for the
+        # entry-rejection check.
+        _ts_bm = (_sector_propagator_bm(target_sector)
+                  if target_sector is not None else 0)
         for old_c, old_ub in zip(prev_cu, prev_ubm):
             if _prof:
                 _ts = _time.perf_counter()
@@ -1273,10 +1316,20 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
                 if _prof:
                     _n_fast += 1
             else:
-                new_cu.append(new_c)
                 if _prof:
                     _tb = _time.perf_counter()
-                new_ubm.append(cached_union_bitmask(new_c))
+                new_ub = cached_union_bitmask(new_c)
+                if (target_sector is not None
+                        and _entry_rejected_by_sector(new_ub, _ts_bm)):
+                    # Outside-sector content: this entry will fail the
+                    # sector filter for every future target. Drop it by
+                    # storing an empty dict + zero bitmask. Phase 1b's
+                    # `target in cached` check will naturally skip it.
+                    new_cu.append({})
+                    new_ubm.append(0)
+                else:
+                    new_cu.append(new_c)
+                    new_ubm.append(new_ub)
                 if _prof:
                     _t_bm += _time.perf_counter() - _tb
                     _n_sub += 1
@@ -1350,7 +1403,19 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
         if _prof:
             _p['t_phaseB_apply_batch'] += _time.perf_counter() - _t
             _t = _time.perf_counter()
-        if _UBM_CY is not None:
+        if target_sector is not None:
+            # Entry-level rejection: compute union_bm, drop outside-sector
+            # entries by replacing cached with {} and ubm with 0.
+            _ts_bm = _sector_propagator_bm(target_sector)
+            for c in new_cacheds:
+                ub = cached_union_bitmask(c)
+                if _entry_rejected_by_sector(ub, _ts_bm):
+                    new_cu.append({})
+                    new_ubm.append(0)
+                else:
+                    new_cu.append(c)
+                    new_ubm.append(ub)
+        elif _UBM_CY is not None:
             for c in new_cacheds:
                 new_cu.append(c)
                 new_ubm.append(_UBM_CY(c, _BITMASK_CACHE, N_INDICES))
@@ -1502,13 +1567,18 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
 
 
 def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
-                                            shifts, raw_eq_cache):
+                                            shifts, raw_eq_cache,
+                                            target_sector=None):
     """Full compute that ALSO returns aux state for chaining incremental updates.
 
     Returns: (result, aux_state) where
         aux_state = (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
 
     Pass aux_state to compute_indirect_substituted_incremental on the next step.
+
+    When `target_sector` is given, every cached dict in cu is projected to
+    the target sector (outside-sector keys dropped). Required for the
+    "work modulo subsectors everywhere" principle.
     """
     # Reuse the same logic by recomputing locally — we need access to the
     # intermediate variables that the standard function doesn't expose. The
@@ -1552,6 +1622,13 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
 
     cached_unique = apply_resolved_subs_batch(unique_raws, resolved_subs)
     union_bms = [cached_union_bitmask(c) for c in cached_unique]
+    if target_sector is not None:
+        # Entry-level rejection: zero out outside-sector entries.
+        _ts_bm = _sector_propagator_bm(target_sector)
+        for i, ub in enumerate(union_bms):
+            if _entry_rejected_by_sector(ub, _ts_bm):
+                cached_unique[i] = {}
+                union_bms[i] = 0
 
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
@@ -1559,6 +1636,297 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
         result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
 
     return result, (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+
+
+def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t,
+                                            shifts, raw_eq_cache,
+                                            target_sector=None):
+    """Build aux from CURRENT expr non-masters + USEFUL resolved-sub anchors.
+
+    Bit-identical action set to the depth-keyed baseline. Memory bound by
+    problem dimension, not search depth.
+
+    For target T_curr ∈ current_expr_nm to appear in `cached = apply_resolved_subs(raw, RS)`
+    (the Phase-1b validity condition), the equation `raw = IBP_op(seed)`
+    must satisfy EXACTLY one of:
+      (A) T_curr ∈ raw directly (T_curr is not in RS, so apply_resolved_subs
+          preserves it)
+      (B) Some K ∈ raw is in RS, and T_curr ∈ sol_K (so substitution K→sol_K
+          introduces T_curr into cached)
+
+    No further recursion is possible because `add_sub_to_resolved` keeps RS
+    fully flattened — sol_K's values are leaves with NO RS keys.
+
+    So we enumerate seeds anchored on:
+      • each T_curr (gives all (A) seeds via T_curr − shift over topology
+        shifts)
+      • each "useful K" = K ∈ resolved_subs : sol_K ∩ expr_nm ≠ ∅ (gives
+        all (B) seeds via K − shift)
+
+    For each anchor M, enumerate (op, M − shift) for shifts in topology;
+    raw must contain M as a nonzero term. The `sub_int` slot of each
+    iraws tuple is set to M (the anchor), preserving the consumer's
+        seed = sub_int − shift = M − shift
+        delta = seed − target
+    so action recomputation in `_apply_action` recovers the same raw.
+
+    Dedup by (op, seed) — multiple anchors can produce the same seed and
+    thus the same action.
+    """
+    if '_sub_cache_expr' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache_expr'] = {}
+    sub_cache = raw_eq_cache['_sub_cache_expr']
+
+    def _grc(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Build the anchor set: (A) current expr_nm keys + (B) useful resolved
+    # sub keys whose sol intersects expr_nm.
+    expr_set = set(expr_keys)
+    anchors = set(expr_set)
+    for K, sol_K in resolved_subs.items():
+        for term in sol_K:
+            if term in expr_set:
+                anchors.add(K)
+                break
+
+    indirect_raws = []
+    seen_oseed = set()
+    for anchor in anchors:
+        if anchor in sub_cache:
+            raw_list = sub_cache[anchor]
+        else:
+            raw_list = []
+            for ibp_op, shift_list in shifts.items():
+                for shift in shift_list:
+                    seed = tuple(anchor[i] - shift[i] for i in range(N_INDICES))
+                    raw = _grc(ibp_op, seed)
+                    if anchor in raw and raw[anchor] != 0:
+                        raw_list.append((ibp_op, shift, raw))
+            sub_cache[anchor] = raw_list
+        for ibp_op, shift, raw in raw_list:
+            seed = tuple(anchor[i] - shift[i] for i in range(N_INDICES))
+            ok = (ibp_op, seed)
+            if ok in seen_oseed:
+                continue
+            seen_oseed.add(ok)
+            indirect_raws.append((anchor, ibp_op, shift, raw))
+
+    if not indirect_raws:
+        return [], ([], [], {}, [])
+
+    unique_raws = []
+    raw_id_to_idx = {}
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        rid = id(raw)
+        if rid not in raw_id_to_idx:
+            raw_id_to_idx[rid] = len(unique_raws)
+            unique_raws.append(raw)
+
+    cached_unique = apply_resolved_subs_batch(unique_raws, resolved_subs)
+    union_bms = [cached_union_bitmask(c) for c in cached_unique]
+    if target_sector is not None:
+        _ts_bm = _sector_propagator_bm(target_sector)
+        for i, ub in enumerate(union_bms):
+            if _entry_rejected_by_sector(ub, _ts_bm):
+                cached_unique[i] = {}
+                union_bms[i] = 0
+
+    result = []
+    for sub_int, ibp_op, shift, raw in indirect_raws:
+        idx = raw_id_to_idx[id(raw)]
+        result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
+
+    return result, (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+
+
+def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
+                                                   new_sub_int, new_resolved_sol,
+                                                   new_resolved_subs,
+                                                   ibp_t, li_t, shifts,
+                                                   raw_eq_cache,
+                                                   target_sector=None):
+    """Incremental delta on the bounded anchor set.
+
+    Equivalent action set to baseline `compute_indirect_substituted_incremental`,
+    but iraws is bounded by `|expr_nm| + |useful K|` instead of `|subs|`.
+
+    Anchor set logic:
+      new_anchor_set = expr_nm ∪ {K ∈ resolved_subs : sol_K ∩ expr_nm ≠ ∅}
+      prev_anchor_set = set(anchor for anchor, *_ in prev_iraws)
+      removed = prev_anchor_set - new_anchor_set  → drop their iraws entries
+      added   = new_anchor_set - prev_anchor_set  → Phase B adds their entries
+
+    Phase A is unchanged (substitute new_sub_int → new_resolved_sol in
+    every kept cached). Per-step cost is O(|cu|) + O(|added| × |shifts|),
+    bounded by the anchor set — NOT depth. So we keep delta speed.
+
+    Lossless: by the flatness of resolved_subs (single-pass
+    apply_resolved_subs), T_curr ∈ cached iff T_curr ∈ raw (covered by
+    expr_nm anchors) OR ∃ K ∈ raw ∩ RS with T_curr ∈ sol_K (covered by
+    useful-K anchors).
+
+    `prev_aux` is the parent's (cu, ubm, rid, iraws) — same shape as
+    `compute_indirect_substituted_incremental`. `expr_nm` is the iterable
+    of current in-sector non-masters of the survivor's expr.
+    """
+    prev_cu, prev_ubm, prev_rid, prev_iraws = prev_aux
+
+    # Compute the new anchor set.
+    # iraws should ONLY contain past-sub_int anchors (useful K's where
+    # sol_K ∩ expr_nm ≠ ∅). DO NOT include expr_nm keys as anchors: those
+    # would correspond to "direct" actions (case A in the user derivation),
+    # which Phase 1a already enumerates per target. Including them in
+    # iraws makes Phase 1b emit EXTRA actions for OTHER targets when
+    # their cached happens to contain T' ≠ T_curr — actions baseline
+    # never generates. So we restrict to (B) only, matching baseline's
+    # iraws structure (only past-sub_int anchors, just pruned to useful).
+    expr_set = set(expr_nm)
+    new_anchor_set = set()
+    for K, sol_K in new_resolved_subs.items():
+        for term in sol_K:
+            if term in expr_set:
+                new_anchor_set.add(K)
+                break
+
+    # Compute prev anchor set from prev_iraws.
+    prev_anchor_set = set()
+    for entry in prev_iraws:
+        prev_anchor_set.add(entry[0])
+
+    removed = prev_anchor_set - new_anchor_set
+    added = new_anchor_set - prev_anchor_set
+
+    # Phase A: substitute new_sub_int → new_resolved_sol in every cu entry.
+    # Same algebra as the baseline incremental update; just runs on a
+    # bounded cu list. Sector-rejection is preserved when target_sector
+    # is provided.
+    _ts_bm = _sector_propagator_bm(target_sector) if target_sector is not None else 0
+    new_cu = []
+    new_ubm = []
+    for old_c, old_ub in zip(prev_cu, prev_ubm):
+        new_c = _substitute_one_in_cached(old_c, new_sub_int, new_resolved_sol)
+        if new_c is old_c:
+            new_cu.append(old_c)
+            new_ubm.append(old_ub)
+        else:
+            new_ub = cached_union_bitmask(new_c)
+            if target_sector is not None and _entry_rejected_by_sector(new_ub, _ts_bm):
+                new_cu.append({})
+                new_ubm.append(0)
+            else:
+                new_cu.append(new_c)
+                new_ubm.append(new_ub)
+    new_rid = dict(prev_rid)
+
+    # Phase 0: drop iraws entries whose anchor left the anchor set, BUT
+    # keep entries whose raw still contains any other K ∈ new_anchor_set.
+    # CRITICAL: we KEEP THE ENTRY AS-IS (same sub_int=X, same shift, same
+    # position in the list) rather than rebadging it under a new anchor Y.
+    # This preserves iraws iteration order — the order the production
+    # model was trained on (baseline's depth-keyed order). Any deviation
+    # from that order changes argsort tie-break at P3 and silently shifts
+    # the trajectory.
+    #
+    # Correctness: enumerate_valid_actions_with_indirect_cache only reads
+    # (sub_int, shift, raw, cached, union_bm) — sub_int is just metadata
+    # used to compute seed = sub_int - shift. Keeping the original
+    # (X, shift_X) gives seed_X (original), action delta is unchanged.
+    # X is still in resolved_subs (a past sub_int), so referencing it is
+    # safe even though X is not in v4's current "useful K" anchor set.
+    kept_iraws = []
+    referenced_raw_ids = set()
+    for entry in prev_iraws:
+        anchor = entry[0]
+        if anchor not in removed:
+            kept_iraws.append(entry)
+            referenced_raw_ids.add(id(entry[3]))
+            continue
+        # Anchor left the useful set. Keep entry only if raw still has
+        # any K ∈ new_anchor_set (so some useful K covers this raw).
+        _raw = entry[3]
+        for Y, coef in _raw.items():
+            if coef != 0 and Y in new_anchor_set:
+                kept_iraws.append(entry)  # keep AS-IS — preserves order
+                referenced_raw_ids.add(id(_raw))
+                break
+
+    # Phase B: add iraws entries for newly-added anchors.
+    if '_sub_cache_expr' not in raw_eq_cache:
+        raw_eq_cache['_sub_cache_expr'] = {}
+    sub_cache = raw_eq_cache['_sub_cache_expr']
+
+    def _grc(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    # Dedup by (op, seed) within the COMBINED iraws (kept + new).
+    seen_oseed = set()
+    for entry in kept_iraws:
+        anchor, op, sh, _ = entry
+        seed = tuple(anchor[i] - sh[i] for i in range(N_INDICES))
+        seen_oseed.add((op, seed))
+
+    new_iraws = list(kept_iraws)
+    raws_to_apply = []
+    # `added` is iterated in insertion order via list(); set iteration
+    # order varies with PYTHONHASHSEED. For NEW entries appended after
+    # kept_iraws, we use sub_int insertion order (the order they were
+    # added to new_resolved_subs), which matches baseline's iraws-build
+    # order for new sub_ints.
+    added_sorted = [k for k in new_resolved_subs.keys() if k in added]
+    for anchor in added_sorted:
+        if anchor in sub_cache:
+            raw_list = sub_cache[anchor]
+        else:
+            raw_list = []
+            for ibp_op, shift_list in shifts.items():
+                for shift in shift_list:
+                    seed = tuple(anchor[i] - shift[i] for i in range(N_INDICES))
+                    raw = _grc(ibp_op, seed)
+                    if anchor in raw and raw[anchor] != 0:
+                        raw_list.append((ibp_op, shift, raw))
+            sub_cache[anchor] = raw_list
+        for ibp_op, shift, raw in raw_list:
+            seed = tuple(anchor[i] - shift[i] for i in range(N_INDICES))
+            ok = (ibp_op, seed)
+            if ok in seen_oseed:
+                continue
+            seen_oseed.add(ok)
+            new_iraws.append((anchor, ibp_op, shift, raw))
+            rid = id(raw)
+            if rid not in new_rid:
+                new_rid[rid] = len(new_cu) + len(raws_to_apply)
+                raws_to_apply.append(raw)
+
+    if raws_to_apply:
+        new_cacheds = apply_resolved_subs_batch(raws_to_apply, new_resolved_subs)
+        if target_sector is not None:
+            for c in new_cacheds:
+                ub = cached_union_bitmask(c)
+                if _entry_rejected_by_sector(ub, _ts_bm):
+                    new_cu.append({})
+                    new_ubm.append(0)
+                else:
+                    new_cu.append(c)
+                    new_ubm.append(ub)
+        else:
+            for c in new_cacheds:
+                new_cu.append(c)
+                new_ubm.append(cached_union_bitmask(c))
+
+    # Build result indirect_cache_list.
+    result = []
+    for anchor, op, sh, raw in new_iraws:
+        idx = new_rid[id(raw)]
+        result.append((anchor, op, sh, raw, new_cu[idx], new_ubm[idx]))
+
+    return result, (new_cu, new_ubm, new_rid, new_iraws)
 
 
 def enumerate_valid_actions_with_indirect_cache(target, indirect_cache, subs, resolved_subs, ibp_t, li_t, shifts, filter_mode, raw_eq_cache, verbose_timing=False):

@@ -61,7 +61,39 @@ def main():
                         help='Number of CPU threads for torch BLAS ops. '
                              'P2 (model inference) speeds up roughly linearly '
                              'with this if request_cpus matches. Default 1.')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path for periodic beam-state checkpoint. '
+                             'If not supplied, defaults to {output}.ckpt. '
+                             'Pass --no-checkpoint to disable entirely.')
+    parser.add_argument('--no-checkpoint', action='store_true',
+                        help='Disable checkpointing (default ON, thin mode).')
+    parser.add_argument('--checkpoint-interval', type=int, default=50,
+                        help='Save checkpoint every N steps (default 50).')
+    parser.add_argument('--checkpoint-time-seconds', type=int, default=300,
+                        help='Save checkpoint every T seconds even mid-step (default 300).')
+    parser.add_argument('--resume', action='store_true', default=True,
+                        help='Auto-resume from --checkpoint if it exists '
+                             '(default ON). Pass --no-resume to start fresh.')
+    parser.add_argument('--no-resume', action='store_true',
+                        help='Force-start fresh, ignore any existing checkpoint.')
+    parser.add_argument('--checkpoint-mode', choices=['thin', 'thick'],
+                        default='thin',
+                        help='thin: gzipped paths only, ~KB-scale, replay on '
+                             'resume. thick: full FlatAux serialized, '
+                             'GB-scale at depth, bit-faithful resume. '
+                             'Default thin.')
     args = parser.parse_args()
+
+    # Default checkpoint path derived from --output. Pass --no-checkpoint
+    # to disable. This makes thin checkpointing the default behavior so
+    # every worker run leaves a resumable artifact.
+    if args.no_checkpoint:
+        args.checkpoint = None
+    elif args.checkpoint is None:
+        args.checkpoint = f'{args.output}.ckpt'
+    # --no-resume overrides --resume default-True.
+    if args.no_resume:
+        args.resume = False
 
     # Set torch thread count BEFORE loading model. BLAS ops in the
     # model forward pass (transformer attention, linear layers) will
@@ -114,6 +146,14 @@ def main():
                   f'non_masters={len(non_masters)}', flush=True)
 
         this_call_start_expr = dict(expr)
+        # Checkpoint path is per-restart so multiple restarts in one worker
+        # don't overwrite each other. resume_from only fires on restart 1.
+        ckpt_path = (f'{args.checkpoint}.r{restart_count}'
+                     if args.checkpoint else None)
+        resume_from = (ckpt_path
+                       if (args.resume and restart_count == 1
+                           and args.checkpoint is not None)
+                       else None)
         solution, final_beam, best_weight = beam_search_delta(
             env, model, expr,
             target_sector=target_sector,
@@ -124,6 +164,11 @@ def main():
             stop_on_weight_improvement=True,
             filter_mode='subsector',
             device=args.device,
+            checkpoint_path=ckpt_path,
+            checkpoint_interval=args.checkpoint_interval,
+            checkpoint_time_seconds=args.checkpoint_time_seconds,
+            resume_from=resume_from,
+            checkpoint_mode=args.checkpoint_mode,
         )
 
         def _full_expr(state):

@@ -8,8 +8,9 @@
 #                              : effectively disables the straggler escalation
 #                                workflow. Every worker runs at 1 CPU
 #                                indefinitely.
-#   --worker-memory-gb 32    : (8,5) is heavier than (8,4); reserve headroom
-#                              for incremental aux growth.
+#   --worker-memory-gb 16    : probe_84_delta peaked at 10.6 GB; 16 leaves
+#                              headroom and matches far more slots than 32
+#                              (the cluster has many 8-16 GB slots).
 #   Priority order is already (level, r, s) lex via job_priority formula
 #   in hierarchical_reduction.py:147.
 #   --paper-masters-only / --no-paper-masters-only: NOT passed → orchestrator
@@ -33,7 +34,8 @@ nohup /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python -u 
     --beam_width 40 --max_steps 1000000 --prime 1009 \
     --no-paper-masters-only \
     --use-delta-worker \
-    --worker-memory-gb 32 \
+    --worker-memory-gb 16 \
+    --resume \
     --straggler-timeout 1000000000 \
     --straggler2-timeout 1000000000 \
     > $OUTDIR/logs/hierarchical.log 2>&1 &

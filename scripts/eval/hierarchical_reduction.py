@@ -145,8 +145,6 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     resume_flag = f' --resume-from {resume_from}' if resume_from else ''
     # Worker now defaults to dedup OFF. Only emit a flag if we want to ENABLE dedup.
     dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
-    memory = memory_gb if memory_gb is not None else 4 * cpus
-
     # Schedule by hierarchical weight (level, r, s) — level dominates because
     # reductions are sector-by-sector, so an L8 integral with low (r,s) must
     # clear before its L7 descendants can be finalized. Stragglers (cpus > 1)
@@ -155,6 +153,26 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     level = sum(get_sector_mask(integral))
     r, s = weight(integral)[:2]
     job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
+
+    # Memory: use explicit --worker-memory-gb as the L=8 (heaviest) request,
+    # and scale DOWN for lower levels. Lower-level integrals have far smaller
+    # incremental aux (fewer denominators -> fewer cu entries), so giving
+    # them 16GB each wastes cluster capacity. Empirically, (8,4) peaks at
+    # ~10.6 GB, but (7,*) and (6,*) workers see far less.
+    if memory_gb is not None:
+        if level >= 8:
+            memory = memory_gb
+        elif level == 7:
+            memory = max(8, memory_gb // 2)
+        elif level == 6:
+            memory = max(4, memory_gb // 4)
+        else:
+            memory = 4
+        # Straggler resubmits at cpus>1 should be heavy regardless of level
+        if cpus > 1:
+            memory = max(memory, memory_gb)
+    else:
+        memory = 4 * cpus
 
     if use_delta_worker:
         # delta_onestep_worker.py: serial 1-cpu, delta-tracking beam search
