@@ -25,6 +25,16 @@ from torch.utils.data import Dataset, DataLoader
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
 from classifier import IBPActionClassifier
+from classifier_nosubs import IBPActionClassifierNoSubs
+from classifier_subs_xattn import IBPActionClassifierSubsXAttn
+from classifier_v3 import IBPActionClassifierV3
+
+MODEL_CLASSES = {
+    'full': IBPActionClassifier,
+    'nosubs': IBPActionClassifierNoSubs,
+    'subs_xattn': IBPActionClassifierSubsXAttn,
+    'v3': IBPActionClassifierV3,
+}
 
 
 class PackedDatasetV5(Dataset):
@@ -58,13 +68,113 @@ class PackedDatasetV5(Dataset):
 
 
 MAX_REPLACEMENT_TERMS = 20  # Max replacement terms per substitution
+MAX_EQ_TERMS = 30           # Max terms in a post-sub action equation (v3)
 
 
-def make_collate_fn(n_indices, n_denominators):
-    """Build a topology-aware collate_fn closure."""
+def make_collate_fn(n_indices, n_denominators,
+                    variant='full', max_actions_eq=64, max_eq_terms=MAX_EQ_TERMS):
+    """Build a topology-aware collate_fn closure.
+
+    For `variant='v3'`, each sample is augmented in-place with on-the-fly
+    post-sub action equations: action arrays are truncated to top-K
+    (`max_actions_eq`) actions with the chosen action guaranteed to remain,
+    each kept action's equation is computed via resolve_subs +
+    apply_resolved_subs and packed into (action_eq_integrals,
+    action_eq_coeffs, action_eq_mask) tensors. Requires that
+    `ibp_env.init_from_topology(...)` has been called in the parent process
+    (DataLoader workers inherit module state via fork).
+    """
     def collate_fn(samples):
-        return _collate(samples, n_indices, n_denominators)
+        if variant == 'v3':
+            for s in samples:
+                _v3_select_and_compute_eqs(s, max_actions_eq, max_eq_terms)
+        batch = _collate(samples, n_indices, n_denominators)
+        if variant == 'v3':
+            batch.update(_pack_action_eqs(samples, n_indices, max_eq_terms))
+        return batch
     return collate_fn
+
+
+def _v3_select_and_compute_eqs(s, max_actions_eq, max_eq_terms):
+    """In-place: select top-K actions (chosen pinned), compute post-sub
+    equations for each kept action, mutate `s` to carry the new (truncated)
+    arrays + an `action_eqs` field (list[dict] per kept action).
+    """
+    from sailir import ibp_env
+
+    target = tuple(int(x) for x in s['target_integral'])
+    n_actions = int(s['action_ibp_ops'].shape[0])
+    label = int(s['label'])
+
+    # --- Top-K selection. Chosen always retained. ---
+    if n_actions <= max_actions_eq:
+        keep = list(range(n_actions))
+        new_label = label
+    elif label < max_actions_eq:
+        keep = list(range(max_actions_eq))
+        new_label = label
+    else:
+        # Chosen is past first K; swap it into the last position.
+        keep = list(range(max_actions_eq - 1)) + [label]
+        new_label = max_actions_eq - 1
+
+    # --- Resolve subs once per sample, then apply per kept action. ---
+    subs_dict = {
+        tuple(sub[0]): {tuple(pair[0]): pair[1] for pair in sub[1]}
+        for sub in s['subs_raw']
+    }
+    resolved = ibp_env.resolve_subs(subs_dict)
+
+    ibp_templates = ibp_env.IBP_TEMPLATES
+    li_templates = ibp_env.LI_TEMPLATES
+    raw_cache = {}
+    eqs = []
+    for idx in keep:
+        ibp_op = int(s['action_ibp_ops'][idx])
+        delta = tuple(int(x) for x in s['action_deltas'][idx])
+        seed = tuple(target[j] + delta[j] for j in range(len(target)))
+        ck = (ibp_op, seed)
+        if ck not in raw_cache:
+            raw_cache[ck] = ibp_env.get_raw_equation(
+                ibp_templates, li_templates, ibp_op, seed,
+            )
+        eq = ibp_env.apply_resolved_subs(raw_cache[ck], resolved)
+        eqs.append(eq)
+
+    # --- Mutate sample to reflect truncation. The existing _collate uses
+    #     these fields (action_ibp_ops, action_deltas, label) as-is. ---
+    keep_t = torch.as_tensor(keep, dtype=torch.long)
+    s['action_ibp_ops'] = s['action_ibp_ops'][keep_t]
+    s['action_deltas'] = s['action_deltas'][keep_t]
+    s['label'] = torch.as_tensor(new_label, dtype=s['label'].dtype)
+    s['action_eqs'] = eqs
+
+
+def _pack_action_eqs(samples, n_indices, max_eq_terms):
+    """Pack per-sample lists of equation dicts into (B, A_max, T_max, ...) tensors."""
+    batch_size = len(samples)
+    max_action = max(len(s['action_eqs']) for s in samples)
+    if max_action == 0:
+        max_action = 1  # empty action set is degenerate; keep tensors well-shaped
+
+    eq_integrals = torch.zeros(batch_size, max_action, max_eq_terms, n_indices, dtype=torch.long)
+    eq_coeffs = torch.zeros(batch_size, max_action, max_eq_terms, dtype=torch.long)
+    eq_mask = torch.zeros(batch_size, max_action, max_eq_terms, dtype=torch.bool)
+
+    for i, s in enumerate(samples):
+        for j, eq in enumerate(s['action_eqs']):
+            for k, (integral, coeff) in enumerate(eq.items()):
+                if k >= max_eq_terms:
+                    break
+                eq_integrals[i, j, k] = torch.as_tensor(integral, dtype=torch.long)
+                eq_coeffs[i, j, k] = int(coeff)
+                eq_mask[i, j, k] = True
+
+    return {
+        'action_eq_integrals': eq_integrals,
+        'action_eq_coeffs': eq_coeffs,
+        'action_eq_mask': eq_mask,
+    }
 
 
 def _collate(samples, n_indices, n_denominators):
@@ -140,6 +250,26 @@ def _collate(samples, n_indices, n_denominators):
     }
 
 
+def model_forward(model, batch):
+    """Call model with the right positional args. v3 needs 3 extra eq tensors;
+    other variants' forwards accept the base 13 args. We dispatch on whether
+    the batch contains eq tensors (which the v3 collate adds)."""
+    if 'action_eq_integrals' in batch:
+        return model(
+            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
+            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+            batch['sector_mask'], batch['target_integral'],
+            batch['action_eq_integrals'], batch['action_eq_coeffs'], batch['action_eq_mask'],
+        )
+    return model(
+        batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+        batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
+        batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+        batch['sector_mask'], batch['target_integral'],
+    )
+
+
 def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_batches=None,
                 max_iters=None):
     """Run one training epoch. Returns RAW sums (not averages) so the caller
@@ -164,12 +294,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
         batch = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
 
-        logits, _ = model(
-            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
-            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
-            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
-            batch['sector_mask'], batch['target_integral']
-        )
+        logits, _ = model_forward(model, batch)
 
         loss = F.cross_entropy(logits, batch['labels'])
         loss.backward()
@@ -211,12 +336,7 @@ def evaluate(model, dataloader, device, max_iters=None):
         if max_iters is not None and batch_idx >= max_iters:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
-        logits, _ = model(
-            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
-            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
-            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
-            batch['sector_mask'], batch['target_integral']
-        )
+        logits, _ = model_forward(model, batch)
         loss = F.cross_entropy(logits, batch['labels'])
         bs = batch['labels'].size(0)
         total_loss += loss.item() * bs
@@ -264,6 +384,18 @@ def main():
     parser.add_argument('--n_expr_layers', type=int, default=2)
     parser.add_argument('--n_cross_layers', type=int, default=2)
     parser.add_argument('--n_subs_layers', type=int, default=2)
+    parser.add_argument('--model_variant', type=str, default='full',
+                        choices=tuple(MODEL_CLASSES.keys()),
+                        help='full: original IBPActionClassifier (with subs encoder); '
+                             'nosubs: IBPActionClassifierNoSubs (subs path removed); '
+                             'subs_xattn: cross-attention to subs in the scorer; '
+                             'v3: action = post-sub equation (no subs anywhere, no (ibp_op,delta) handle). '
+                             'Checkpoints from different variants are NOT interchangeable; use a '
+                             'distinct --output_dir per variant.')
+    parser.add_argument('--max_actions_eq', type=int, default=64,
+                        help='[v3 only] Cap on actions per sample (chosen always retained).')
+    parser.add_argument('--max_eq_terms', type=int, default=MAX_EQ_TERMS,
+                        help='[v3 only] Cap on terms per post-sub action equation.')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prime', type=int, default=1009)
     parser.add_argument('--device', type=str, default='cuda')
@@ -285,18 +417,21 @@ def main():
     # DDP detection: torchrun sets LOCAL_RANK/RANK/WORLD_SIZE env vars.
     local_rank = int(os.environ.get('LOCAL_RANK', -1))
     ddp_enabled = local_rank >= 0
+    # Global rank — distinct from local_rank on multi-node (one local_rank==0
+    # per node, but exactly one global_rank==0 across the whole job).
+    global_rank = int(os.environ.get('RANK', 0))
 
-    # Build manifest on rank 0 BEFORE CUDA is touched.
+    # Build manifest on global rank 0 BEFORE CUDA is touched.
     # multiprocessing.Pool uses fork, which is safe pre-CUDA-init.
     # ~2-3 min one-time; cached to JSON for future runs.
-    if args.shards_dir and (not ddp_enabled or local_rank == 0):
+    if args.shards_dir and (not ddp_enabled or global_rank == 0):
         manifest_path = Path(args.shards_dir) / 'manifest.json'
         if not manifest_path.is_file():
-            print(f"[rank{max(local_rank,0)}] Building manifest at {manifest_path} "
+            print(f"[rank{global_rank}] Building manifest at {manifest_path} "
                   f"(one-time, ~2-3 min)...", flush=True)
             from sharded_dataset import build_manifest as _bm
             _bm(args.shards_dir)
-            print(f"[rank{max(local_rank,0)}] Manifest built.", flush=True)
+            print(f"[rank{global_rank}] Manifest built.", flush=True)
 
     if ddp_enabled:
         dist.init_process_group(backend='nccl')
@@ -344,7 +479,12 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    collate = make_collate_fn(n_indices=n_indices, n_denominators=n_denominators)
+    collate = make_collate_fn(
+        n_indices=n_indices, n_denominators=n_denominators,
+        variant=args.model_variant,
+        max_actions_eq=args.max_actions_eq,
+        max_eq_terms=args.max_eq_terms,
+    )
 
     if args.shards_dir is not None:
         # Sharded streaming mode — memory-bounded.
@@ -474,13 +614,15 @@ def main():
     ibp_env.init_from_topology(topology)
     ibp_env.set_prime(args.prime)
 
-    model = IBPActionClassifier(
+    model_cls = MODEL_CLASSES[args.model_variant]
+    model = model_cls(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
         n_subs_layers=args.n_subs_layers, prime=args.prime,
         n_indices=n_indices, n_denominators=n_denominators, n_ibp_ops=n_actions,
     )
     model = model.to(device)
+    log(f"Model variant: {args.model_variant} ({model_cls.__name__})")
     log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     if ddp_enabled:

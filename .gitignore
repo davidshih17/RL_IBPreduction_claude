@@ -14,6 +14,7 @@ __pycache__/
 logs/
 *.log
 !results/training_log/train.log
+!results/training_log/v3/*.log
 *.pkl
 *.npz
 work-dir/

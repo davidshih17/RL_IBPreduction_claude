@@ -1,0 +1,50 @@
+[2026-06-05T09:08:56-07:00] Supervisor started.
+[2026-06-05T09:08:56-07:00]   TARGET_EPOCHS=100  MAX_ALLOCATIONS=12
+[2026-06-05T09:08:56-07:00]   Allocation:   -N 4 --gpus 16 -t 04:00:00
+[2026-06-05T09:08:56-07:00]   Output dir:   checkpoints/pentagonbox_10x_loop_100_v3
+[2026-06-05T09:08:56-07:00]   Supervisor log: logs/supervisor_20260605_090856.log (training logs are separate)
+[2026-06-05T09:08:56-07:00] --- iteration 1/12  current_epoch=0/100 ---
+[2026-06-05T09:08:56-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-05T09:08:56-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-05T13:09:30-07:00] salloc exited rc=143
+[2026-06-05T13:09:39-07:00] After iteration: epoch=7 (was 0)
+[2026-06-05T13:09:39-07:00] Sleeping 30s before next allocation...
+[2026-06-05T13:10:14-07:00] --- iteration 2/12  current_epoch=7/100 ---
+[2026-06-05T13:10:14-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-05T13:10:14-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-05T17:10:42-07:00] salloc exited rc=143
+[2026-06-05T17:10:49-07:00] After iteration: epoch=13 (was 7)
+[2026-06-05T17:10:49-07:00] Sleeping 30s before next allocation...
+[2026-06-05T17:11:21-07:00] --- iteration 3/12  current_epoch=13/100 ---
+[2026-06-05T17:11:21-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-05T17:11:21-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-05T21:11:34-07:00] salloc exited rc=143
+[2026-06-05T21:11:40-07:00] After iteration: epoch=20 (was 13)
+[2026-06-05T21:11:40-07:00] Sleeping 30s before next allocation...
+[2026-06-05T21:12:12-07:00] --- iteration 4/12  current_epoch=20/100 ---
+[2026-06-05T21:12:12-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-05T21:12:12-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-06T01:12:40-07:00] salloc exited rc=143
+[2026-06-06T01:12:48-07:00] After iteration: epoch=27 (was 20)
+[2026-06-06T01:12:48-07:00] Sleeping 30s before next allocation...
+[2026-06-06T01:13:20-07:00] --- iteration 5/12  current_epoch=27/100 ---
+[2026-06-06T01:13:20-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-06T01:13:20-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-06T05:14:28-07:00] salloc exited rc=143
+[2026-06-06T05:14:34-07:00] After iteration: epoch=33 (was 27)
+[2026-06-06T05:14:34-07:00] Sleeping 30s before next allocation...
+[2026-06-06T05:15:06-07:00] --- iteration 6/12  current_epoch=33/100 ---
+[2026-06-06T05:15:06-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-06T05:15:06-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-06T09:15:40-07:00] salloc exited rc=143
+[2026-06-06T09:15:46-07:00] After iteration: epoch=40 (was 33)
+[2026-06-06T09:15:46-07:00] Sleeping 30s before next allocation...
+[2026-06-06T09:16:18-07:00] --- iteration 7/12  current_epoch=40/100 ---
+[2026-06-06T09:16:18-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-06T09:16:18-07:00] (this blocks until the allocation is granted; can take a few minutes)
+[2026-06-06T13:16:28-07:00] salloc exited rc=143
+[2026-06-06T13:16:34-07:00] After iteration: epoch=46 (was 40)
+[2026-06-06T13:16:34-07:00] Sleeping 30s before next allocation...
+[2026-06-06T13:17:06-07:00] --- iteration 8/12  current_epoch=46/100 ---
+[2026-06-06T13:17:06-07:00] Requesting salloc -N 4 --gpus 16 -q interactive -t 04:00:00 -A m4539_g ...
+[2026-06-06T13:17:06-07:00] (this blocks until the allocation is granted; can take a few minutes)
