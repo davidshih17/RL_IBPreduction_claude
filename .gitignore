@@ -16,8 +16,14 @@ logs/
 !results/training_log/train.log
 *.pkl
 *.npz
+*.err
+*.out
 work-dir/
 scratch/
+
+# Per-run output directories — all under results/ except training_log/
+results/*/
+!results/training_log/
 
 # Generated outputs (regenerable from CSVs in results/)
 *.pdf
@@ -31,7 +37,26 @@ data/
 # Training output (the published phase-1 model at checkpoints/best_model.pt
 # is committed; everything else under checkpoints/ is per-run output).
 checkpoints/pentagonbox/
+checkpoints/pentagonbox_*/
 checkpoints/*/last.pt
 checkpoints/*/checkpoint_epoch*.pt
 checkpoints/*/final_model.pt
+checkpoints/*/best_model.pt
 smoke_checkpoints/
+
+# Compiled extensions and Cython generated C (keep .pyx, not .c/.so)
+*.so
+sailir/_*_inner.c
+
+# In-place backup files from refactor experiments
+*.bak-pre-*
+
+# Build artifacts
+build/
+
+# External data / orchestrator state (regenerable, large)
+from_federica/
+
+# Test scratch dirs inside scripts/symmetries/
+scripts/symmetries/tmp_*
+scripts/symmetries/logs/

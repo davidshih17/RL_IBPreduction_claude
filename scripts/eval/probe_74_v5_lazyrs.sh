@@ -1,0 +1,33 @@
+#!/bin/bash
+# Re-run (7,4) probe with LAZY_RS + keep-first=50.
+# Resumes from the step-100 snapshot ckpt for warm start.
+set -e
+BASE=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
+OUTDIR=$BASE/results/probe_74_v5_lazyrs
+mkdir -p $OUTDIR
+# Resume from snapshot of step 100 (taken pre-LAZY_RS but still valid since
+# the running run had LAZY_RS=False; trajectory is bit-identical either way)
+cp -n /tmp/probe74_step100_ckpt.pkl $OUTDIR/seed_ckpt.pkl 2>/dev/null || true
+PYTHON=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
+MODEL=$BASE/checkpoints/pentagonbox_10x_loop_100/best_model.pt
+TOPOLOGY=$BASE/topology_input/pentagonbox
+INTEGRAL_STR="0,1,1,1,1,1,1,1,-4,0,0"
+
+cat > $OUTDIR/probe.sub <<EOF
+universe = vanilla
+executable = $PYTHON
+arguments = -u $BASE/scripts/eval/beam_search_v5.py --topology $TOPOLOGY --model $MODEL --integral='$INTEGRAL_STR' --output $OUTDIR/result.pkl --ckpt $OUTDIR/ckpt.pkl --ckpt-every 50 --resume-from $OUTDIR/seed_ckpt.pkl --tabu --no-exprkeyed --iraws-keep-first 50 --beam-width 40 --max-steps 5000 --max-actions 900 --beam-sort mixed --no-paper-masters-only --prime 1009 --n-threads 1 --device cpu
+environment = "PYTHONUNBUFFERED=1"
+output = $OUTDIR/probe.out
+error  = $OUTDIR/probe.err
+log    = $OUTDIR/probe.log
+request_cpus = 1
+request_memory = 32GB
+request_disk = 50GB
+Requirements = (TARGET.KFlops > 3000000)
+priority = 1000000000
++JobFlavour = "workday"
+queue
+EOF
+
+condor_submit $OUTDIR/probe.sub

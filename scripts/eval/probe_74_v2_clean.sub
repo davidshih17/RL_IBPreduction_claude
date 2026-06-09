@@ -1,0 +1,12 @@
+universe = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
+arguments = -u /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/eval/onestep_worker.py --topology /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/topology_input/pentagonbox --integral='0,1,1,1,1,1,1,1,-4,0,0' --output /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/probe_74_v2_clean/result.pkl --model-checkpoint /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/checkpoints/pentagonbox_v2/best_model.pt --beam_width 20 --max_steps 1000000 --prime 1009 --device cpu -v --n_workers 8
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/probe_74_v2_clean/probe.out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/probe_74_v2_clean/probe.err
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/probe_74_v2_clean/probe.log
+request_cpus = 8
+request_memory = 32GB
+request_disk = 1GB
+Requirements = (TARGET.KFlops > 3000000)
++JobFlavour = "workday"
+queue

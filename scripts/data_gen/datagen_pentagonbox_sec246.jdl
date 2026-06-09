@@ -1,0 +1,15 @@
+# Pentagon-box sec246 dedicated data-gen: 100 workers x 400 scrambles each.
+# Expected ~500k samples total (vs ~5.6k for sector 246 in the original 1.29M set).
+universe                 = vanilla
+executable               = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/datagen_worker_pentagonbox_sec246.sh
+arguments                = $(Process) 400 /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/data/pentagonbox_sec246_raw_jsonl
+output                   = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/datagen_pb_sec246_$(Process).out
+error                    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/datagen_pb_sec246_$(Process).err
+log                      = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/data_gen/logs/datagen_pb_sec246_$(Process).log
+environment              = "SAILIR_DIR=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2 PYTHON=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python"
+request_cpus             = 1
+request_memory           = 6GB
+request_disk             = 1GB
+should_transfer_files    = NO
+notification             = Error
+queue 100

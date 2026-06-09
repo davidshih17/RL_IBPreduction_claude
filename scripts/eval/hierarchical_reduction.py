@@ -112,7 +112,8 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                          checkpoint_path=None, checkpoint_interval=50,
                          checkpoint_time_seconds=300, resume_from=None,
                          dedup_beam_by_content=False,
-                         use_delta_worker=False, memory_gb=None):
+                         use_delta_worker=False, memory_gb=None,
+                         use_v6_worker=False):
     """Create a Condor submit file for a single-integral one-step reduction.
 
     PAPER DEFAULTS (matches trianglebox-paper recipe):
@@ -174,7 +175,19 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     else:
         memory = 4 * cpus
 
-    if use_delta_worker:
+    if use_v6_worker:
+        # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
+        # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
+        # any()-termination + macro-dedup). Accepts the same CLI as
+        # onestep_worker.py and writes orchestrator-compatible result.pkl.
+        worker_script = 'onestep_worker_v6.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}{cp_flag}{resume_flag}')
+    elif use_delta_worker:
         # delta_onestep_worker.py: serial 1-cpu, delta-tracking beam search
         # with Cython phase1b + Phase A. CLI surface is smaller — drops
         # checkpoint, resume, n_workers, beam_sort, dedup flags.
@@ -363,6 +376,15 @@ def main():
                              'resume). Use with large --straggler-timeout '
                              'and --straggler2-timeout to disable the '
                              'straggler escalation entirely.')
+    parser.add_argument('--use-v6-worker', action='store_true',
+                        help='Dispatch workers to onestep_worker_v6.py '
+                             '(serial 1-cpu beam_search_v6 — strip-passenger '
+                             '+ LAZY_RS + iraws-keep-first=50 + tabu + '
+                             'any() termination + macro-dedup). '
+                             'Drops the n_workers/dedup/beam_sort flags. '
+                             'Empirically 9.7\u00d7 faster + 10.9\u00d7 lower memory '
+                             'than the delta worker on the canonical '
+                             'pentagonbox long-runner integral.')
     parser.add_argument('--worker-memory-gb', type=int, default=None,
                         help='Override per-worker memory request (GB). '
                              'Default scales with cpus (4 * cpus). For the '
@@ -489,14 +511,15 @@ def main():
         # Count cache hits (integrals that were substituted)
         # This is approximate - we count how many integrals were removed
 
-        # Cancel IDLE pending jobs whose integral is no longer in expr (its
-        # coefficient was zeroed mod prime by another substitution). We only
-        # kill jobs that have NOT yet started running on Condor — already-
-        # running jobs are left alone so their eventual cache entry can short-
-        # circuit any future re-occurrence of the same integral.
+        # Cancel pending jobs whose integral is no longer in expr (its
+        # coefficient was zeroed mod prime by another substitution). Kill
+        # both IDLE and RUNNING workers — a running worker on a substituted-
+        # out integral is doing redundant work that won't be inserted back
+        # into the live expression. (Earlier policy spared running workers
+        # for cache short-circuit benefits, but it was inconsistent: when
+        # the JobStartDate query timed out it killed running workers anyway,
+        # so different iterations applied different policies.)
         if pending:
-            pending_cids = [cid for (cid, _, _, _) in pending.values() if cid]
-            start_times = query_job_start_times(pending_cids)
             cancelled_obsolete = 0
             for integral in list(pending.keys()):
                 if integral in expr:
@@ -506,9 +529,6 @@ def main():
                     continue  # result already on disk — let normal handling take it
                 if not cluster_id:
                     continue
-                if str(cluster_id) in start_times:
-                    continue  # already running — let it finish for the cache entry
-                # Idle and obsolete — drop it
                 try:
                     subprocess.run(['condor_rm', str(cluster_id)],
                                    capture_output=True, text=True, timeout=10)
@@ -517,8 +537,8 @@ def main():
                 del pending[integral]
                 cancelled_obsolete += 1
             if cancelled_obsolete:
-                print(f"[Iter {iteration}] Cancelled {cancelled_obsolete} idle pending jobs "
-                      f"whose integrals are no longer needed", flush=True)
+                print(f"[Iter {iteration}] Cancelled {cancelled_obsolete} pending jobs "
+                      f"(idle+running) whose integrals are no longer needed", flush=True)
 
         # Find non-masters that need reduction
         non_masters = get_non_masters(expr)
@@ -574,6 +594,7 @@ def main():
                 resume_from=resume_from,
                 dedup_beam_by_content=args.worker_dedup_beam_by_content,
                 use_delta_worker=args.use_delta_worker,
+                use_v6_worker=args.use_v6_worker,
                 memory_gb=args.worker_memory_gb,
             )
 
@@ -666,6 +687,7 @@ def main():
                     resume_from=resume_from,
                     dedup_beam_by_content=args.worker_dedup_beam_by_content,
                     use_delta_worker=args.use_delta_worker,
+                    use_v6_worker=args.use_v6_worker,
                     memory_gb=args.worker_memory_gb,
                 )
 
@@ -730,6 +752,7 @@ def main():
                     resume_from=resume_from,
                     dedup_beam_by_content=True,  # force dedup at this level
                     use_delta_worker=args.use_delta_worker,
+                    use_v6_worker=args.use_v6_worker,
                     memory_gb=args.worker_memory_gb,
                 )
 

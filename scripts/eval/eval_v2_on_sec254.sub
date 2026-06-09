@@ -1,0 +1,12 @@
+universe = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
+arguments = -u /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/eval/eval_v2_on_sec254.py
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/eval_v2_on_sec254.out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/eval_v2_on_sec254.err
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/eval_v2_on_sec254.log
+request_cpus = 2
+request_memory = 16GB
+request_disk = 4GB
+request_gpus = 1
+should_transfer_files = NO
+queue
