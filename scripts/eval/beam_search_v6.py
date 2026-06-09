@@ -422,7 +422,9 @@ def prepare_batched_input_v5_dummy(batch_data, device, max_subs=50,
       |prob Δ|=4.1e-7, top-1 always matches)
     - max_actions defaults to 900 (matches training distribution)
     """
-    from beam_search_full import MAX_REPLACEMENT_TERMS
+    # MAX_REPLACEMENT_TERMS was previously imported from beam_search_full;
+    # inlined here to keep v6 self-contained (beam_search_full now in archive/).
+    MAX_REPLACEMENT_TERMS = 20  # Must match training
 
     batch_size = len(batch_data)
     max_terms = max(len(filter_to_sector(d[0], d[3])) for d in batch_data) if batch_data else 1
