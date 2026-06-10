@@ -37,6 +37,36 @@ import torch
 sys.path.insert(0, '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2')
 sys.path.insert(0, '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/eval')
 
+
+# ── memprofile helpers ─────────────────────────────────────────────────
+def _read_rss_kb():
+    """Read RSS + VmSize from /proc/self/status in KB. Linux-only, no
+    dependencies. Returns (rss_kb, vms_kb) or (0, 0) on failure.
+    """
+    try:
+        with open('/proc/self/status') as fp:
+            txt = fp.read()
+        rss = vms = 0
+        for line in txt.splitlines():
+            if line.startswith('VmRSS:'):
+                rss = int(line.split()[1])
+            elif line.startswith('VmSize:'):
+                vms = int(line.split()[1])
+        return rss, vms
+    except Exception:
+        return 0, 0
+
+
+def _rss_sample(memprofile_dir, step, phase):
+    """Append a single RSS sample to phase_rss.tsv. Cheap (one /proc read +
+    one fp write). Called at phase boundaries inside the step loop."""
+    rss, vms = _read_rss_kb()
+    try:
+        with open(os.path.join(memprofile_dir, 'phase_rss.tsv'), 'a') as fp:
+            fp.write(f'{step}\t{phase}\t{rss}\t{vms}\n')
+    except Exception:
+        pass
+
 from sailir import ibp_env
 from sailir.topology import Topology
 from sailir.ibp_env import (
@@ -519,7 +549,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                    ckpt_every_step=False,
                    iraws_window=None,
                    iraws_keep_first=None,
-                   lazy_rs=True):
+                   lazy_rs=True,
+                   model_batch_chunk=None):
     """Sequential beam search, v5 strip-active semantics.
 
     resume_from: path to a ckpt.pkl (or result.pkl) from a prior run; resumes
@@ -638,6 +669,11 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f'{n_orig_beam} → {n_macros} distinct expr', flush=True)
         # ──────────────────────────────────────────────────────────────────
 
+        # Sample RSS at start of step (after the macro-dedup pass above).
+        _memprofile_dir = os.environ.get('MEMPROFILE_DIR')
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'start_of_step')
+
         # Build candidate list across all parents × valid actions
         candidates = []  # list of state_v5_child
         cand_metadata = []  # parallel list of (parent_state, target) for incremental aux
@@ -689,13 +725,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     )
                 else:
                     # Optionally restrict the fresh rebuild's sub-int keyset.
-                    # IMPORTANT: only prune fresh_dummy (which controls which
-                    # sub_ints get iraws entries — bounding output size).
-                    # `resolved_subs` MUST stay full so cu reflects all current
-                    # substitutions. (Pruning resolved_subs here was a bug that
-                    # made --no-incremental-aux diverge from the incremental
-                    # path, where parent.aux_flat.cu had full context applied
-                    # and `_prune_aux_by_recency` only dropped iraws entries.)
                     if (iraws_window is not None or iraws_keep_first is not None):
                         keys = list(s.resolved_subs.keys())
                         keep = set()
@@ -705,14 +734,16 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                             keep.update(keys[-iraws_window:])
                         if len(keep) < len(keys):
                             keep_list = [k for k in keys if k in keep]
+                            fresh_rs = {k: s.resolved_subs[k] for k in keep_list}
                             fresh_dummy = {k: {} for k in keep_list}
                         else:
+                            fresh_rs = s.resolved_subs
                             fresh_dummy = dummy_subs
                     else:
+                        fresh_rs = s.resolved_subs
                         fresh_dummy = dummy_subs
                     indirect_cache, new_aux = compute_indirect_substituted_with_aux(
-                        fresh_dummy, s.resolved_subs,
-                        env.ibp_t, env.li_t, env.shifts,
+                        fresh_dummy, fresh_rs, env.ibp_t, env.li_t, env.shifts,
                         env._raw_eq_cache,
                     )
                 if _v5_prof:
@@ -770,27 +801,105 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 print(f'[v6 step {step}] no tasks — STUCK', flush=True)
             break
 
+        # Phase 1 done — sample RSS.
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'after_p1_enum')
+
         # Run model batched on all tasks
         _t = time.time() if _v5_prof else 0
         batch_data = []
         for parent_idx, target, valid in tasks:
             s = beam[parent_idx]
             batch_data.append((s.expr, s.resolved_subs, valid, target_sector, target))
-        b = prepare_batched_input_v5_dummy(batch_data, device,
-                                           max_actions=max_actions)
+
+        # Compute global max_actions across all tasks so chunked outputs share
+        # a consistent action dimension. We cap by `max_actions` arg.
+        global_max_actions = min(
+            max(len(d[2]) for d in batch_data) if batch_data else 1,
+            max_actions,
+        )
+
+        # Determine chunk size. None / 0 / >= len(batch_data) means no chunking
+        # (single big batch — original behavior).
+        chunk_sz = model_batch_chunk if model_batch_chunk else len(batch_data)
+        chunk_sz = max(1, min(chunk_sz, len(batch_data)))
         if _v5_prof:
             _p2['batch_prep'] += time.time() - _t
-            _t = time.time()
-        with torch.no_grad():
-            logits, probs = model(
-                b['expr_integrals'], b['expr_coeffs'], b['expr_mask'],
-                b['sub_keys'], b['sub_repl_ints'], b['sub_repl_coeffs'],
-                b['sub_repl_mask'], b['sub_mask'],
-                b['action_ibp_ops'], b['action_deltas'], b['action_mask'],
-                b['sector_mask'], b['target_integral'],
+
+        # Sample RSS just BEFORE the model forward, so we isolate its delta.
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'before_model_fwd')
+
+        # Preallocate global probs tensor: (B_total, global_max_actions).
+        # Each chunk fills its slice. Chunks with smaller max_actions_eff
+        # leave the trailing zeros for unused action slots (the downstream
+        # code uses `probs[ti, :n_v]` so trailing zeros are never read for
+        # valid > chunk_max).
+        probs_all = torch.zeros(len(batch_data), global_max_actions)
+
+        # Decide whether to enable torch.profiler this step (only on every
+        # 10th step, on the FIRST chunk only — keeps overhead bounded).
+        do_profile = bool(_memprofile_dir and (step % 10 == 0))
+        prof_ctx = None
+        if do_profile:
+            import torch.profiler as _tp
+            prof_ctx = _tp.profile(
+                activities=[_tp.ProfilerActivity.CPU],
+                profile_memory=True, record_shapes=True, with_stack=True,
             )
+
+        _t = time.time() if _v5_prof else 0
+        for chunk_start in range(0, len(batch_data), chunk_sz):
+            chunk = batch_data[chunk_start:chunk_start + chunk_sz]
+            # Cap actions to the global so probs shape matches downstream.
+            b = prepare_batched_input_v5_dummy(chunk, device,
+                                                max_actions=global_max_actions)
+            if do_profile and chunk_start == 0:
+                with prof_ctx:
+                    with torch.no_grad():
+                        _, chunk_probs = model(
+                            b['expr_integrals'], b['expr_coeffs'], b['expr_mask'],
+                            b['sub_keys'], b['sub_repl_ints'], b['sub_repl_coeffs'],
+                            b['sub_repl_mask'], b['sub_mask'],
+                            b['action_ibp_ops'], b['action_deltas'], b['action_mask'],
+                            b['sector_mask'], b['target_integral'],
+                        )
+            else:
+                with torch.no_grad():
+                    _, chunk_probs = model(
+                        b['expr_integrals'], b['expr_coeffs'], b['expr_mask'],
+                        b['sub_keys'], b['sub_repl_ints'], b['sub_repl_coeffs'],
+                        b['sub_repl_mask'], b['sub_mask'],
+                        b['action_ibp_ops'], b['action_deltas'], b['action_mask'],
+                        b['sector_mask'], b['target_integral'],
+                    )
+            # chunk_probs shape: (len(chunk), chunk_max_actions_eff)
+            cn = chunk_probs.shape[1]
+            probs_all[chunk_start:chunk_start + len(chunk), :cn] = chunk_probs
+            # explicit free of chunk-local tensors
+            del b, chunk_probs
+
+        probs = probs_all
         if _v5_prof:
             _p2['model_fwd'] += time.time() - _t
+
+        # Save the profile output if we ran one.
+        if prof_ctx is not None:
+            _trace_path = os.path.join(_memprofile_dir,
+                                        f'torch_trace_step{step+1:04d}.json')
+            _topmem_path = os.path.join(_memprofile_dir,
+                                         f'torch_topmem_step{step+1:04d}.txt')
+            try:
+                prof_ctx.export_chrome_trace(_trace_path)
+                with open(_topmem_path, 'w') as fp:
+                    fp.write(prof_ctx.key_averages().table(
+                        sort_by='cpu_memory_usage', row_limit=40))
+            except Exception as _e:
+                print(f'  [memprofile] torch export failed: {_e}', flush=True)
+
+        # Sample RSS after model forward.
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'after_model_fwd')
 
         # For each task, take top-K actions by prob, apply, generate candidates
         K = max(1, beam_width // 2)
@@ -871,29 +980,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
 
         if _v5_prof:
             _p3['sort'] += time.time() - _t_sort
-
-        # ── v6 early macro-dedup (Issue #11) ────────────────────────────
-        # The original macro-dedup runs at the TOP of the next step. By
-        # then we've already paid the cost of materializing aux_flat for
-        # every duplicate child that's about to be thrown away. Doing the
-        # dedup BEFORE materialization is bit-identical (dedup key depends
-        # only on expr / max_w12 / n_non_masters / score — all of which
-        # are unchanged by materialization) and saves the wasted work.
-        # The next-step dedup becomes a no-op.
-        if len(beam) > 1:
-            early_groups = {}
-            for s in beam:
-                efp = frozenset(s.expr.items())
-                cur = early_groups.get(efp)
-                if cur is None or (s.max_w12, s.n_non_masters, -s.score) < \
-                                  (cur.max_w12, cur.n_non_masters, -cur.score):
-                    early_groups[efp] = s
-            if len(early_groups) < len(beam):
-                if verbose:
-                    print(f'[v6 step {step}] early-dedup: {len(beam)} → '
-                          f'{len(early_groups)} distinct expr (pre-materialize)',
-                          flush=True)
-                beam = list(early_groups.values())
+        # Phase 3 done — children selected, not yet materialized.
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'after_p3_select')
 
         # Post-selection survivors: materialize lazy_rs THEN attach aux in a
         # single pass so the original `c` is still in meta_by_id.
@@ -918,6 +1007,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         if _v5_prof:
             _p4['mat_rs'] = _p4.get('mat_rs', 0.0) + (time.time() - _t_mat - _t_aux)
             _p4['attach_aux'] += _t_aux
+        # Phase 4 done — children fully materialized.
+        if _memprofile_dir:
+            _rss_sample(_memprofile_dir, step + 1, 'after_p4_materialize')
 
         # Track best so far: use (max_w, n_non_masters) only — ignore score.
         # Score is cumulative negative log-prob, so the initial state always
@@ -946,6 +1038,37 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f't_step={time.time()-t_step:.1f}s '
                   f't_total={time.time()-t0:.1f}s',
                   flush=True)
+
+        # ── memprofile end-of-step phase sample ─────────────────────────
+        # phase-RSS samples within the step are written inline at phase
+        # boundaries; this is the final "after_dedup" sample.
+        memprofile_dir = os.environ.get('MEMPROFILE_DIR')
+        if memprofile_dir:
+            _rss_sample(memprofile_dir, step + 1, 'after_dedup_eos')
+
+            # Cache size sample: cheap lens, no allocations.
+            try:
+                raw_eq_len = len(env._raw_eq_cache) if hasattr(env, '_raw_eq_cache') else -1
+                tabu_buckets = len(tabu_dict) if tabu_dict is not None else 0
+                tabu_entries = sum(len(v) for v in tabu_dict.values()) if tabu_dict else 0
+                sum_rs = sum(len(s.resolved_subs) if s.resolved_subs else 0 for s in beam)
+                sum_sa = sum(len(s.sub_accum) if s.sub_accum else 0 for s in beam)
+                sum_path = sum(len(s.path) if s.path else 0 for s in beam)
+                with open(os.path.join(memprofile_dir, 'cache_sizes.tsv'), 'a') as fp:
+                    fp.write(f'{step+1}\t{raw_eq_len}\t{tabu_buckets}\t'
+                             f'{tabu_entries}\t{sum_rs}\t{sum_sa}\t{sum_path}\n')
+            except Exception as _e:
+                pass
+
+            # tracemalloc snapshot at intervals.
+            if os.environ.get('MEMPROFILE_TRACEMALLOC') == '1':
+                every = int(os.environ.get('MEMPROFILE_TRACEMALLOC_EVERY_N',
+                                            '25'))
+                if (step + 1) % every == 0:
+                    import tracemalloc
+                    snap_path = os.path.join(memprofile_dir,
+                                              f'trace_step{step+1:04d}.snap')
+                    tracemalloc.take_snapshot().dump(snap_path)
             if _v5_prof:
                 p1_t = sum(_p1.values())
                 p2_t = sum(_p2.values())
@@ -1081,6 +1204,26 @@ def main():
                    help='Write a thick per-step checkpoint after every step '
                         '(format: <ckpt_path>.stepNNNN). For bit-identical '
                         'verification of incremental-aux runs.')
+    p.add_argument('--memprofile-dir', default=None,
+                   help='Enable phase-RSS sampling + torch.profiler around '
+                        'model forward (every 10th step). Output goes to '
+                        '<dir>/phase_rss.tsv and <dir>/torch_*.{json,txt}.')
+    p.add_argument('--model-batch-chunk', type=int, default=None,
+                   help='If set, split the per-step model forward into '
+                        'chunks of this many (parent, target) pairs. Each '
+                        'chunk gets its own model() call. Output probs are '
+                        'reassembled into a single tensor so downstream '
+                        'logic is unchanged. Trades a few ms/step of '
+                        'overhead for bounded peak torch memory.')
+    p.add_argument('--tracemalloc', action='store_true',
+                   help='Enable tracemalloc snapshots every '
+                        '--tracemalloc-every steps (saved to '
+                        '<memprofile-dir>/trace_step<NNNN>.snap). Diff '
+                        'consecutive snapshots offline to see which Python '
+                        'lines grew.')
+    p.add_argument('--tracemalloc-every', type=int, default=25,
+                   help='How often (in steps) to take a tracemalloc '
+                        'snapshot. Default 25.')
     p.add_argument('--iraws-window', type=int, default=None,
                    help='If set, keep iraws anchored on the most recent N '
                         'sub_ints (recency window).')
@@ -1099,6 +1242,34 @@ def main():
     args = p.parse_args()
 
     torch.set_num_threads(args.n_threads)
+
+    # ── memprofile instrumentation (RSS + torch.profiler + tracemalloc) ─
+    # Three layers:
+    #   1) /proc/self/status RSS sampling at every phase boundary
+    #   2) torch.profiler around model forward (profile_memory=True) —
+    #      torch op-level memory attribution
+    #   3) tracemalloc snapshot every TRACEMALLOC_EVERY_N steps (low frame
+    #      depth to keep overhead bounded). Snapshots can be diffed offline
+    #      via Snapshot.compare_to to see WHICH PY OBJECTS GREW.
+    # PLUS a cache_sizes.tsv: cheap len() of suspect caches per step.
+    if args.memprofile_dir:
+        os.makedirs(args.memprofile_dir, exist_ok=True)
+        os.environ['MEMPROFILE_DIR'] = args.memprofile_dir
+        with open(os.path.join(args.memprofile_dir, 'phase_rss.tsv'), 'w') as fp:
+            fp.write('step\tphase\trss_kb\tvms_kb\n')
+        with open(os.path.join(args.memprofile_dir, 'cache_sizes.tsv'), 'w') as fp:
+            fp.write('step\traw_eq_cache_len\ttabu_buckets\ttabu_total_entries\t'
+                     'sum_rs_len\tsum_sub_accum_len\tsum_path_len\n')
+        if args.tracemalloc:
+            import tracemalloc
+            tracemalloc.start(5)  # frames=5 keeps overhead low
+            os.environ['MEMPROFILE_TRACEMALLOC'] = '1'
+            os.environ['MEMPROFILE_TRACEMALLOC_EVERY_N'] = str(args.tracemalloc_every)
+        print(f'  [memprofile] phase-RSS + cache-sizes on; '
+              f'torch.profiler every 10 steps; '
+              f'tracemalloc={args.tracemalloc} (every '
+              f'{args.tracemalloc_every} steps); '
+              f'output → {args.memprofile_dir}', flush=True)
 
     print(f'== v5 beam search ==', flush=True)
     print(f'  topology      = {args.topology}', flush=True)
@@ -1154,6 +1325,7 @@ def main():
         iraws_window=args.iraws_window,
         iraws_keep_first=args.iraws_keep_first,
         lazy_rs=args.lazy_rs,
+        model_batch_chunk=args.model_batch_chunk,
     )
 
     print(f'\n== DONE — beam size {len(beam)} ==', flush=True)

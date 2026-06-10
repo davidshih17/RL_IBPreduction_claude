@@ -689,13 +689,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     )
                 else:
                     # Optionally restrict the fresh rebuild's sub-int keyset.
-                    # IMPORTANT: only prune fresh_dummy (which controls which
-                    # sub_ints get iraws entries — bounding output size).
-                    # `resolved_subs` MUST stay full so cu reflects all current
-                    # substitutions. (Pruning resolved_subs here was a bug that
-                    # made --no-incremental-aux diverge from the incremental
-                    # path, where parent.aux_flat.cu had full context applied
-                    # and `_prune_aux_by_recency` only dropped iraws entries.)
                     if (iraws_window is not None or iraws_keep_first is not None):
                         keys = list(s.resolved_subs.keys())
                         keep = set()
@@ -705,14 +698,16 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                             keep.update(keys[-iraws_window:])
                         if len(keep) < len(keys):
                             keep_list = [k for k in keys if k in keep]
+                            fresh_rs = {k: s.resolved_subs[k] for k in keep_list}
                             fresh_dummy = {k: {} for k in keep_list}
                         else:
+                            fresh_rs = s.resolved_subs
                             fresh_dummy = dummy_subs
                     else:
+                        fresh_rs = s.resolved_subs
                         fresh_dummy = dummy_subs
                     indirect_cache, new_aux = compute_indirect_substituted_with_aux(
-                        fresh_dummy, s.resolved_subs,
-                        env.ibp_t, env.li_t, env.shifts,
+                        fresh_dummy, fresh_rs, env.ibp_t, env.li_t, env.shifts,
                         env._raw_eq_cache,
                     )
                 if _v5_prof:
@@ -871,30 +866,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
 
         if _v5_prof:
             _p3['sort'] += time.time() - _t_sort
-
-        # ── v6 early macro-dedup (Issue #11) ────────────────────────────
-        # The original macro-dedup runs at the TOP of the next step. By
-        # then we've already paid the cost of materializing aux_flat for
-        # every duplicate child that's about to be thrown away. Doing the
-        # dedup BEFORE materialization is bit-identical (dedup key depends
-        # only on expr / max_w12 / n_non_masters / score — all of which
-        # are unchanged by materialization) and saves the wasted work.
-        # The next-step dedup becomes a no-op.
-        if len(beam) > 1:
-            early_groups = {}
-            for s in beam:
-                efp = frozenset(s.expr.items())
-                cur = early_groups.get(efp)
-                if cur is None or (s.max_w12, s.n_non_masters, -s.score) < \
-                                  (cur.max_w12, cur.n_non_masters, -cur.score):
-                    early_groups[efp] = s
-            if len(early_groups) < len(beam):
-                if verbose:
-                    print(f'[v6 step {step}] early-dedup: {len(beam)} → '
-                          f'{len(early_groups)} distinct expr (pre-materialize)',
-                          flush=True)
-                beam = list(early_groups.values())
-
         # Post-selection survivors: materialize lazy_rs THEN attach aux in a
         # single pass so the original `c` is still in meta_by_id.
         _t_mat = time.time() if _v5_prof else 0
