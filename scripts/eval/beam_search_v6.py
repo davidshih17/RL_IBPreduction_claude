@@ -49,13 +49,20 @@ from sailir.ibp_env import (
 
 
 def _aux_to_result(aux_flat):
-    """Reconstruct compute_indirect_substituted result list from aux tuple."""
+    """Reconstruct compute_indirect_substituted result list from aux tuple.
+
+    Post-refactor: raw_id_to_idx is keyed by (op, seed) where
+    seed = sub_int - shift componentwise. (op, seed) is stable across
+    env._raw_eq_cache eviction.
+    """
     cached_unique, union_bms, raw_id_to_idx, indirect_raws = aux_flat
     if not indirect_raws:
         return []
+    n_indices = len(indirect_raws[0][0])
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        idx = raw_id_to_idx[id(raw)]
+        seed = tuple(sub_int[i] - shift[i] for i in range(n_indices))
+        idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw,
                        cached_unique[idx], union_bms[idx]))
     return result
@@ -65,50 +72,29 @@ _PICKLABLE_AUX_MARKER = '__v5_aux_v2__'
 
 
 def _aux_to_picklable(aux_flat):
-    """Convert aux's rid from id(raw)-keyed (process-local, doesn't survive
-    pickle) to (ibp_op, seed)-keyed (stable across processes).
-
-    Each raw is uniquely determined by the (ibp_op, seed) that produced it:
-    seed = sub_int - shift. So we can use that as a stable key.
-
-    Returns a tuple where the last element is a marker so loaders can
-    distinguish old/new format.
+    """Post-refactor: rid is already (op, seed)-keyed which is pickle-stable.
+    Just append the marker for format detection on the loader side. Cu/ubm
+    content is preserved as-is.
     """
     if aux_flat is None:
         return None
     cu, ubm, rid, iraws = aux_flat
-    # Build id() → (op, seed) mapping by walking iraws
-    id_to_opseed = {}
-    for sub_int, op, shift, raw in iraws:
-        if id(raw) in id_to_opseed:
-            continue
-        n = len(sub_int)
-        seed = tuple(sub_int[i] - shift[i] for i in range(n))
-        id_to_opseed[id(raw)] = (op, seed)
-    # Build stable rid
-    stable_rid = {id_to_opseed[old_id]: idx for old_id, idx in rid.items()}
-    # Note: iraws still has Python id()-via-pickle issues for raw objects,
-    # but that doesn't matter — on load we'll re-key rid by walking iraws
-    # in current process. cu/ubm content is preserved as-is.
-    return (cu, ubm, stable_rid, iraws, _PICKLABLE_AUX_MARKER)
+    return (cu, ubm, rid, iraws, _PICKLABLE_AUX_MARKER)
 
 
 def _aux_from_picklable(aux_flat, env=None):
-    """Convert aux from picklable (op, seed)-keyed form back to id(raw)-keyed.
-    Returns the standard 4-tuple aux usable by all helpers.
+    """Post-refactor: rid stays as (op, seed)-keyed, no re-key needed.
 
     If env is provided, replace each iraws entry's raw with env's cached
-    version (via env.get_raw_equation_cached). Critical for resume bit-
-    identical behavior: env._raw_eq_cache is process-local, so pickle-
-    loaded raws are DIFFERENT objects than the ones env will hand out for
-    the same (op, seed). Future incremental updates fetch raws from env,
-    leading to inconsistent id() mappings. Unifying via env eliminates this.
+    version (via env.get_raw_equation_cached) so that downstream code that
+    happens to compare raws via `is` still finds matches. Optional — the
+    (op, seed)-based dedup is no longer dependent on object identity.
     """
     if aux_flat is None:
         return None
     # Detect new format by length + trailing marker
     if len(aux_flat) == 5 and aux_flat[4] == _PICKLABLE_AUX_MARKER:
-        cu, ubm, stable_rid, iraws, _ = aux_flat
+        cu, ubm, rid, iraws, _ = aux_flat
         new_iraws = iraws
         if env is not None:
             # Replace each iraws entry's raw with env's cached version.
@@ -118,21 +104,7 @@ def _aux_from_picklable(aux_flat, env=None):
                 seed = tuple(sub_int[i] - shift[i] for i in range(n))
                 env_raw = env.get_raw_equation_cached(op, seed)
                 new_iraws.append((sub_int, op, shift, env_raw))
-        # Build id()-keyed rid using the (possibly env-unified) raws
-        new_rid = {}
-        for sub_int, op, shift, raw in new_iraws:
-            k = id(raw)
-            if k in new_rid:
-                continue
-            n = len(sub_int)
-            seed = tuple(sub_int[i] - shift[i] for i in range(n))
-            cu_idx = stable_rid.get((op, seed))
-            if cu_idx is None:
-                raise ValueError(
-                    f'aux load: no stable_rid entry for (op={op}, seed={seed})'
-                )
-            new_rid[k] = cu_idx
-        return (cu, ubm, new_rid, new_iraws)
+        return (cu, ubm, rid, new_iraws)
     # Legacy 4-tuple format — assume same-process; just pass through.
     return aux_flat
 
@@ -142,7 +114,8 @@ def _prune_aux_by_recency(aux_flat, recent_sub_ints):
     Rebuild cu/ubm/rid from the kept raws.
 
     Args:
-        aux_flat: (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+        aux_flat: (cached_unique, union_bms, raw_key_to_idx, indirect_raws)
+            where raw_key_to_idx is keyed by (op, seed) tuples.
         recent_sub_ints: iterable of sub_int tuples to KEEP.
 
     Returns the pruned aux tuple (unchanged tuple if nothing dropped).
@@ -154,16 +127,19 @@ def _prune_aux_by_recency(aux_flat, recent_sub_ints):
     new_iraws = [e for e in iraws if e[0] in keep_set]
     if len(new_iraws) == len(iraws):
         return aux_flat  # nothing to drop
-    # Rebuild cu/ubm/rid: only keep entries referenced by surviving iraws.
+    # Rebuild cu/ubm/rid: keep only entries referenced by surviving iraws.
+    # Key is (op, seed) where seed = sub_int - shift componentwise.
     referenced = set()
-    for e in new_iraws:
-        referenced.add(id(e[3]))
+    for sub_int, op, shift, raw in new_iraws:
+        n = len(sub_int)
+        seed = tuple(sub_int[i] - shift[i] for i in range(n))
+        referenced.add((op, seed))
     new_cu = []
     new_ubm = []
     new_rid = {}
-    for old_id, old_idx in rid.items():
-        if old_id in referenced:
-            new_rid[old_id] = len(new_cu)
+    for key, old_idx in rid.items():
+        if key in referenced:
+            new_rid[key] = len(new_cu)
             new_cu.append(cu[old_idx])
             new_ubm.append(ubm[old_idx])
     return (new_cu, new_ubm, new_rid, new_iraws)

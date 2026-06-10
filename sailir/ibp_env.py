@@ -1104,41 +1104,34 @@ def apply_resolved_subs_batch(raw_eqs, resolved_subs, verbose_timing=False):
         # No subs to apply - just copy
         return [dict(raw) for raw in raw_eqs]
 
-    # Deduplicate by object id - same raw eq object means same result
-    t_dedup = _time.time()
-    unique_cache = {}  # id(raw) -> result
-    results = []
-
-    t_dedup_elapsed = _time.time() - t_dedup
+    # NOTE: callers are expected to pre-dedupe raw_eqs (by (op, seed) since
+    # the refactor away from id(raw)-based dedup). We no longer do an
+    # internal id-based dedup here — that was unsafe when env._raw_eq_cache
+    # gets evicted (same logical raw equation could appear as two distinct
+    # Python objects in raw_eqs).
     t_apply = _time.time()
+    results = []
     n_computed = 0
-    n_reused = 0
     total_subs_applied = 0
 
     for raw in raw_eqs:
-        raw_id = id(raw)
-        if raw_id in unique_cache:
-            # Reuse previously computed result (copy it)
-            results.append(dict(unique_cache[raw_id]))
-            n_reused += 1
-        else:
-            # Compute fresh
-            result = dict(raw)
-            for integral in list(result.keys()):
-                if integral in resolved_subs:
-                    total_subs_applied += 1
-                    coeff = result.pop(integral)
-                    for repl_integral, repl_coeff in resolved_subs[integral].items():
-                        new_coeff = (coeff * repl_coeff) % PRIME
-                        if repl_integral in result:
-                            result[repl_integral] = (result[repl_integral] + new_coeff) % PRIME
-                        else:
-                            result[repl_integral] = new_coeff
-                        if result[repl_integral] == 0:
-                            del result[repl_integral]
-            unique_cache[raw_id] = result
-            results.append(dict(result))  # Return a copy
-            n_computed += 1
+        # Compute fresh for every raw — caller has pre-deduped.
+        result = dict(raw)
+        for integral in list(result.keys()):
+            if integral in resolved_subs:
+                total_subs_applied += 1
+                coeff = result.pop(integral)
+                for repl_integral, repl_coeff in resolved_subs[integral].items():
+                    new_coeff = (coeff * repl_coeff) % PRIME
+                    if repl_integral in result:
+                        result[repl_integral] = (result[repl_integral] + new_coeff) % PRIME
+                    else:
+                        result[repl_integral] = new_coeff
+                    if result[repl_integral] == 0:
+                        del result[repl_integral]
+        results.append(result)  # caller doesn't need a defensive copy — already fresh dict
+        n_computed += 1
+    n_reused = 0
 
     t_apply_elapsed = _time.time() - t_apply
     total_elapsed = _time.time() - t_start
@@ -1384,7 +1377,10 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
         _t = _time.perf_counter()
     raws_to_apply = []
     for sub_int, op, sh, raw in new_iraws_for_new:
-        rid = id(raw)
+        # (op, seed)-based dedup — stable across env._raw_eq_cache eviction.
+        # seed = sub_int - shift componentwise (in int tuple form).
+        seed = tuple(sub_int[i] - sh[i] for i in range(N_INDICES))
+        rid = (op, seed)
         if rid not in new_rid:
             # Reserve the slot index BEFORE applying. Multiple unique raws
             # each get their own index — must add len(raws_to_apply) so they
@@ -1436,11 +1432,12 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
     if _prof:
         _t = _time.perf_counter()
     if _BUILD_RESULT_CY is not None:
-        result = _BUILD_RESULT_CY(new_iraws, new_rid, new_cu, new_ubm)
+        result = _BUILD_RESULT_CY(new_iraws, new_rid, new_cu, new_ubm, N_INDICES)
     else:
         result = []
         for sub_int, op, sh, raw in new_iraws:
-            idx = new_rid[id(raw)]
+            seed = tuple(sub_int[i] - sh[i] for i in range(N_INDICES))
+            idx = new_rid[(op, seed)]
             result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
     if _prof:
         _p['t_result_build'] += _time.perf_counter() - _t
@@ -1506,7 +1503,8 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
 
         for ibp_op, shift, raw in raw_list:
             indirect_raws.append((sub_int, ibp_op, shift, raw))
-            seen_raws.add(id(raw))
+            seen_raws.add((ibp_op,
+                            tuple(sub_int[i] - shift[i] for i in range(N_INDICES))))
     t_phase1 = _time.time() - _t_phase
 
     if not indirect_raws:
@@ -1519,12 +1517,13 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
                 'n_sub_cache_misses': n_sub_cache_misses})
         return []
 
-    # Phase 2: deduplicate raws by id
+    # Phase 2: deduplicate raws by (op, seed) — stable across cache eviction
     _t_phase = _time.time()
     unique_raws = []
     raw_id_to_idx = {}
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        raw_id = id(raw)
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        raw_id = (ibp_op, seed)
         if raw_id not in raw_id_to_idx:
             raw_id_to_idx[raw_id] = len(unique_raws)
             unique_raws.append(raw)
@@ -1544,7 +1543,8 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
     _t_phase = _time.time()
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        idx = raw_id_to_idx[id(raw)]
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        idx = raw_id_to_idx[(ibp_op, seed)]
         cached = cached_unique[idx]
         union_bm = union_bms[idx]
         result.append((sub_int, ibp_op, shift, raw, cached, union_bm))
@@ -1615,7 +1615,8 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
     unique_raws = []
     raw_id_to_idx = {}
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        rid = id(raw)
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        rid = (ibp_op, seed)
         if rid not in raw_id_to_idx:
             raw_id_to_idx[rid] = len(unique_raws)
             unique_raws.append(raw)
@@ -1632,7 +1633,8 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
 
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        idx = raw_id_to_idx[id(raw)]
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
 
     return result, (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
@@ -1721,7 +1723,8 @@ def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t
     unique_raws = []
     raw_id_to_idx = {}
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        rid = id(raw)
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        rid = (ibp_op, seed)
         if rid not in raw_id_to_idx:
             raw_id_to_idx[rid] = len(unique_raws)
             unique_raws.append(raw)
@@ -1737,7 +1740,8 @@ def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t
 
     result = []
     for sub_int, ibp_op, shift, raw in indirect_raws:
-        idx = raw_id_to_idx[id(raw)]
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
 
     return result, (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
@@ -1899,7 +1903,8 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
                 continue
             seen_oseed.add(ok)
             new_iraws.append((anchor, ibp_op, shift, raw))
-            rid = id(raw)
+            # (op, seed)-based dedup — stable across env._raw_eq_cache eviction
+            rid = (ibp_op, seed)
             if rid not in new_rid:
                 new_rid[rid] = len(new_cu) + len(raws_to_apply)
                 raws_to_apply.append(raw)
@@ -1923,7 +1928,8 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
     # Build result indirect_cache_list.
     result = []
     for anchor, op, sh, raw in new_iraws:
-        idx = new_rid[id(raw)]
+        seed = tuple(anchor[i] - sh[i] for i in range(N_INDICES))
+        idx = new_rid[(op, seed)]
         result.append((anchor, op, sh, raw, new_cu[idx], new_ubm[idx]))
 
     return result, (new_cu, new_ubm, new_rid, new_iraws)

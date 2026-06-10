@@ -84,13 +84,24 @@ def phase_a_apply(list prev_cu, list prev_ubm, tuple sub_key, dict replacement,
     return new_cu, new_ubm, n_fast, n_sub
 
 
-def build_result(list new_iraws, dict new_rid, list new_cu, list new_ubm):
+def build_result(list new_iraws, dict new_rid, list new_cu, list new_ubm,
+                  int n_indices):
+    """Look up new_rid[(op, seed)] where seed = sub_int - shift componentwise.
+
+    Switched from id(raw) keys to (op, seed) keys after the refactor that
+    makes raw-equation dedup stable across env._raw_eq_cache eviction. The
+    extra parameter n_indices is the index dimension (11 for pentagonbox).
+    """
     cdef Py_ssize_t n = len(new_iraws)
     cdef list result = [None] * n
-    cdef Py_ssize_t i
+    cdef Py_ssize_t i, j
     cdef tuple entry
     cdef object sub_int, op, sh, raw
+    cdef tuple seed
+    cdef tuple si_tup, sh_tup
+    cdef object key
     cdef Py_ssize_t idx
+    cdef list seed_list
 
     for i in range(n):
         entry = <tuple>new_iraws[i]
@@ -98,7 +109,14 @@ def build_result(list new_iraws, dict new_rid, list new_cu, list new_ubm):
         op = entry[1]
         sh = entry[2]
         raw = entry[3]
-        idx = <Py_ssize_t>(<long>new_rid[id(raw)])
+        si_tup = <tuple>sub_int
+        sh_tup = <tuple>sh
+        seed_list = [None] * n_indices
+        for j in range(n_indices):
+            seed_list[j] = (<long>si_tup[j]) - (<long>sh_tup[j])
+        seed = tuple(seed_list)
+        key = (op, seed)
+        idx = <Py_ssize_t>(<long>new_rid[key])
         result[i] = (sub_int, op, sh, raw, new_cu[idx], new_ubm[idx])
     return result
 
