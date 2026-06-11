@@ -84,13 +84,15 @@ def phase_a_apply(list prev_cu, list prev_ubm, tuple sub_key, dict replacement,
     return new_cu, new_ubm, n_fast, n_sub
 
 
-def build_result(list new_iraws, dict new_rid, list new_cu, list new_ubm,
-                  int n_indices):
-    """Look up new_rid[(op, seed)] where seed = sub_int - shift componentwise.
+def build_result(list new_iraws, list raws_for_iraws, dict new_rid,
+                  list new_cu, list new_ubm, int n_indices):
+    """Build the per-call result list from (op, seed)-keyed iraws + raws.
 
-    Switched from id(raw) keys to (op, seed) keys after the refactor that
-    makes raw-equation dedup stable across env._raw_eq_cache eviction. The
-    extra parameter n_indices is the index dimension (11 for pentagonbox).
+    iraws entries are 3-tuples (sub_int, op, shift). `raws_for_iraws[i]`
+    is the raw equation dict for `new_iraws[i]` — caller pre-resolves
+    via env._raw_eq_cache (one dict lookup per entry, recompute on miss).
+    Keeping the raw out of the persistent iraws tuple is what lets the
+    raw-eq cache evict freely without iraws pinning objects alive.
     """
     cdef Py_ssize_t n = len(new_iraws)
     cdef list result = [None] * n
@@ -108,7 +110,7 @@ def build_result(list new_iraws, dict new_rid, list new_cu, list new_ubm,
         sub_int = entry[0]
         op = entry[1]
         sh = entry[2]
-        raw = entry[3]
+        raw = raws_for_iraws[i]
         si_tup = <tuple>sub_int
         sh_tup = <tuple>sh
         seed_list = [None] * n_indices

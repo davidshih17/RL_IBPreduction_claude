@@ -48,20 +48,21 @@ from sailir.ibp_env import (
 )
 
 
-def _aux_to_result(aux_flat):
+def _aux_to_result(aux_flat, env):
     """Reconstruct compute_indirect_substituted result list from aux tuple.
 
-    Post-refactor: raw_id_to_idx is keyed by (op, seed) where
-    seed = sub_int - shift componentwise. (op, seed) is stable across
-    env._raw_eq_cache eviction.
+    iraws entries are 3-tuples (sub_int, op, shift). Raws are looked up
+    fresh from env._raw_eq_cache (recomputed on miss) — only the cache
+    persistently holds raw equations, so eviction can free memory.
     """
     cached_unique, union_bms, raw_id_to_idx, indirect_raws = aux_flat
     if not indirect_raws:
         return []
     n_indices = len(indirect_raws[0][0])
     result = []
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for sub_int, ibp_op, shift in indirect_raws:
         seed = tuple(sub_int[i] - shift[i] for i in range(n_indices))
+        raw = env.get_raw_equation_cached(ibp_op, seed)
         idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw,
                        cached_unique[idx], union_bms[idx]))
@@ -72,9 +73,8 @@ _PICKLABLE_AUX_MARKER = '__v5_aux_v2__'
 
 
 def _aux_to_picklable(aux_flat):
-    """Post-refactor: rid is already (op, seed)-keyed which is pickle-stable.
-    Just append the marker for format detection on the loader side. Cu/ubm
-    content is preserved as-is.
+    """rid is (op, seed)-keyed; iraws are 3-tuples (sub_int, op, shift).
+    All pickle-stable. Append marker for format detection on load.
     """
     if aux_flat is None:
         return None
@@ -83,28 +83,12 @@ def _aux_to_picklable(aux_flat):
 
 
 def _aux_from_picklable(aux_flat, env=None):
-    """Post-refactor: rid stays as (op, seed)-keyed, no re-key needed.
-
-    If env is provided, replace each iraws entry's raw with env's cached
-    version (via env.get_raw_equation_cached) so that downstream code that
-    happens to compare raws via `is` still finds matches. Optional — the
-    (op, seed)-based dedup is no longer dependent on object identity.
-    """
+    """rid stays (op, seed)-keyed; iraws are 3-tuples (no raw stored)."""
     if aux_flat is None:
         return None
-    # Detect new format by length + trailing marker
     if len(aux_flat) == 5 and aux_flat[4] == _PICKLABLE_AUX_MARKER:
         cu, ubm, rid, iraws, _ = aux_flat
-        new_iraws = iraws
-        if env is not None:
-            # Replace each iraws entry's raw with env's cached version.
-            new_iraws = []
-            for sub_int, op, shift, raw in iraws:
-                n = len(sub_int)
-                seed = tuple(sub_int[i] - shift[i] for i in range(n))
-                env_raw = env.get_raw_equation_cached(op, seed)
-                new_iraws.append((sub_int, op, shift, env_raw))
-        return (cu, ubm, rid, new_iraws)
+        return (cu, ubm, rid, iraws)
     # Legacy 4-tuple format — assume same-process; just pass through.
     return aux_flat
 
@@ -115,7 +99,8 @@ def _prune_aux_by_recency(aux_flat, recent_sub_ints):
 
     Args:
         aux_flat: (cached_unique, union_bms, raw_key_to_idx, indirect_raws)
-            where raw_key_to_idx is keyed by (op, seed) tuples.
+            where raw_key_to_idx is keyed by (op, seed) tuples and
+            indirect_raws entries are 3-tuples (sub_int, op, shift).
         recent_sub_ints: iterable of sub_int tuples to KEEP.
 
     Returns the pruned aux tuple (unchanged tuple if nothing dropped).
@@ -130,7 +115,7 @@ def _prune_aux_by_recency(aux_flat, recent_sub_ints):
     # Rebuild cu/ubm/rid: keep only entries referenced by surviving iraws.
     # Key is (op, seed) where seed = sub_int - shift componentwise.
     referenced = set()
-    for sub_int, op, shift, raw in new_iraws:
+    for sub_int, op, shift in new_iraws:
         n = len(sub_int)
         seed = tuple(sub_int[i] - shift[i] for i in range(n))
         referenced.add((op, seed))
@@ -495,7 +480,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                    ckpt_every_step=False,
                    iraws_window=None,
                    iraws_keep_first=None,
-                   lazy_rs=True):
+                   lazy_rs=True,
+                   model_batch_chunk=None):
     """Sequential beam search, v5 strip-active semantics.
 
     resume_from: path to a ckpt.pkl (or result.pkl) from a prior run; resumes
@@ -580,6 +566,38 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     def sort_totalweight(s):
         return (s.total_w12, s.n_non_masters, -s.score)
 
+    # Hoist memprobe config out of the per-step loop. Per-step we want at
+    # most a set-membership check or an integer modulo — no env-var parsing.
+    _memprobe_path = os.environ.get('SAILIR_MEMPROBE_FULL')
+    _memprobe_steps_set = None
+    _memprobe_every = None
+    _memprobe_start = None
+    if _memprobe_path:
+        _steps_env = os.environ.get('SAILIR_MEMPROBE_FULL_STEPS')
+        if _steps_env:
+            _memprobe_steps_set = {int(x) for x in _steps_env.split(',') if x.strip()}
+        else:
+            _memprobe_every = int(os.environ.get(
+                'SAILIR_MEMPROBE_FULL_EVERY', '10'))
+            _memprobe_start = int(os.environ.get(
+                'SAILIR_MEMPROBE_FULL_START', '20'))
+
+    # End-of-step malloc_trim(0): release glibc's free top back to the OS
+    # so anon-mmap'd allocs forced into the heap by MALLOC_MMAP_THRESHOLD_
+    # actually get returned. Gated by SAILIR_END_OF_STEP_TRIM=1. One-time
+    # binding to libc.so.6; per-step cost is a single syscall.
+    _end_of_step_trim = None
+    if os.environ.get('SAILIR_END_OF_STEP_TRIM') == '1':
+        try:
+            import ctypes as _ctypes
+            import ctypes.util as _ctypes_util
+            _libc = _ctypes.CDLL(_ctypes_util.find_library('c'))
+            _libc.malloc_trim.argtypes = [_ctypes.c_size_t]
+            _libc.malloc_trim.restype = _ctypes.c_int
+            _end_of_step_trim = _libc.malloc_trim
+        except Exception:
+            _end_of_step_trim = None
+
     for step in range(resume_step, max_steps):
         # Termination: ANY beam state has drained — we only need one successful
         # path (the proof). Don't wait for every beam slot to finish.
@@ -653,7 +671,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             # Use cached aux_flat if available, else rebuild from scratch.
             _t = time.time() if _v5_prof else 0
             if s.aux_flat is not None:
-                indirect_cache = _aux_to_result(s.aux_flat)
+                indirect_cache = _aux_to_result(s.aux_flat, env)
                 if _v5_prof:
                     _ct['aux_repack_calls'] += 1
             else:
@@ -746,25 +764,45 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 print(f'[v6 step {step}] no tasks — STUCK', flush=True)
             break
 
-        # Run model batched on all tasks
+        # Run model batched on all tasks (optionally chunked).
+        # Chunking bounds the peak transient activation memory in the forward
+        # pass — large unchunked batches leave hundreds of MB in glibc's free
+        # list every step (the activations are freed but glibc retains pages).
+        # Per-chunk prepare + forward + write into a preallocated probs_all,
+        # with explicit `del` so each chunk's tensors are released before the
+        # next. None / 0 / >= len(batch_data) means no chunking (original).
         _t = time.time() if _v5_prof else 0
         batch_data = []
         for parent_idx, target, valid in tasks:
             s = beam[parent_idx]
             batch_data.append((s.expr, s.resolved_subs, valid, target_sector, target))
-        b = prepare_batched_input_v5_dummy(batch_data, device,
-                                           max_actions=max_actions)
+        # Compute the global action width once so probs_all shape is stable.
+        global_max_actions_eff = min(
+            max(len(d[2]) for d in batch_data), max_actions)
+        chunk_sz = model_batch_chunk if model_batch_chunk else len(batch_data)
+        chunk_sz = max(1, min(chunk_sz, len(batch_data)))
         if _v5_prof:
             _p2['batch_prep'] += time.time() - _t
             _t = time.time()
-        with torch.no_grad():
-            logits, probs = model(
-                b['expr_integrals'], b['expr_coeffs'], b['expr_mask'],
-                b['sub_keys'], b['sub_repl_ints'], b['sub_repl_coeffs'],
-                b['sub_repl_mask'], b['sub_mask'],
-                b['action_ibp_ops'], b['action_deltas'], b['action_mask'],
-                b['sector_mask'], b['target_integral'],
-            )
+        probs_all = torch.zeros(len(batch_data), global_max_actions_eff)
+        for chunk_start in range(0, len(batch_data), chunk_sz):
+            chunk = batch_data[chunk_start:chunk_start + chunk_sz]
+            # Cap chunk's max_actions to the global so the slice assign below
+            # has consistent width.
+            b = prepare_batched_input_v5_dummy(chunk, device,
+                                                max_actions=global_max_actions_eff)
+            with torch.no_grad():
+                _, chunk_probs = model(
+                    b['expr_integrals'], b['expr_coeffs'], b['expr_mask'],
+                    b['sub_keys'], b['sub_repl_ints'], b['sub_repl_coeffs'],
+                    b['sub_repl_mask'], b['sub_mask'],
+                    b['action_ibp_ops'], b['action_deltas'], b['action_mask'],
+                    b['sector_mask'], b['target_integral'],
+                )
+            cn = chunk_probs.shape[1]
+            probs_all[chunk_start:chunk_start + len(chunk), :cn] = chunk_probs
+            del b, chunk_probs
+        probs = probs_all
         if _v5_prof:
             _p2['model_fwd'] += time.time() - _t
 
@@ -963,6 +1001,38 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 for expr_fp, entries in tabu_dict.items()
             ]
 
+        # Full-memory probe (gated by SAILIR_MEMPROBE_FULL=/path/to/jsonl).
+        # Samples every SAILIR_MEMPROBE_FULL_EVERY steps (default 10) using
+        # pympler.asizeof for deep-size accounting of every persistent
+        # structure. See scripts/eval/archive/memprobe_full.py.
+        # End-of-step malloc_trim — release glibc free top after the per-step
+        # transients have been freed. Single syscall; runs every step when
+        # SAILIR_END_OF_STEP_TRIM=1.
+        if _end_of_step_trim is not None:
+            try:
+                _end_of_step_trim(0)
+            except Exception:
+                pass
+
+        if _memprobe_path:
+            if _memprobe_steps_set is not None:
+                _should_sample = (step + 1) in _memprobe_steps_set
+            else:
+                _should_sample = ((step + 1) >= _memprobe_start
+                                   and (step + 1) % _memprobe_every == 0)
+            if _should_sample:
+                try:
+                    import sys as _sys
+                    _archive_dir = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), 'archive')
+                    if _archive_dir not in _sys.path:
+                        _sys.path.insert(0, _archive_dir)
+                    import memprobe_full as _mpf
+                    _mpf.measure(env, beam, tabu_dict, step + 1, _memprobe_path,
+                                  model=model)
+                except Exception as _e:
+                    print(f'  [memprobe_full] error: {_e}', flush=True)
+
         # Checkpoint (rolling, overwrites)
         if ckpt_path and (step + 1) % ckpt_every == 0:
             with open(ckpt_path, 'wb') as f:
@@ -1070,9 +1140,36 @@ def main():
                    help='Disable LAZY_RS optimization (apply add_sub_to_resolved '
                         'eagerly for all candidates instead of only survivors). '
                         'Slower; for verification only.')
+    p.add_argument('--model-batch-chunk', type=int, default=None,
+                   help='If set, split the model forward batch into chunks of '
+                        'this many rows. Bounds transient activation memory '
+                        '(glibc retains free pages from large unchunked '
+                        "forwards). None = no chunking (original behavior).")
     p.add_argument('--n-threads', type=int, default=1)
     p.add_argument('--device', default='cpu')
     args = p.parse_args()
+
+    # Memprobe init: smaps-based attribution. tracemalloc is NOT started
+    # by default — tracing every Python allocation slows the whole program
+    # 5-10×, even when we only sample at a few specific steps. Set
+    # SAILIR_MEMPROBE_FULL_TRACEMALLOC=1 to opt in for Python-heap detail.
+    _memprobe_mod = None
+    if os.environ.get('SAILIR_MEMPROBE_FULL'):
+        if os.environ.get('SAILIR_MEMPROBE_FULL_TRACEMALLOC') == '1':
+            import tracemalloc as _tm
+            _tm.start(int(os.environ.get(
+                'SAILIR_MEMPROBE_FULL_TRACEMALLOC_FRAMES', '5')))
+        try:
+            open(os.environ['SAILIR_MEMPROBE_FULL'], 'w').close()
+        except OSError:
+            pass
+        import sys as _sys
+        _archive_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'archive')
+        if _archive_dir not in _sys.path:
+            _sys.path.insert(0, _archive_dir)
+        import memprobe_full as _memprobe_mod
+        _memprobe_mod.record_milestone('rss_at_import_kb')
 
     torch.set_num_threads(args.n_threads)
 
@@ -1090,6 +1187,8 @@ def main():
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
     env = IBPEnvironment()
+    if _memprobe_mod is not None:
+        _memprobe_mod.record_milestone('rss_after_env_kb')
 
     model = IBPActionClassifier(
         n_indices=topology.n_indices,
@@ -1099,6 +1198,9 @@ def main():
     ck = torch.load(args.model, map_location='cpu', weights_only=False)
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
+    if _memprobe_mod is not None:
+        _memprobe_mod.record_milestone('rss_after_model_kb')
+        _memprobe_mod.record_model(model)
 
     # Strip surrounding quotes that may survive condor argv parsing
     integral_str = args.integral.strip("'").strip('"')
@@ -1130,6 +1232,7 @@ def main():
         iraws_window=args.iraws_window,
         iraws_keep_first=args.iraws_keep_first,
         lazy_rs=args.lazy_rs,
+        model_batch_chunk=args.model_batch_chunk,
     )
 
     print(f'\n== DONE — beam size {len(beam)} ==', flush=True)

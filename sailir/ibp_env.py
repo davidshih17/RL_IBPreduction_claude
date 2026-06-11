@@ -1369,14 +1369,19 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
 
     if _prof:
         _t = _time.perf_counter()
-    new_iraws_for_new = [(new_sub_int, op, sh, r) for op, sh, r in new_raw_list]
+    # Persistent iraws is 3-tuples (sub_int, op, shift) — raw lives only
+    # in env._raw_eq_cache, so cache eviction can actually free memory.
+    # new_raws_for_new is a transient parallel list used for Phase B apply
+    # and for result-build below; goes out of scope at function return.
+    new_iraws_for_new = [(new_sub_int, op, sh) for op, sh, _r in new_raw_list]
+    new_raws_for_new = [r for _op, _sh, r in new_raw_list]
     if _prof:
         _p['t_phaseB_iraws_build'] += _time.perf_counter() - _t
 
     if _prof:
         _t = _time.perf_counter()
     raws_to_apply = []
-    for sub_int, op, sh, raw in new_iraws_for_new:
+    for (sub_int, op, sh), raw in zip(new_iraws_for_new, new_raws_for_new):
         # (op, seed)-based dedup — stable across env._raw_eq_cache eviction.
         # seed = sub_int - shift componentwise (in int tuple form).
         seed = tuple(sub_int[i] - sh[i] for i in range(N_INDICES))
@@ -1428,14 +1433,28 @@ def compute_indirect_substituted_incremental(prev_aux, new_sub_int, new_resolved
     if _prof:
         _p['t_iraws_concat'] += _time.perf_counter() - _t
 
-    # Build result list (same format as compute_indirect_substituted).
+    # Pre-resolve raws for the per-call result list. prev_iraws raws come
+    # from env._raw_eq_cache (one dict lookup per entry, recompute on miss
+    # so we always have the dict). new_iraws_for_new raws are already in
+    # hand from new_raws_for_new built above.
     if _prof:
         _t = _time.perf_counter()
+    raws_for_result = [None] * len(new_iraws)
+    n_prev = len(prev_iraws)
+    for i in range(n_prev):
+        sub_int, op, sh = prev_iraws[i]
+        seed = tuple(sub_int[k] - sh[k] for k in range(N_INDICES))
+        raws_for_result[i] = _get_raw_cached(op, seed)
+    for j, r in enumerate(new_raws_for_new):
+        raws_for_result[n_prev + j] = r
+
+    # Build result list (same 6-tuple format as compute_indirect_substituted).
     if _BUILD_RESULT_CY is not None:
-        result = _BUILD_RESULT_CY(new_iraws, new_rid, new_cu, new_ubm, N_INDICES)
+        result = _BUILD_RESULT_CY(new_iraws, raws_for_result, new_rid,
+                                   new_cu, new_ubm, N_INDICES)
     else:
         result = []
-        for sub_int, op, sh, raw in new_iraws:
+        for (sub_int, op, sh), raw in zip(new_iraws, raws_for_result):
             seed = tuple(sub_int[i] - sh[i] for i in range(N_INDICES))
             idx = new_rid[(op, seed)]
             result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
@@ -1481,10 +1500,12 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
         raw_eq_cache['_sub_cache'] = {}
     sub_cache = raw_eq_cache['_sub_cache']
 
-    # Phase 1: collect indirect raw equations
+    # Phase 1: collect indirect raw equations. iraws as 3-tuples
+    # (sub_int, op, shift); raws collected in a parallel transient list
+    # for Phase 2/3/5 use (goes out of scope at function return).
     _t_phase = _time.time()
-    indirect_raws = []  # List of (sub_int, ibp_op, shift, raw)
-    seen_raws = set()  # Track unique raws by id to avoid duplicate subs application
+    indirect_raws = []        # 3-tuples (sub_int, ibp_op, shift)
+    indirect_raws_raws = []   # parallel raw dicts
     n_sub_cache_misses = 0
 
     for sub_int in subs:
@@ -1502,9 +1523,8 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
             sub_cache[sub_int] = raw_list
 
         for ibp_op, shift, raw in raw_list:
-            indirect_raws.append((sub_int, ibp_op, shift, raw))
-            seen_raws.add((ibp_op,
-                            tuple(sub_int[i] - shift[i] for i in range(N_INDICES))))
+            indirect_raws.append((sub_int, ibp_op, shift))
+            indirect_raws_raws.append(raw)
     t_phase1 = _time.time() - _t_phase
 
     if not indirect_raws:
@@ -1521,7 +1541,7 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
     _t_phase = _time.time()
     unique_raws = []
     raw_id_to_idx = {}
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         raw_id = (ibp_op, seed)
         if raw_id not in raw_id_to_idx:
@@ -1542,7 +1562,7 @@ def compute_indirect_substituted(subs, resolved_subs, ibp_t, li_t, shifts, raw_e
     # Phase 5: build result list
     _t_phase = _time.time()
     result = []
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         idx = raw_id_to_idx[(ibp_op, seed)]
         cached = cached_unique[idx]
@@ -1593,7 +1613,8 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
             raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
         return raw_eq_cache[key]
 
-    indirect_raws = []
+    indirect_raws = []        # 3-tuples (sub_int, ibp_op, shift)
+    indirect_raws_raws = []   # parallel raw dicts (transient)
     for sub_int in subs:
         if sub_int in sub_cache:
             raw_list = sub_cache[sub_int]
@@ -1607,14 +1628,15 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
                         raw_list.append((ibp_op, shift, raw))
             sub_cache[sub_int] = raw_list
         for ibp_op, shift, raw in raw_list:
-            indirect_raws.append((sub_int, ibp_op, shift, raw))
+            indirect_raws.append((sub_int, ibp_op, shift))
+            indirect_raws_raws.append(raw)
 
     if not indirect_raws:
         return [], ([], [], {}, [])
 
     unique_raws = []
     raw_id_to_idx = {}
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         rid = (ibp_op, seed)
         if rid not in raw_id_to_idx:
@@ -1632,7 +1654,7 @@ def compute_indirect_substituted_with_aux(subs, resolved_subs, ibp_t, li_t,
                 union_bms[i] = 0
 
     result = []
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
@@ -1695,7 +1717,8 @@ def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t
                 anchors.add(K)
                 break
 
-    indirect_raws = []
+    indirect_raws = []         # 3-tuples (anchor, ibp_op, shift)
+    indirect_raws_raws = []    # parallel raw dicts (transient)
     seen_oseed = set()
     for anchor in anchors:
         if anchor in sub_cache:
@@ -1715,14 +1738,15 @@ def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t
             if ok in seen_oseed:
                 continue
             seen_oseed.add(ok)
-            indirect_raws.append((anchor, ibp_op, shift, raw))
+            indirect_raws.append((anchor, ibp_op, shift))
+            indirect_raws_raws.append(raw)
 
     if not indirect_raws:
         return [], ([], [], {}, [])
 
     unique_raws = []
     raw_id_to_idx = {}
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         rid = (ibp_op, seed)
         if rid not in raw_id_to_idx:
@@ -1739,7 +1763,7 @@ def compute_indirect_substituted_exprkeyed(expr_keys, resolved_subs, ibp_t, li_t
                 union_bms[i] = 0
 
     result = []
-    for sub_int, ibp_op, shift, raw in indirect_raws:
+    for (sub_int, ibp_op, shift), raw in zip(indirect_raws, indirect_raws_raws):
         seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
         idx = raw_id_to_idx[(ibp_op, seed)]
         result.append((sub_int, ibp_op, shift, raw, cached_unique[idx], union_bms[idx]))
@@ -1841,24 +1865,8 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
     # (X, shift_X) gives seed_X (original), action delta is unchanged.
     # X is still in resolved_subs (a past sub_int), so referencing it is
     # safe even though X is not in v4's current "useful K" anchor set.
-    kept_iraws = []
-    referenced_raw_ids = set()
-    for entry in prev_iraws:
-        anchor = entry[0]
-        if anchor not in removed:
-            kept_iraws.append(entry)
-            referenced_raw_ids.add(id(entry[3]))
-            continue
-        # Anchor left the useful set. Keep entry only if raw still has
-        # any K ∈ new_anchor_set (so some useful K covers this raw).
-        _raw = entry[3]
-        for Y, coef in _raw.items():
-            if coef != 0 and Y in new_anchor_set:
-                kept_iraws.append(entry)  # keep AS-IS — preserves order
-                referenced_raw_ids.add(id(_raw))
-                break
-
-    # Phase B: add iraws entries for newly-added anchors.
+    # Phase B raw_eq_cache helpers — hoisted earlier so Phase 0's
+    # "still useful" check can look up the raw on demand.
     if '_sub_cache_expr' not in raw_eq_cache:
         raw_eq_cache['_sub_cache_expr'] = {}
     sub_cache = raw_eq_cache['_sub_cache_expr']
@@ -1869,10 +1877,24 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
             raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
         return raw_eq_cache[key]
 
+    kept_iraws = []
+    for entry in prev_iraws:
+        anchor, op, sh = entry  # 3-tuple
+        if anchor not in removed:
+            kept_iraws.append(entry)
+            continue
+        # Anchor left the useful set. Keep entry only if raw still has
+        # any K ∈ new_anchor_set (so some useful K covers this raw).
+        seed = tuple(anchor[i] - sh[i] for i in range(N_INDICES))
+        _raw = _grc(op, seed)
+        for Y, coef in _raw.items():
+            if coef != 0 and Y in new_anchor_set:
+                kept_iraws.append(entry)  # keep AS-IS — preserves order
+                break
+
     # Dedup by (op, seed) within the COMBINED iraws (kept + new).
     seen_oseed = set()
-    for entry in kept_iraws:
-        anchor, op, sh, _ = entry
+    for anchor, op, sh in kept_iraws:
         seed = tuple(anchor[i] - sh[i] for i in range(N_INDICES))
         seen_oseed.add((op, seed))
 
@@ -1902,7 +1924,7 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
             if ok in seen_oseed:
                 continue
             seen_oseed.add(ok)
-            new_iraws.append((anchor, ibp_op, shift, raw))
+            new_iraws.append((anchor, ibp_op, shift))
             # (op, seed)-based dedup — stable across env._raw_eq_cache eviction
             rid = (ibp_op, seed)
             if rid not in new_rid:
@@ -1925,10 +1947,13 @@ def compute_indirect_substituted_exprkeyed_delta(prev_aux, expr_nm,
                 new_cu.append(c)
                 new_ubm.append(cached_union_bitmask(c))
 
-    # Build result indirect_cache_list.
+    # Build result indirect_cache_list. Look up raws from env cache; for
+    # entries we just computed (in `added_sorted` loop above) the raw is
+    # already in raw_eq_cache, so this is a free dict lookup.
     result = []
-    for anchor, op, sh, raw in new_iraws:
+    for anchor, op, sh in new_iraws:
         seed = tuple(anchor[i] - sh[i] for i in range(N_INDICES))
+        raw = _grc(op, seed)
         idx = new_rid[(op, seed)]
         result.append((anchor, op, sh, raw, new_cu[idx], new_ubm[idx]))
 
@@ -2265,6 +2290,97 @@ def enumerate_valid_actions_batched(target, subs, resolved_subs, ibp_t, li_t, sh
     return valid
 
 
+class _LRURawEqCache:
+    """LRU cache for env._raw_eq_cache (raw IBP equation dicts).
+
+    Safe to evict ONLY because the iraws-key refactor removed raw refs
+    from aux_flat.iraws tuples (now 3-tuples (sub_int, op, shift)). The
+    env cache is now the sole persistent holder of raw equations; on
+    eviction, refcount drops to zero and Python frees the dict.
+
+    Cap from env var SAILIR_RAW_EQ_CACHE_CAP (default 50000). Reserves
+    non-tuple keys (`_sub_cache`, `_sub_cache_expr`) as non-evicting
+    metadata slots since callers stuff per-anchor sub_cache dicts under
+    those names.
+
+    Tracks hits/misses/evicts in self._stats for diagnostics.
+    """
+    def __init__(self, cap=None):
+        import os
+        import collections
+        if cap is None:
+            cap = int(os.environ.get('SAILIR_RAW_EQ_CACHE_CAP', '50000'))
+        self._cap = cap
+        self._lru = collections.OrderedDict()   # (op, seed) -> raw_eq
+        self._meta = {}                         # non-tuple keys
+        self._stats = {'hits': 0, 'misses': 0, 'evicts': 0}
+
+    def __contains__(self, key):
+        if isinstance(key, tuple):
+            return key in self._lru
+        return key in self._meta
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            self._lru.move_to_end(key)
+            self._stats['hits'] += 1
+            return self._lru[key]
+        return self._meta[key]
+
+    def __setitem__(self, key, value):
+        if isinstance(key, tuple):
+            if key in self._lru:
+                self._lru[key] = value
+                self._lru.move_to_end(key)
+            else:
+                self._stats['misses'] += 1
+                self._lru[key] = value
+                if len(self._lru) > self._cap:
+                    self._lru.popitem(last=False)
+                    self._stats['evicts'] += 1
+        else:
+            self._meta[key] = value
+
+    def __delitem__(self, key):
+        if isinstance(key, tuple):
+            del self._lru[key]
+        else:
+            del self._meta[key]
+
+    def __len__(self):
+        return len(self._lru) + len(self._meta)
+
+    def __iter__(self):
+        for k in self._lru:
+            yield k
+        for k in self._meta:
+            yield k
+
+    def get(self, key, default=None):
+        if isinstance(key, tuple):
+            if key in self._lru:
+                self._lru.move_to_end(key)
+                self._stats['hits'] += 1
+                return self._lru[key]
+            return default
+        return self._meta.get(key, default)
+
+    def keys(self):
+        return list(self._lru.keys()) + list(self._meta.keys())
+
+    def items(self):
+        for k, v in self._lru.items():
+            yield k, v
+        for k, v in self._meta.items():
+            yield k, v
+
+    def values(self):
+        for v in self._lru.values():
+            yield v
+        for v in self._meta.values():
+            yield v
+
+
 class IBPEnvironment:
     """Environment for IBP reduction with model-based action selection."""
 
@@ -2297,8 +2413,21 @@ class IBPEnvironment:
         for li_idx in self.li_t:
             self.shifts[n_ibp + li_idx] = [s for s, _ in self.li_t[li_idx]]
 
-        # Cache for get_raw_equation results: (ibp_op, seed) -> equation dict
-        self._raw_eq_cache = {}
+        # Cache for get_raw_equation results: (ibp_op, seed) -> equation dict.
+        # LRU-bounded by default (cap from SAILIR_RAW_EQ_CACHE_CAP, default
+        # 50000 entries ~ 150-250 MB). Set the env var to 0 to disable the
+        # cap and fall back to an unbounded dict.
+        #
+        # Eviction is lossless: get_raw_equation(op, seed) is deterministic,
+        # so a miss-then-recompute returns the same content. Stable across
+        # eviction because the iraws-key refactor dropped raw refs from
+        # aux_flat.iraws — this cache is the sole persistent raw holder.
+        import os as _os
+        _cap_env = _os.environ.get('SAILIR_RAW_EQ_CACHE_CAP')
+        if _cap_env is not None and _cap_env.strip() == '0':
+            self._raw_eq_cache = {}
+        else:
+            self._raw_eq_cache = _LRURawEqCache()
 
     def get_raw_equation_cached(self, ibp_op, seed):
         """Cached version of get_raw_equation."""

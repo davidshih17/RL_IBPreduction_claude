@@ -5,8 +5,10 @@ Aux layout (the dict-based original):
   (cu, ubm, rid, iraws)
   cu      : list of dict[integral_tuple -> int_coeff]
   ubm     : list of int (sector union bitmask per cu entry)
-  rid     : dict[id(raw_eq_dict) -> cu_idx]   (process-local: id() is)
-  iraws   : list of (sub_int, ibp_op, shift, raw_eq_dict_ref)
+  rid     : dict[(ibp_op, seed_tuple) -> cu_idx]
+  iraws   : list of (sub_int, ibp_op, shift)  — raw is NOT stored here;
+            it's looked up on demand via env._raw_eq_cache so the cache
+            (and only the cache) holds raws persistently.
 
 Flat layout:
   cu_offsets  : int64 (n_cu + 1,) — cu[i] occupies cu_keys[cu_offsets[i] : cu_offsets[i+1]]
@@ -114,7 +116,7 @@ class FlatAux:
 
         # iraws_meta
         iraws_meta = np.zeros((n_iraws, 2 * n_indices + 1), dtype=np.int32)
-        for j, (sub_int, ibp_op, shift, _raw) in enumerate(iraws):
+        for j, (sub_int, ibp_op, shift) in enumerate(iraws):
             for k in range(n_indices):
                 iraws_meta[j, k] = sub_int[k]
             iraws_meta[j, n_indices] = ibp_op
@@ -128,10 +130,13 @@ class FlatAux:
             ubm=ubm_arr, iraws_meta=iraws_meta,
         )
 
-    def to_dict_aux(self, env, n_indices=None):
+    def to_dict_aux(self, env=None, n_indices=None):
         """Convert flat representation back to dict-based aux 4-tuple.
 
-        Reconstructs raws + rid locally via env.get_raw_equation_cached.
+        iraws are reconstructed as 3-tuples (sub_int, op, shift); raws are
+        NOT pinned in iraws — downstream code looks them up via env on
+        demand. rid is rebuilt with (op, seed) keys in iraws iteration
+        order. env parameter kept for API stability (no longer required).
         """
         if n_indices is None:
             n_indices = ibp_env.N_INDICES
@@ -159,9 +164,8 @@ class FlatAux:
             ibp_op = int(row[n_indices])
             shift = tuple(int(x) for x in row[n_indices + 1:])
             seed = tuple(sub_int[k] - shift[k] for k in range(n_indices))
-            raw = env.get_raw_equation_cached(ibp_op, seed)
-            iraws.append((sub_int, ibp_op, shift, raw))
-            rid_key = id(raw)
+            iraws.append((sub_int, ibp_op, shift))
+            rid_key = (ibp_op, seed)
             if rid_key not in rid:
                 # Worker MUST assign cu_idx in iraws-iteration order to
                 # match the original incremental code's order.
