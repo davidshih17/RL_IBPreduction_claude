@@ -147,6 +147,29 @@ def substitute_one(eq, sub_id, rep_ids, rep_coeffs, prime):
     return _combine(all_ids, all_coeffs, prime)
 
 
+def apply_resolved_subs(eq, resolved_subs_packed, prime):
+    """Packed equivalent of ibp_env.apply_resolved_subs (and the per-raw body of
+    apply_resolved_subs_batch).
+
+    resolved_subs_packed: {sub_id: (sol_ids ndarray, sol_coeffs ndarray)}.
+
+    Single flat pass: expand each of `eq`'s ids that is a substitution key,
+    exactly once. resolved_subs solutions never contain substitution keys, so
+    one pass suffices and the application order is irrelevant (GF(p) sums
+    commute) — making this bit-identical to the dict version regardless of the
+    id-sorted iteration order used here.
+    """
+    if not resolved_subs_packed:
+        return eq
+    result = eq
+    # snapshot the sub-key ids present in the ORIGINAL eq
+    sub_ids = [int(i) for i in eq.ids if int(i) in resolved_subs_packed]
+    for sid in sub_ids:
+        sol_ids, sol_coeffs = resolved_subs_packed[sid]
+        result = substitute_one(result, sid, sol_ids, sol_coeffs, prime)
+    return result
+
+
 def union_bitmask(eq, reg):
     """OR of per-integral sector bitmasks across eq's ids.
 

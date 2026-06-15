@@ -11,8 +11,11 @@ import os
 import random
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from sailir.packed_eq import IntegralRegistry, PackedEq, substitute_one, union_bitmask
+from sailir.packed_eq import (IntegralRegistry, PackedEq, substitute_one,
+                              apply_resolved_subs, union_bitmask)
 
 PRIME = 1009
 N_INDICES = 11
@@ -46,6 +49,23 @@ def oracle_union_bitmask(cached_eq):
                 bm |= (1 << i)
         u |= bm
     return u
+
+
+def oracle_apply_resolved_subs(expr, resolved_subs):
+    if not resolved_subs:
+        return dict(expr)
+    result = dict(expr)
+    keys_to_expand = [k for k in result if k in resolved_subs]
+    for sub_int in keys_to_expand:
+        if sub_int in result and result[sub_int] != 0:
+            coeff = result.pop(sub_int)
+            for k, v in resolved_subs[sub_int].items():
+                new_coeff = (coeff * v) % PRIME
+                if k in result:
+                    result[k] = (result[k] + new_coeff) % PRIME
+                else:
+                    result[k] = new_coeff
+    return {k: v for k, v in result.items() if v != 0}
 
 
 def rand_integral(rng):
@@ -127,10 +147,42 @@ def main():
     got, unchanged = packed_substitute({}, A, {B: 5}, reg)
     assert unchanged and got.to_dict(reg) == {}, "empty-eq failed"
 
-    print(f"PASS: {n_trials} random trials bit-identical "
-          f"(absent-key fast path checked {n_unchanged_checked}x, "
-          f"explicit cancellation {n_cancel_checked}x). "
-          f"registry size={len(reg)}")
+    # --- apply_resolved_subs fuzz (flat resolved_subs: solutions never contain
+    #     sub keys) vs the dict oracle ---
+    n_ars = 20000
+    for t in range(n_ars):
+        pool = [rand_integral(rng) for _ in range(rng.randint(3, 25))]
+        pool = list(dict.fromkeys(pool))            # unique
+        if len(pool) < 2:
+            continue
+        n_sub = rng.randint(0, len(pool) // 2)
+        sub_keys = pool[:n_sub]
+        non_sub = pool[n_sub:]                       # solution terms only
+        resolved_subs = {}
+        for sk in sub_keys:
+            sol = {non_sub[rng.randrange(len(non_sub))]: rng.randint(1, PRIME - 1)
+                   for _ in range(rng.randint(1, 4))}
+            resolved_subs[sk] = sol
+        expr = {pool[rng.randrange(len(pool))]: rng.randint(1, PRIME - 1)
+                for _ in range(rng.randint(0, 15))}
+
+        want = oracle_apply_resolved_subs(expr, resolved_subs)
+        rs_packed = {
+            reg.get_id(sk): (
+                np.fromiter((reg.get_id(k) for k in sol), np.int32, len(sol)),
+                np.fromiter((sol[k] for k in sol), np.int64, len(sol)),
+            )
+            for sk, sol in resolved_subs.items()
+        }
+        peq = PackedEq.from_dict(expr, reg)
+        got = apply_resolved_subs(peq, rs_packed, PRIME)
+        assert got.to_dict(reg) == want, (
+            f"apply_resolved_subs trial {t}: MISMATCH\n expr={expr}\n"
+            f" subs={resolved_subs}\n want={want}\n got={got.to_dict(reg)}")
+
+    print(f"PASS: {n_trials} substitute_one trials + {n_ars} apply_resolved_subs "
+          f"trials bit-identical (absent-key fast path {n_unchanged_checked}x, "
+          f"explicit cancellation {n_cancel_checked}x). registry size={len(reg)}")
 
 
 if __name__ == '__main__':
