@@ -51,20 +51,27 @@ def _sector_propagator_bm_from(ibp_env, target_sector):
 def compute_indirect_substituted_incremental_packed(
         prev_aux, new_sub_int, new_resolved_sol, new_resolved_subs,
         ibp_t, li_t, shifts, raw_eq_cache,
-        reg, packed_rs_cache, prime, N_INDICES, ibp_env,
+        reg, prime, N_INDICES, ibp_env,
         get_raw_equation, target_sector=None):
     """Packed equivalent of compute_indirect_substituted_incremental.
 
     Extra params vs the dict version:
       reg               : IntegralRegistry
-      packed_rs_cache   : dict {sub_int -> (ids,coeffs)} grown lazily
       prime, N_INDICES  : env scalars
       ibp_env           : the ibp_env module (for _sector_propagator_bm /
                           _entry_rejected_by_sector — sector logic unchanged)
       get_raw_equation  : ibp_env.get_raw_equation (raws stay dicts)
 
     Returns (result, new_aux) with cu entries as PackedEq.
+
+    NOTE: the packed sub-solution cache is PER CALL (local), not persistent.
+    resolved_subs VALUES change over the run (add_sub_to_resolved rewrites
+    existing solutions via copy-on-write when a new sub is referenced), so a
+    cache persisted across calls would go stale. Within one call
+    new_resolved_subs is a fixed snapshot, so a local cache is both correct and
+    avoids re-converting the same solution twice in this call.
     """
+    packed_rs_cache = {}
     prev_cu, prev_ubm, prev_rid, prev_iraws = prev_aux
 
     # new sub solution in packed form (for Phase A)

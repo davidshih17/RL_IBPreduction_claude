@@ -7,8 +7,15 @@ stronger than path-length equality.
 
 Usage: python compare_reduction_results.py <baseline.pkl> <candidate.pkl>
 """
+import os
 import pickle
 import sys
+
+# Make `sailir` + the beam_search modules importable for unpickling result.pkl
+# (it holds State_v5 namedtuples and sailir-referenced objects).
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, 'scripts', 'eval'))
 
 
 def load(path):
