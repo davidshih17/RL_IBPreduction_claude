@@ -481,8 +481,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                    iraws_window=None,
                    iraws_keep_first=None,
                    lazy_rs=True,
-                   model_batch_chunk=8,
-                   top_k=None):
+                   model_batch_chunk=None):
     """Sequential beam search, v5 strip-active semantics.
 
     resume_from: path to a ckpt.pkl (or result.pkl) from a prior run; resumes
@@ -547,6 +546,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
 
     # Tabu: expr fingerprint -> set of (target, ibp_op, delta) tried before
     tabu_dict = {} if tabu else None
+    # Diagnostic pick dump (same format as instrumented current code).
+    _pick_dump_dir = os.environ.get('SAILIR_PICK_DUMP')
     # Restore tabu from ckpt if present (resume bit-identical needs this).
     if (resume_from is not None and os.path.exists(resume_from)
             and tabu_dict is not None and d.get('tabu_dict')):
@@ -560,11 +561,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             n_entries = sum(len(v) for v in tabu_dict.values())
             print(f'[v6 RESUME] restored tabu_dict: {len(tabu_dict)} expr '
                   f'fingerprints, {n_entries} total entries', flush=True)
-    # Free the loaded checkpoint dict — beam + tabu have been extracted into
-    # live State_v5 objects, so keeping `d` bound pins the ENTIRE serialized
-    # beam (GBs of aux) alive for the whole run (diagnostic artifact + leak).
-    if resume_from is not None and os.path.exists(resume_from):
-        del d
 
     def sort_weight(s):
         return (s.max_w12, s.n_non_masters, -s.score)
@@ -588,320 +584,21 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             _memprobe_start = int(os.environ.get(
                 'SAILIR_MEMPROBE_FULL_START', '20'))
 
-    # Glibc memory tuning.
-    #  (1) End-of-step malloc_trim(0) — DEFAULT ON. Returns the freed heap top
-    #      to the OS; helped at shallow depth and is neutral at worst (it only
-    #      ever reclaims the trimmable top). Opt out: SAILIR_END_OF_STEP_TRIM=0.
-    #  (2) mmap-threshold pin via mallopt(M_MMAP_THRESHOLD=64MB) — DEFAULT OFF
-    #      (OPT-IN: SAILIR_MMAP_THRESHOLD=<bytes>). It was in the validated
-    #      probes but those only ran NORMAL integrals (74/84/LR); on the
-    #      huge-equation HOG regime it BACKFIRES (+~3GB): forcing medium
-    #      equation dicts onto the heap where live data blocks trim. So it is
-    #      no longer applied unless explicitly requested.
+    # End-of-step malloc_trim(0): release glibc's free top back to the OS
+    # so anon-mmap'd allocs forced into the heap by MALLOC_MMAP_THRESHOLD_
+    # actually get returned. Gated by SAILIR_END_OF_STEP_TRIM=1. One-time
+    # binding to libc.so.6; per-step cost is a single syscall.
     _end_of_step_trim = None
-    try:
-        import ctypes as _ctypes
-        import ctypes.util as _ctypes_util
-        _libc = _ctypes.CDLL(_ctypes_util.find_library('c'))
-        _mmap_thr = os.environ.get('SAILIR_MMAP_THRESHOLD')
-        if _mmap_thr:                                  # opt-in only
-            _libc.mallopt.argtypes = [_ctypes.c_int, _ctypes.c_int]
-            _libc.mallopt.restype = _ctypes.c_int
-            _libc.mallopt(-3, int(_mmap_thr))          # M_MMAP_THRESHOLD = -3
-        if os.environ.get('SAILIR_END_OF_STEP_TRIM', '1') != '0':
+    if os.environ.get('SAILIR_END_OF_STEP_TRIM') == '1':
+        try:
+            import ctypes as _ctypes
+            import ctypes.util as _ctypes_util
+            _libc = _ctypes.CDLL(_ctypes_util.find_library('c'))
             _libc.malloc_trim.argtypes = [_ctypes.c_size_t]
             _libc.malloc_trim.restype = _ctypes.c_int
             _end_of_step_trim = _libc.malloc_trim
-    except Exception:
-        _end_of_step_trim = None
-
-    # Optional beam-set trace: log per step (step, n_distinct_expr_fps,
-    # hash_of_expr_fp_set) to verify the hypothesis "tabu trap fires only
-    # when current beam's expr_fp set equals some prior step's set".
-    # Gated by SAILIR_TRACE_BEAM_SETS=<path>. Per-step cost = one hash
-    # over n_beam frozensets; per-step memory = 3 ints.
-    _beam_set_trace_path = os.environ.get('SAILIR_TRACE_BEAM_SETS')
-    _beam_set_history = []  # list of (step, n_distinct, set_hash)
-
-    # Optional bounded-tabu mode (SAILIR_TABU_CAP=N, N>0). Per (expr_fp,target)
-    # we accumulate every tried (op,delta) into a tabu set, exactly like the
-    # baseline aggressive tabu, and pick top-K of valid minus that set. The ONE
-    # difference: the effective block is capped at CAP actions. When the number
-    # of currently-valid tabu'd actions exceeds CAP, we re-allow the highest-
-    # model-prob overflow (keeping the lowest-prob CAP blocked) — so once we've
-    # swept CAP-deep, the model's current favourites re-open and get re-tried
-    # under the evolved RS (different sol → different children). Reduces to
-    # baseline byte-for-byte until |valid∩tabu| first exceeds CAP. Replaces the
-    # plain tabu filter — they're alternatives, not stackable. Storage grows
-    # like baseline (the cap governs the FILTER, not the stored set).
-    # Aggressive tabu is the FOUNDATION whenever --tabu is set: every top-K
-    # pick is recorded and blocked (== baseline). SAILIR_TABU_CAP only adds the
-    # optional cap+cycling LAYER on top: cap>0 caps the effective block at CAP
-    # and re-allows the highest-prob overflow once swept CAP-deep; cap<=0 means
-    # NO cap (effective block = ∞), i.e. pure aggressive baseline tabu.
-    _tabu_cap = int(os.environ.get('SAILIR_TABU_CAP', '0'))
-    _tabu_cap_eff = _tabu_cap if _tabu_cap > 0 else float('inf')
-    _bounded_tabu_on = bool(tabu)
-    _bt_tabu = {} if _bounded_tabu_on else None
-
-    # Focused runtime memory breakdown (SAILIR_MEM_BREAKDOWN=1). Each sampled
-    # step we RESET VmHWM at step start (/proc/self/clear_refs) so the print's
-    # peak_rss is THIS step's transient peak (not the all-time max), then report:
-    #   peak_rss   = per-step transient peak (pre end-of-step trim)
-    #   rss        = post-trim quiescent RSS
-    #   smaps      = where RSS lives: heap (brk) / anon (mmap) / file
-    #   named structs (shared-seen partition): beam,cand,cand_meta,cache,bt,tabu
-    #   glibc_transient = peak_rss - rss  (freed-then-trimmed each step)
-    #   live_unaccounted = rss - sum_struct  (live, unnamed -> next target)
-    # Every 4th sample a gc deep-walk-by-type names any live_unaccounted.
-    _mem_bd = os.environ.get('SAILIR_MEM_BREAKDOWN')
-    _mem_bd_every = int(os.environ.get('SAILIR_MEM_BREAKDOWN_EVERY', '25'))
-
-    def _membd_deepsize(o, seen=None):
-        import sys as _s
-        from collections import deque as _dq
-        if seen is None:
-            seen = set()
-        tot = 0; st = _dq([o])
-        while st:
-            x = st.popleft(); i = id(x)
-            if i in seen:
-                continue
-            seen.add(i)
-            if isinstance(x, np.ndarray):
-                tot += x.nbytes; continue
-            tot += _s.getsizeof(x, 0)
-            if isinstance(x, dict):
-                for k, v in x.items():
-                    st.append(k); st.append(v)
-            elif isinstance(x, (list, tuple, set, frozenset, _dq)):
-                for e in x:
-                    st.append(e)
-            else:
-                # arbitrary object: traverse its attributes so env/model/caches
-                # held in __dict__ or __slots__ are actually counted.
-                _xd = getattr(x, '__dict__', None)
-                if _xd is not None:
-                    st.append(_xd)
-                _sl = getattr(type(x), '__slots__', None)
-                if _sl:
-                    for _n in _sl:
-                        try:
-                            st.append(getattr(x, _n))
-                        except Exception:
-                            pass
-        return tot
-
-    def _membd_mem():
-        rss = hwm = 0
-        with open('/proc/self/status') as _f:
-            for _l in _f:
-                if _l.startswith('VmRSS:'):
-                    rss = int(_l.split()[1])
-                elif _l.startswith('VmHWM:'):
-                    hwm = int(_l.split()[1])
-        return rss, hwm   # kB; hwm here is the per-step peak after a reset
-
-    def _membd_reset_peak():
-        # Reset VmHWM to current VmRSS so the next VmHWM read is THIS step's
-        # peak. CLEAR_REFS_MM_HIWATER_RSS = '5'. Cheap; no side effects beyond
-        # the peak counter (which only the diagnostic relies on).
-        try:
-            with open('/proc/self/clear_refs', 'w') as _cf:
-                _cf.write('5')
         except Exception:
-            pass
-
-    def _membd_smaps():
-        # Sum Rss (kB) by region category from /proc/self/smaps:
-        #   heap = the main-arena brk region ([heap]); anon = anonymous mmaps
-        #   (glibc secondary arenas + large malloc/numpy/torch); file = mapped
-        #   files (libs, model). Tells WHERE the RSS physically lives.
-        heap = anon = filed = 0
-        is_heap = is_file = False
-        try:
-            with open('/proc/self/smaps') as _f:
-                for _l in _f:
-                    # Mapping header lines start with "start-end" (a '-' in the
-                    # first token); detail lines are "Field:  N kB".
-                    if '-' in _l.split(' ', 1)[0]:
-                        _p = _l.split()
-                        _path = _p[5] if len(_p) >= 6 else ''
-                        is_heap = (_path == '[heap]')
-                        is_file = _path.startswith('/')
-                    elif _l.startswith('Rss:'):
-                        _kb = int(_l.split()[1])
-                        if is_heap:
-                            heap += _kb
-                        elif is_file:
-                            filed += _kb
-                        else:
-                            anon += _kb
-        except Exception:
-            pass
-        return heap, anon, filed
-
-    def _membd_torch_bytes():
-        # Sum unique LIVE torch tensor storage (model params + forward
-        # transients: probs_all, batch_data, ...). These live in anon-mmap,
-        # OUTSIDE the Python heap, so _membd_deepsize can't see them — they are
-        # the dominant PEAK driver on heavy candidate-gen steps.
-        try:
-            import torch as _t
-            import gc as _g
-            _seen_st = set()
-            _tot = 0
-            for _o in _g.get_objects():
-                if isinstance(_o, _t.Tensor):
-                    try:
-                        _st = _o.untyped_storage()
-                        _sid = id(_st)
-                        if _sid not in _seen_st:
-                            _seen_st.add(_sid)
-                            _tot += _st.nbytes()
-                    except Exception:
-                        pass
-            return _tot
-        except Exception:
-            return 0
-
-    def _membd_mallinfo():
-        # glibc allocator stats via malloc_info() XML (mallinfo2 doesn't exist
-        # on glibc 2.28; old mallinfo() int fields overflow past 2GB). Reports
-        # glibc-managed memory ONLY (large allocs / numpy / torch mmap; NOT
-        # CPython pymalloc small-object arenas — those are counted by the gc
-        # heap walk instead). free = glibc freed-but-retained (fragmentation);
-        # mmap = bytes in mmap'd regions; system = total from-OS in glibc arenas.
-        try:
-            import ctypes as _c
-            import re as _re
-            _libc2 = _c.CDLL('libc.so.6')
-            _buf = _c.c_char_p()
-            _sz = _c.c_size_t()
-            _libc2.open_memstream.restype = _c.c_void_p
-            _libc2.open_memstream.argtypes = [
-                _c.POINTER(_c.c_char_p), _c.POINTER(_c.c_size_t)]
-            _fp = _libc2.open_memstream(_c.byref(_buf), _c.byref(_sz))
-            _libc2.malloc_info.argtypes = [_c.c_int, _c.c_void_p]
-            _libc2.malloc_info(0, _fp)
-            _libc2.fflush(_c.c_void_p(_fp))
-            _libc2.fclose(_c.c_void_p(_fp))
-            _xml = _c.string_at(_buf.value, _sz.value).decode()
-            _libc2.free.argtypes = [_c.c_void_p]
-            _libc2.free(_c.cast(_buf, _c.c_void_p))
-
-            def _last(_pat):
-                _mm = _re.findall(_pat, _xml)
-                return int(_mm[-1]) if _mm else 0
-            _fast = _last(r'<total type="fast" count="\d+" size="(\d+)"')
-            _rest = _last(r'<total type="rest" count="\d+" size="(\d+)"')
-            _mmap = _last(r'<total type="mmap" count="\d+" size="(\d+)"')
-            _syscur = _last(r'<system type="current" size="(\d+)"')
-            _free = _fast + _rest
-            return {'system': _syscur, 'hblkhd': _mmap, 'fordblks': _free,
-                    'uordblks': max(_syscur - _free, 0)}
-        except Exception:
-            return None
-
-    def _membd_gc_by_type(top_n=15):
-        # FULL live-heap walk. CPython UNTRACKS dicts/tuples/lists whose contents
-        # are all atomic (int/str) — gc.get_objects() does NOT list them, and
-        # SAILIR's equation dicts (seed→int-coeff) are exactly that. So we seed
-        # from the GC roots and traverse gc.get_referents(), which DOES reach
-        # untracked children. id-dedup; numpy/torch buffers special-cased. This
-        # reaches every reachable live object → total = the real python RSS, and
-        # the by-type rows name the dominant container. Returns
-        # (total_bytes, [(typename, bytes), ...]).
-        import gc as _g
-        import sys as _s
-        from collections import Counter as _Cn
-        try:
-            import numpy as _np
-        except Exception:
-            _np = None
-        try:
-            import torch as _tt
-        except Exception:
-            _tt = None
-        _g.collect()
-        _seen = set()
-        _tot = 0
-        _bt = _Cn()
-        _st_seen = set()
-        _stack = _g.get_objects()                 # tracked roots
-        _get_ref = _g.get_referents
-        # Exclude the walk's OWN structures (seen/stack/bt/st_seen) so we never
-        # count the instrumentation as heap (the seen-set alone is GBs on a big
-        # heap — that observer effect inflated the total above rss).
-        _self_ids = {id(_seen), id(_bt), id(_st_seen), id(_stack)}
-        while _stack:
-            _o = _stack.pop()
-            _i = id(_o)
-            if _i in _seen:
-                continue
-            _seen.add(_i)
-            if _i in _self_ids:
-                continue
-            if _np is not None and isinstance(_o, _np.ndarray):
-                _sz = _o.nbytes
-            elif _tt is not None and isinstance(_o, _tt.Tensor):
-                try:
-                    _sid = id(_o.untyped_storage())
-                    if _sid in _st_seen:
-                        _sz = _s.getsizeof(_o, 0)
-                    else:
-                        _st_seen.add(_sid)
-                        _sz = _o.untyped_storage().nbytes()
-                except Exception:
-                    _sz = _s.getsizeof(_o, 0)
-            elif (_tt is not None and 'Storage' in type(_o).__name__
-                  and hasattr(_o, 'nbytes')):
-                # Storage object reached directly. getsizeof(storage) returns the
-                # BUFFER size, so without this branch torch storage is counted
-                # twice (once via its Tensor above). Dedup by storage id across
-                # both paths so each buffer is counted exactly once.
-                _sid = id(_o)
-                if _sid in _st_seen:
-                    _sz = 0
-                else:
-                    _st_seen.add(_sid)
-                    try:
-                        _sz = _o.nbytes()
-                    except Exception:
-                        _sz = _s.getsizeof(_o, 0)
-            else:
-                _sz = _s.getsizeof(_o, 0)
-            _tot += _sz
-            _typ = type(_o)
-            _modn = getattr(_typ, '__module__', '')
-            if not isinstance(_modn, str):
-                _modn = ''
-            _nm = getattr(_typ, '__name__', None)
-            if not isinstance(_nm, str):
-                _nm = repr(_typ)
-            _bt[_modn + '.' + _nm] += _sz
-            # Follow referents to reach UNTRACKED children (the equation dicts).
-            for _r in _get_ref(_o):
-                if id(_r) not in _seen:
-                    _stack.append(_r)
-        return _tot, _bt.most_common(top_n)
-
-    # Diagnostic: dump per-task (expr_fp, target, n_v, picked_actions, V) every
-    # step to <dir>/picks_step<N>.pkl. Used to diff baseline-tabu vs rank-cycle
-    # picks and locate the first divergence. Off unless SAILIR_PICK_DUMP set.
-    _pick_dump_dir = os.environ.get('SAILIR_PICK_DUMP')
-
-    # Optional tabu audit / sol fallback infra.
-    # SAILIR_TABU_AUDIT=1       → maintain _sol_history + dump audit on stuck
-    # SAILIR_TABU_SOL_FALLBACK=1 → maintain _sol_history AND consult it on
-    #                              stuck to let "drifted" actions through.
-    # Either flag activates _sol_history. No cap on fallback uses — it only
-    # fires when primary tabu has zero valid actions, so it's self-limiting.
-    _tabu_audit_on = os.environ.get('SAILIR_TABU_AUDIT') == '1'
-    _tabu_sol_fallback = os.environ.get('SAILIR_TABU_SOL_FALLBACK') == '1'
-    # _sol_history[frozenset(expr_fp)][(target, op, delta)] = list of (step, sol_fp)
-    _sol_history = ({} if (_tabu_audit_on or _tabu_sol_fallback) else None)
-    _sol_fallback_count = 0
+            _end_of_step_trim = None
 
     for step in range(resume_step, max_steps):
         # Termination: ANY beam state has drained — we only need one successful
@@ -913,17 +610,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 print(f'[v6 step {step}] beam state drained — DONE '
                       f'(path_len={len(winning.path)})', flush=True)
             break
-
-        # Reset the peak-RSS counter at the START of a sampled step so the
-        # MEMBD print reads THIS step's transient peak (the candidate-gen
-        # spike), not the all-time high-water mark.
-        if _mem_bd and (step + 1) % _mem_bd_every == 0:
-            _membd_reset_peak()
-
-        # Record per-step beam set for the trap-hypothesis verification.
-        if _beam_set_trace_path is not None:
-            _bs = frozenset(frozenset(s.expr.items()) for s in beam)
-            _beam_set_history.append((step, len(_bs), hash(_bs)))
 
         # ── v6: macro-beam dedup ──────────────────────────────────────────
         # Collapse beam slots that share the same expr_fp. The model only
@@ -1049,34 +735,13 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     _ct['enum_calls'] += 1
                 # Tabu: filter out (target, op, delta) tried previously from
                 # this expr fingerprint.
-                if (not _bounded_tabu_on
-                        and tabu_dict is not None and valid):
+                if tabu_dict is not None and valid:
                     _t = time.time() if _v5_prof else 0
                     expr_fp = frozenset(s.expr.items())
                     tabu_set = tabu_dict.get(expr_fp)
                     if tabu_set:
                         valid = [(op, dlt) for (op, dlt) in valid
                                  if (target, op, dlt) not in tabu_set]
-                    if _v5_prof:
-                        _p1['tabu'] += time.time() - _t
-                # Aggressive tabu: remove this (expr_fp,target)'s tabu'd actions
-                # here — BEFORE the max_actions truncation — so the model sees
-                # the same tabu-free window as baseline (byte-identical). TWO
-                # cases keep the FULL list instead, deferring to the pick loop:
-                #  • EXHAUSTED (every valid action tabu'd): filtering would drop
-                #    the task (the trap → stuck). Keep the full list so the pick
-                #    loop CYCLES — re-picks the top-K best to retry under the
-                #    evolved RS instead of dying.
-                #  • OVER fixed cap (only when SAILIR_TABU_CAP>0): pick loop
-                #    re-allows the highest-prob overflow using model probs.
-                elif _bounded_tabu_on and valid:
-                    _t = time.time() if _v5_prof else 0
-                    _bt_key = (frozenset(s.expr.items()), target)
-                    _bt_set = _bt_tabu.get(_bt_key)
-                    if _bt_set:
-                        _nblk = sum(1 for a in valid if a in _bt_set)
-                        if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
-                            valid = [a for a in valid if a not in _bt_set]
                     if _v5_prof:
                         _p1['tabu'] += time.time() - _t
                 if valid:
@@ -1097,234 +762,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             print(f'  [DUMP] valids at step {step+1} → {_dump_path}', flush=True)
 
         if not tasks:
-            # SOL_FALLBACK: before declaring STUCK, retry filter using
-            # sol_fp drift. For each raw candidate (op, dlt), compute the
-            # current sol_fp under THIS state's RS. If it doesn't match
-            # ANY historical sol_fp under (target, op, dlt) for this
-            # expr_fp, that means the substitution we'd apply now is
-            # different from what was tabu'd → allow.
-            if _tabu_sol_fallback and _sol_history is not None:
-                tasks = []
-                n_unblocked_total = 0
-                for parent_idx in range(len(beam)):
-                    s = beam[parent_idx]
-                    nm = get_non_masters(s.expr, target_sector)
-                    if not nm:
-                        continue
-                    mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                    tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
-                    expr_fp_ = frozenset(s.expr.items())
-                    ts_ = (tabu_dict.get(expr_fp_)
-                           if tabu_dict is not None else None)
-                    hist_p = _sol_history.get(expr_fp_)
-                    if hist_p is None:
-                        continue
-                    ic = (_aux_to_result(s.aux_flat, env)
-                          if s.aux_flat is not None else None)
-                    if ic is None:
-                        continue
-                    dummy_subs = {k: {} for k in s.resolved_subs.keys()}
-                    cu_p = s.aux_flat[0]
-                    rid_p = s.aux_flat[2]
-                    N_ = ibp_env.N_INDICES
-                    for tgt in tied:
-                        raw_valid = enumerate_valid_actions_with_indirect_cache(
-                            tgt, ic, dummy_subs, s.resolved_subs,
-                            env.ibp_t, env.li_t, env.shifts, 'subsector',
-                            env._raw_eq_cache,
-                        )
-                        unblocked = []
-                        for (op, dlt) in raw_valid:
-                            # If primary tabu doesn't block it, keep as-is.
-                            if ts_ is None or (tgt, op, dlt) not in ts_:
-                                unblocked.append((op, dlt))
-                                continue
-                            # Primary blocks it — check sol_fp drift.
-                            key_ = (tgt, op, dlt)
-                            hist = hist_p.get(key_, [])
-                            if not hist:
-                                continue  # primary tabu'd via different path
-                            seed_p = tuple(tgt[i] + dlt[i] for i in range(N_))
-                            cu_idx_p = rid_p.get((op, seed_p))
-                            if cu_idx_p is None:
-                                continue
-                            sol_p = solve_ibp_for(cu_p[cu_idx_p], tgt)
-                            if sol_p is None:
-                                continue
-                            cur_sol_fp = hash(frozenset(sol_p.items()))
-                            hist_sol_fps = {sfp for _s, sfp in hist}
-                            if cur_sol_fp not in hist_sol_fps:
-                                # Drifted: substitution differs from
-                                # what was previously tabu'd → allow.
-                                unblocked.append((op, dlt))
-                        if unblocked:
-                            tasks.append((parent_idx, tgt, unblocked))
-                            n_unblocked_total += len(unblocked)
-                if tasks:
-                    _sol_fallback_count += 1
-                    if verbose:
-                        print(f'[v6 step {step}] TABU TRAP - sol_fp fallback '
-                              f'#{_sol_fallback_count}: '
-                              f'{n_unblocked_total} drifted actions unblocked',
-                              flush=True)
-                    # Fall through to model forward / action selection.
-                else:
-                    if verbose:
-                        print(f'[v6 step {step}] no tasks — STUCK (sol_fp '
-                              f'fallback found no drifted actions)', flush=True)
-            if not tasks:
-                if verbose:
-                    print(f'[v6 step {step}] no tasks — STUCK', flush=True)
-                # All the diagnostics below only fire if STILL stuck after
-                # the sol_fp fallback above (or if fallback was disabled).
-                _real_stuck = True
-            else:
-                _real_stuck = False
-            # If beam-set tracing is on, identify prior steps whose beam
-            # had the SAME set of expr_fps as the current (stuck) beam.
-            if _real_stuck and _beam_set_trace_path is not None:
-                _cur_bs = frozenset(frozenset(s.expr.items()) for s in beam)
-                _cur_h = hash(_cur_bs)
-                _prior_matches = [s for s, _n, h in _beam_set_history
-                                  if h == _cur_h and s < step]
-                with open(_beam_set_trace_path, 'w') as _tf:
-                    _tf.write(f'stuck_step\t{step}\n')
-                    _tf.write(f'stuck_n_distinct\t{len(_cur_bs)}\n')
-                    _tf.write(f'prior_steps_with_same_set\t'
-                               f'{",".join(map(str, _prior_matches))}\n')
-                    _tf.write(f'# history (step, n_distinct, hash):\n')
-                    for s, n, h in _beam_set_history:
-                        _tf.write(f'{s}\t{n}\t{h}\n')
-                print(f'  [BEAM_SET_TRACE] stuck-set seen earlier at steps: '
-                      f'{_prior_matches} → '
-                      f'{_beam_set_trace_path}', flush=True)
-            # Comprehensive forensic dump of the stuck state. Gated by env
-            # var SAILIR_DUMP_STUCK=<path> so it only fires when requested.
-            _dump_stuck_path = (os.environ.get('SAILIR_DUMP_STUCK')
-                                 if _real_stuck else None)
-            if _dump_stuck_path:
-                try:
-                    _stuck_payload = {
-                        'step': step,
-                        'target_sector': target_sector,
-                        'start_w12': start_w12,
-                        'beam_width': beam_width,
-                        'max_actions': max_actions,
-                        # Tabu — every (target, op, delta) recorded
-                        'tabu_dict': {
-                            tuple(expr_fp): list(entries)
-                            for expr_fp, entries in tabu_dict.items()
-                        } if tabu_dict is not None else None,
-                        'tabu_summary': ({
-                            'n_expr_fps': len(tabu_dict),
-                            'total_entries': sum(len(v) for v in tabu_dict.values()),
-                        } if tabu_dict is not None else None),
-                        # Full beam: every state's expr, RS, sub_accum, path,
-                        # score, max_w12, total_w12, n_non_masters, aux_flat
-                        'beam': [
-                            {
-                                'expr': dict(st.expr),
-                                'resolved_subs': (dict(st.resolved_subs)
-                                                   if st.resolved_subs else None),
-                                'sub_accum': (dict(st.sub_accum)
-                                              if st.sub_accum else None),
-                                'path': list(st.path) if st.path else [],
-                                'score': float(st.score),
-                                'max_w12': tuple(st.max_w12),
-                                'total_w12': tuple(st.total_w12),
-                                'n_non_masters': int(st.n_non_masters),
-                                'aux_flat': (_aux_to_picklable(st.aux_flat)
-                                              if st.aux_flat is not None else None),
-                            }
-                            for st in beam
-                        ],
-                        # Per-state, per-target: what enumerate_valid_actions
-                        # gave us (raw) and what tabu LEFT (post-filter), so
-                        # we can see EXACTLY how many candidates each target
-                        # had vs how many tabu took out.
-                        'per_state_per_target': [],
-                        # Best state tracker
-                        'best_state': ({
-                            'path_len': int(best_state.path_len if hasattr(best_state, 'path_len') else len(best_state.path)),
-                            'n_non_masters': int(best_state.n_non_masters),
-                            'max_w12': tuple(best_state.max_w12),
-                            'score': float(best_state.score),
-                        } if best_state is not None else None),
-                    }
-                    # Re-enumerate per parent, per tied target — capture
-                    # raw_valid (no tabu) and filtered_valid (post-tabu).
-                    for parent_idx, st in enumerate(beam):
-                        nm = get_non_masters(st.expr, target_sector)
-                        if not nm:
-                            continue
-                        mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                        tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
-                        # rebuild indirect_cache for re-enumeration
-                        ic = (_aux_to_result(st.aux_flat, env)
-                              if st.aux_flat is not None else None)
-                        if ic is None:
-                            continue
-                        dummy_subs = {k: {} for k in st.resolved_subs.keys()}
-                        expr_fp_ = frozenset(st.expr.items())
-                        ts_ = (tabu_dict.get(expr_fp_)
-                               if tabu_dict is not None else None)
-                        cu_p = st.aux_flat[0]
-                        rid_p = st.aux_flat[2]
-                        N_ = ibp_env.N_INDICES
-                        _hist_p = (_sol_history.get(expr_fp_)
-                                    if _sol_history is not None else None)
-                        for tgt in tied:
-                            raw_valid = enumerate_valid_actions_with_indirect_cache(
-                                tgt, ic, dummy_subs, st.resolved_subs,
-                                env.ibp_t, env.li_t, env.shifts, 'subsector',
-                                env._raw_eq_cache,
-                            )
-                            filtered = ([(op, dlt) for (op, dlt) in raw_valid
-                                          if (tgt, op, dlt) not in ts_]
-                                        if ts_ else list(raw_valid))
-                            # AUDIT: for each tabu'd action, compute CURRENT
-                            # sol_fp under THIS step's RS and compare to the
-                            # sol_fp(s) when it was first tabu'd. Drift =
-                            # current ≠ all historical sol_fps for that key.
-                            audit_rows = []
-                            if _hist_p is not None:
-                                for (op, dlt) in raw_valid:
-                                    key_ = (tgt, op, dlt)
-                                    hist = _hist_p.get(key_, [])
-                                    seed_p = tuple(tgt[i] + dlt[i] for i in range(N_))
-                                    cu_idx_p = rid_p.get((op, seed_p))
-                                    cur_sol_fp = None
-                                    if cu_idx_p is not None:
-                                        sol_p = solve_ibp_for(cu_p[cu_idx_p], tgt)
-                                        if sol_p is not None:
-                                            cur_sol_fp = hash(frozenset(sol_p.items()))
-                                    hist_sol_fps = {sfp for _s, sfp in hist}
-                                    drifted = (cur_sol_fp is not None
-                                                and cur_sol_fp not in hist_sol_fps
-                                                and len(hist) > 0)
-                                    audit_rows.append({
-                                        'op': op, 'delta': tuple(dlt),
-                                        'current_sol_fp': cur_sol_fp,
-                                        'history': hist,  # list of (step, sol_fp)
-                                        'drifted': drifted,
-                                    })
-                            _stuck_payload['per_state_per_target'].append({
-                                'parent_idx': parent_idx,
-                                'target': tgt,
-                                'n_raw': len(raw_valid),
-                                'n_after_tabu': len(filtered),
-                                'raw_valid': [(op, tuple(d)) for op, d in raw_valid],
-                                'filtered': [(op, tuple(d)) for op, d in filtered],
-                                'audit': audit_rows,
-                            })
-                    with open(_dump_stuck_path, 'wb') as _df:
-                        pickle.dump(_stuck_payload, _df)
-                    print(f'  [STUCK_DUMP] wrote forensic state → '
-                          f'{_dump_stuck_path}', flush=True)
-                except Exception as _e:
-                    print(f'  [STUCK_DUMP] failed: {_e}', flush=True)
-            if _real_stuck:
-                break
+            if verbose:
+                print(f'[v6 step {step}] no tasks — STUCK', flush=True)
+            break
 
         # Run model batched on all tasks (optionally chunked).
         # Chunking bounds the peak transient activation memory in the forward
@@ -1369,61 +809,28 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             _p2['model_fwd'] += time.time() - _t
 
         # For each task, take top-K actions by prob, apply, generate candidates
-        K = max(1, top_k if top_k is not None else beam_width // 2)
+        K = max(1, beam_width // 2)
         _pick_dump_step = [] if _pick_dump_dir else None
         for ti, (parent_idx, target, valid) in enumerate(tasks):
             n_v = min(len(valid), probs.shape[1])
             row = probs[ti, :n_v].numpy()
+            # Take top-K by prob
+            top_idx = np.argsort(-row)[:K]
             parent_state = beam[parent_idx]
-            if _bounded_tabu_on:
-                # Bounded tabu: block previously-tried (op,delta) for this
-                # (expr_fp,target), but cap the effective block at CAP. When
-                # more than CAP currently-valid actions are tabu'd, keep the
-                # lowest-prob CAP blocked and RE-ALLOW the highest-prob overflow
-                # (the model's current favourites get re-tried under evolved RS).
-                _key_bt = (frozenset(parent_state.expr.items()), target)
-                _tset = _bt_tabu.get(_key_bt)
-                if _tset:
-                    _blk = [i for i in range(n_v) if valid[i] in _tset]
-                else:
-                    _blk = []
-                _n_blocked = len(_blk)
-                if _n_blocked > _tabu_cap_eff:
-                    _blk.sort(key=lambda i: row[i])      # ascending prob
-                    _eff_block = set(_blk[:_tabu_cap])   # lowest-prob CAP
-                else:
-                    _eff_block = set(_blk)
-                if _eff_block:
-                    _avail = [i for i in np.argsort(-row) if i not in _eff_block]
-                    if _avail:
-                        top_idx = np.array(_avail[:K], dtype=int)
-                    else:
-                        # EXHAUSTED: every valid action is tabu'd. Cycle —
-                        # re-allow everything and re-pick the top-K best, so a
-                        # trapped task retries its best actions under the evolved
-                        # RS rather than producing nothing (= baseline's stuck).
-                        top_idx = np.argsort(-row)[:K]
-                else:
-                    top_idx = np.argsort(-row)[:K]
-                # Record ALL picks into the tabu set (aggressive, like baseline).
-                _ts2 = _bt_tabu.setdefault(_key_bt, set())
-                for _ai in top_idx:
-                    _ts2.add(valid[int(_ai)])
-            else:
-                # Take top-K by prob
-                top_idx = np.argsort(-row)[:K]
-                _n_blocked = -1
             if _pick_dump_step is not None:
-                _V_d = _n_blocked
                 _picked_d = tuple(sorted(
                     (op_, tuple(d_)) for (op_, d_)
                     in (valid[int(_a)] for _a in top_idx)))
                 _pick_dump_step.append((
                     tuple(sorted(parent_state.expr.items())),
-                    tuple(target), int(n_v), _picked_d, int(_V_d)))
-            # Tabu is recorded LATER — after beam selection and macro-dedup
-            # — for ONLY the actions that actually survived into the next
-            # beam, not every top-K attempt.
+                    tuple(target), int(n_v), _picked_d, -1))
+            # Tabu: record (target, op, delta) we choose to try from this expr
+            if tabu_dict is not None:
+                expr_fp = frozenset(parent_state.expr.items())
+                ts = tabu_dict.setdefault(expr_fp, set())
+                for ai in top_idx:
+                    op, delta = valid[int(ai)]
+                    ts.add((target, op, delta))
             for ai in top_idx:
                 ai = int(ai)
                 op, delta = valid[ai]
@@ -1516,36 +923,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                           flush=True)
                 beam = list(early_groups.values())
 
-        # Tabu: now that beam survivors are finalised, record (target, op,
-        # delta) of EACH survivor's last action under its parent's expr_fp.
-        # Only survivors get tabu'd — top-K attempts whose children were
-        # rejected by beam selection are NOT tabu'd (they may produce
-        # different outcomes in future visits with different RS context).
-        if tabu_dict is not None and not _bounded_tabu_on:
-            N_ = ibp_env.N_INDICES
-            for c in beam:
-                meta_i = meta_by_id.get(id(c))
-                if meta_i is None:
-                    continue
-                parent_state, target, _sol = cand_metadata[meta_i]
-                # Last action in child's path = (target, op, delta) applied
-                target_p, op_p, delta_p = c.path[-1]
-                expr_fp_p = frozenset(parent_state.expr.items())
-                ts = tabu_dict.setdefault(expr_fp_p, set())
-                ts.add((target_p, op_p, delta_p))
-                if _sol_history is not None:
-                    seed_p = tuple(target_p[i] + delta_p[i] for i in range(N_))
-                    cu_p_ = parent_state.aux_flat[0]
-                    rid_p_ = parent_state.aux_flat[2]
-                    cu_idx_p = rid_p_.get((op_p, seed_p))
-                    if cu_idx_p is not None:
-                        sol_p = solve_ibp_for(cu_p_[cu_idx_p], target_p)
-                        if sol_p is not None:
-                            sol_fp_p = hash(frozenset(sol_p.items()))
-                            _hist = _sol_history.setdefault(expr_fp_p, {})
-                            _hist.setdefault((target_p, op_p, delta_p),
-                                              []).append((step, sol_fp_p))
-
         # Post-selection survivors: materialize lazy_rs THEN attach aux in a
         # single pass so the original `c` is still in meta_by_id.
         _t_mat = time.time() if _v5_prof else 0
@@ -1615,29 +992,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 print(f'    P3: {p3_parts}', flush=True)
                 print(f'    cts: ' + ' '.join(f'{k}={v}' for k, v in _ct.items()),
                       flush=True)
-        # Explicit aux dump (SAILIR_DUMP_AUX_STEPS="10,25"): print the best
-        # state's aux_flat = (cu, ubm, rid, iraws) — lengths, the per-cu-entry
-        # term counts, and samples — so depth-keyed vs exprkeyed aux can be
-        # compared directly. SEPARATE block (not inside the profiling guard).
-        _dump_steps = os.environ.get('SAILIR_DUMP_AUX_STEPS')
-        if _dump_steps and (step + 1) in {int(_x) for _x in _dump_steps.split(',') if _x}:
-            _ax = best_in_beam.aux_flat
-            if _ax is None:
-                print(f'[AUXDUMP step {step+1}] best.aux_flat is None', flush=True)
-            else:
-                _cu, _ubm, _rid, _iraws = _ax
-                _sizes = sorted((len(c) for c in _cu), reverse=True)
-                print(f'[AUXDUMP step {step+1}] use_exprkeyed={use_exprkeyed} '
-                      f'| len(cu)={len(_cu)} len(iraws)={len(_iraws)} '
-                      f'len(rid)={len(_rid)} | cu #terms total={sum(_sizes)} '
-                      f'max={_sizes[0] if _sizes else 0} top8={_sizes[:8]}',
-                      flush=True)
-                print(f'  iraws[:4] = {_iraws[:4]}', flush=True)
-                if _cu:
-                    _big = max(_cu, key=len)
-                    print(f'  largest cu entry: {len(_big)} terms; first 4 items'
-                          f' = {list(_big.items())[:4]}', flush=True)
-                print(f'  rid[:3] = {list(_rid.items())[:3]}', flush=True)
 
         def _serialize_beam_for_ckpt():
             out = []
@@ -1693,52 +1047,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 except Exception as _e:
                     print(f'  [memprobe_full] error: {_e}', flush=True)
 
-        # Focused memory breakdown. peak_rss = this step's transient peak (VmHWM
-        # was reset at step start); rss = post-trim quiescent. Named structures
-        # use ONE shared seen-set so they partition (no double count). The two
-        # gaps separate the dominant unaccounted into its two possible causes.
-        if _mem_bd and (step + 1) % _mem_bd_every == 0:
-            # ── O(1) allocator-level accounting — NO object-graph walk. ────────
-            # A heap walk (deep-size / gc.get_referents) needs a `seen` set of
-            # one id PER LIVE OBJECT to dedup the traversal. This workload has
-            # ~10^8 tiny int/set/dict objects, so that seen-set is *tens of GB*,
-            # allocated every sample, larger than the heap it measures — that is
-            # what ballooned rss to 146GB. So we NEVER walk objects here.
-            #
-            # smaps is the OS ground truth: heap+anon+file = rss EXACTLY (closes
-            # by construction). malloc_info splits the glibc arena into
-            # in-use/free/mmap. The CPython pymalloc arenas — where the millions
-            # of small int/set/dict objects actually live — are anon bytes NOT in
-            # glibc's mmap, so pymalloc_region = anon − glibc_mmap. Cost is O(1)
-            # (a couple /proc reads + one malloc_info), so it cannot perturb the
-            # run. It attributes rss to allocator buckets but NOT to python type/
-            # source — for that, run a BOUNDED tracemalloc job (capped steps).
-            _rss, _peak = _membd_mem()
-            _heap, _anon, _filed = _membd_smaps()
-            _rssm = _rss // 1024
-            _peakm = _peak // 1024
-            _heap_mb = _heap // 1024
-            _anon_mb = _anon // 1024
-            _file_mb = _filed // 1024
-            _mi = _membd_mallinfo()
-            if _mi is not None:
-                _g_inuse = _mi['uordblks'] // 10**6
-                _g_free = _mi['fordblks'] // 10**6
-                _g_mmap = _mi['hblkhd'] // 10**6
-            else:
-                _g_inuse = _g_free = _g_mmap = -1
-            _pyrest_mb = max(_anon_mb - max(_g_mmap, 0), 0)
-            _close = _heap_mb + _anon_mb + _file_mb
-            print(f'[MEMBD step {step+1}] peak_rss={_peakm}MB rss={_rssm}MB '
-                  f'| smaps heap={_heap_mb}MB anon={_anon_mb}MB file={_file_mb}MB '
-                  f'(sum={_close}MB={100*_close//max(_rssm,1)}% of rss) '
-                  f'| glibc[inuse={_g_inuse} free={_g_free} mmap={_g_mmap}]MB '
-                  f'pymalloc+torch+numpy(anon-glibcmmap)={_pyrest_mb}MB '
-                  f'| n_beam={len(beam)} n_cand={len(candidates)} '
-                  f'n_cache={len(env._raw_eq_cache)} '
-                  f'n_bt={len(_bt_tabu) if _bt_tabu else 0}',
-                  flush=True)
-
         # Checkpoint (rolling, overwrites)
         if ckpt_path and (step + 1) % ckpt_every == 0:
             with open(ckpt_path, 'wb') as f:
@@ -1751,22 +1059,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 }, f)
             if verbose:
                 print(f'  [ckpt] wrote {ckpt_path} at step {step+1}', flush=True)
-        # KEPT versioned checkpoints every SAILIR_KEEP_CKPT_EVERY steps (not
-        # overwritten) — lets us reconstruct the persistent state at the peak
-        # step after the fact, correlated with the per-step MEMBD peak_rss log.
-        _keep_every = int(os.environ.get('SAILIR_KEEP_CKPT_EVERY', '0'))
-        if ckpt_path and _keep_every > 0 and (step + 1) % _keep_every == 0:
-            _kp = f'{ckpt_path}.keep_step{step + 1:05d}'
-            with open(_kp, 'wb') as f:
-                pickle.dump({
-                    'step': step + 1,
-                    'beam': _serialize_beam_for_ckpt(),
-                    'target_sector': target_sector,
-                    'start_w12': start_w12,
-                    'tabu_dict': _serialize_tabu_for_ckpt(),
-                }, f)
-            if verbose:
-                print(f'  [keep-ckpt] wrote {_kp}', flush=True)
         # Per-step thick checkpoint (for bit-identical incremental verification)
         if ckpt_every_step and ckpt_path:
             step_path = f'{ckpt_path}.step{step + 1:04d}'
@@ -1822,9 +1114,6 @@ def main():
                    help='Comma-separated indices for starting integral')
     p.add_argument('--prime', type=int, default=1009)
     p.add_argument('--beam-width', type=int, default=40)
-    p.add_argument('--top-k', type=int, default=None,
-                   help='Number of model-top actions tried per (parent,target)'
-                        ' per step. Default = beam_width // 2 = 20.')
     p.add_argument('--max-steps', type=int, default=2000)
     p.add_argument('--max-actions', type=int, default=900)
     p.add_argument('--beam-sort', default='mixed')
@@ -1865,7 +1154,7 @@ def main():
                    help='Disable LAZY_RS optimization (apply add_sub_to_resolved '
                         'eagerly for all candidates instead of only survivors). '
                         'Slower; for verification only.')
-    p.add_argument('--model-batch-chunk', type=int, default=8,
+    p.add_argument('--model-batch-chunk', type=int, default=None,
                    help='If set, split the model forward batch into chunks of '
                         'this many rows. Bounds transient activation memory '
                         '(glibc retains free pages from large unchunked '
@@ -1958,7 +1247,6 @@ def main():
         iraws_keep_first=args.iraws_keep_first,
         lazy_rs=args.lazy_rs,
         model_batch_chunk=args.model_batch_chunk,
-        top_k=args.top_k,
     )
 
     print(f'\n== DONE — beam size {len(beam)} ==', flush=True)
@@ -1966,17 +1254,6 @@ def main():
           f'mw={max_w12(best_state.expr, target_sector)} '
           f'path_len={len(best_state.path)} '
           f'score={best_state.score:.4f}', flush=True)
-    # Peak RSS (kernel-tracked, monotonic over the process lifetime).
-    try:
-        with open('/proc/self/status') as _ps:
-            for _line in _ps:
-                if _line.startswith('VmHWM:'):
-                    _peak_kb = int(_line.split()[1])
-                    print(f'peak_rss_kb={_peak_kb} ({_peak_kb // 1024} MB)',
-                          flush=True)
-                    break
-    except OSError:
-        pass
 
     if best_state.n_non_masters == 0:
         print('SUCCESS — active bucket drained (start_int = passenger expansion)', flush=True)

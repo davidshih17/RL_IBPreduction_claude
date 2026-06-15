@@ -397,6 +397,21 @@ def main():
                              'orchestrator loop. Drops any pending jobs (will be '
                              'resubmitted). Use after stopping the orchestrator + '
                              'killing all its workers (condor_rm).')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Round-2 resume: load a PRIOR round\'s cache '
+                             'READ-ONLY from <dir> (uses <dir>/replay_state.pkl '
+                             'if present, else scans <dir>/results/*.pkl), while '
+                             'writing all NEW worker results to --work-dir. The '
+                             'prior dir is never modified. Combine with '
+                             '--reduce-only to re-reduce a specific subset.')
+    parser.add_argument('--reduce-only', type=str, default=None,
+                        help='Path to a text file of integrals (one comma-'
+                             'separated tuple per line). Restrict THIS round to '
+                             'reducing exactly these (plus any genuinely-new '
+                             'descendants): the initial expr is seeded to their '
+                             'sum and they are dropped from the resumed cache so '
+                             'they re-submit. Everything not reachable from this '
+                             'list is never entered into expr (set aside).')
     args = parser.parse_args()
 
     print('='*70)
@@ -480,6 +495,61 @@ def main():
         expr = apply_substitutions(expr, cache, args.prime)
         print(f'[RESUME] Applied substitutions to expr in {time.time()-t_apply:.1f}s; '
               f'|expr|={len(expr)}, |cache|={len(cache)}', flush=True)
+
+    # --resume-from: round-2 mode. Load a PRIOR round's cache read-only; new
+    # results still write to work_dir. Prefer the prior dir's replay_state.pkl
+    # (one fast load) over re-scanning all of results/.
+    if args.resume_from:
+        import glob
+        t_rf = time.time()
+        src = Path(args.resume_from)
+        replay = src / 'replay_state.pkl'
+        if replay.exists():
+            with open(replay, 'rb') as f:
+                st = pickle.load(f)
+            loaded = st['cache'] if (isinstance(st, dict) and 'cache' in st) else st
+            cache.update(loaded)
+            print(f'[RESUME-FROM] Loaded {len(loaded)} cache entries from '
+                  f'{replay} in {time.time()-t_rf:.1f}s', flush=True)
+        else:
+            results_dir = src / 'results'
+            pkl_files = [p for p in sorted(glob.glob(str(results_dir / '*.pkl')))
+                         if not p.endswith('.checkpoint')]
+            print(f'[RESUME-FROM] Scanning {len(pkl_files)} pickles from '
+                  f'{results_dir} ...', flush=True)
+            for pf in pkl_files:
+                try:
+                    with open(pf, 'rb') as f:
+                        r = pickle.load(f)
+                except Exception:
+                    continue
+                integ = r.get('original_integral')
+                if integ is None:
+                    continue
+                if r.get('success'):
+                    cache[integ] = r.get('final_expr', r.get('expr', {integ: 1}))
+                else:
+                    cache[integ] = {integ: 1}
+            print(f'[RESUME-FROM] Loaded {len(cache)} cache entries in '
+                  f'{time.time()-t_rf:.1f}s', flush=True)
+        expr = apply_substitutions(expr, cache, args.prime)
+
+    # --reduce-only: restrict this round to a target list. Seed expr to their
+    # sum and drop them from the (resumed) cache so they re-submit; anything not
+    # reachable from them never enters expr and is thus set aside.
+    if args.reduce_only:
+        targets = []
+        with open(args.reduce_only) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    targets.append(tuple(int(x) for x in line.split(',')))
+        for ig in targets:
+            cache.pop(ig, None)
+        expr = apply_substitutions({ig: 1 for ig in targets}, cache, args.prime)
+        print(f'[REDUCE-ONLY] {len(targets)} targets; dropped from cache and '
+              f'seeded expr; |expr|={len(expr)}, |cache|={len(cache)}', flush=True)
+
     # integral -> path of its most-recent worker's .checkpoint file. Persists
     # across pending lifecycle (does NOT get cleared by obsolete-cancel) so a
     # re-entering straggler integral can resume from its last saved beam state.
