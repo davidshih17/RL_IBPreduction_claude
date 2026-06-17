@@ -220,24 +220,28 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
                 integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
                 eq[integral] = c
         return eq
-    # mod-lower-weight: strip by weight BEFORE the expensive eval_coeff. The
-    # integral weight (w1,w2)=(sum positive, -sum negative) needs only seed+shift,
-    # so a sub-weight term is dropped WITHOUT paying eval_coeff for the ~28% we
-    # discard — this makes stripping a net SPEEDUP vs the full path, not a cost.
+    # mod-lower-weight: strip by weight BEFORE the expensive eval_coeff AND
+    # before building the integral tuple. The weight (w1,w2)=(sum positive,
+    # -sum negative) is computed inline from seed+shift, so a sub-weight term is
+    # dropped without paying eval_coeff AND without ever allocating its integral
+    # tuple. This avoids transient-garbage tuples (the ~28% stripped terms) that
+    # would otherwise fragment the glibc heap and inflate peak_rss. The tuple is
+    # built ONLY for terms we keep. Net SPEEDUP and lower memory vs the full path.
     m0, m1 = min_w12
     for shift, coeff_str in template:
-        integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
         w0 = 0
         w1 = 0
-        for x in integral:
-            if x > 0:
-                w0 += x
-            elif x < 0:
-                w1 -= x
+        for i in range(N_INDICES):
+            v = seed[i] + shift[i]
+            if v > 0:
+                w0 += v
+            elif v < 0:
+                w1 -= v
         if w0 < m0 or (w0 == m0 and w1 < m1):
             continue
         c = eval_coeff(coeff_str, seed)
         if c != 0:
+            integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
             eq[integral] = c
     return eq
 
