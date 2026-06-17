@@ -194,10 +194,17 @@ def eval_coeff(coeff_str, seed):
         return 0
 
 
-def get_raw_equation(ibp_t, li_t, ibp_op, seed):
+def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
     """Get raw IBP equation for given operator and seed.
 
     Action indices: 0..n_ibp-1 are IBP, n_ibp..n_ibp+n_li-1 are LI.
+
+    min_w12: if not None, terms whose weight (w1,w2) < min_w12 are NEVER
+        generated (mod-lower-weight build). Each template term is independent
+        (integral = seed+shift, coeff = eval_coeff(seed)), so skipping a
+        sub-weight term cannot affect any surviving term — bit-identical to
+        building the full dict and stripping after, but with zero extra
+        allocation/free churn. Default None => full equation (replay path).
     """
     n_ibp = len(ibp_t)
     if ibp_op >= n_ibp:
@@ -205,10 +212,32 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed):
     else:
         template = ibp_t.get(ibp_op, [])
     eq = {}
+    if min_w12 is None:
+        # full equation — unchanged hot path (no per-term weight work).
+        for shift, coeff_str in template:
+            c = eval_coeff(coeff_str, seed)
+            if c != 0:
+                integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
+                eq[integral] = c
+        return eq
+    # mod-lower-weight: strip by weight BEFORE the expensive eval_coeff. The
+    # integral weight (w1,w2)=(sum positive, -sum negative) needs only seed+shift,
+    # so a sub-weight term is dropped WITHOUT paying eval_coeff for the ~28% we
+    # discard — this makes stripping a net SPEEDUP vs the full path, not a cost.
+    m0, m1 = min_w12
     for shift, coeff_str in template:
+        integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
+        w0 = 0
+        w1 = 0
+        for x in integral:
+            if x > 0:
+                w0 += x
+            elif x < 0:
+                w1 -= x
+        if w0 < m0 or (w0 == m0 and w1 < m1):
+            continue
         c = eval_coeff(coeff_str, seed)
         if c != 0:
-            integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
             eq[integral] = c
     return eq
 
@@ -635,6 +664,30 @@ def is_higher_sector(i):
 
 def weight(i):
     return (sum(max(0, x) for x in i), -sum(min(0, x) for x in i), tuple(abs(x) for x in i))
+
+
+# --- optional active-weight stripping of CACHED raw equations (v7 search) ---
+# When set (beam_search_v7 calls set_raw_strip_threshold(start_w12) at run start),
+# the CACHED raw accessors (get_raw_equation_cached + packed_cu._get_raw_cached)
+# pass this threshold as get_raw_equation(..., min_w12=thr), so sub-weight terms
+# are NEVER generated: the cu is built mod-lower-weight and the raw cache holds
+# only the terms the search uses, with zero extra alloc/free churn (no full dict
+# is ever materialised then stripped). The sub-weight spillover is recovered
+# separately by replay, which calls get_raw_equation with the default min_w12=None
+# (full equation). Opt-in: None => no stripping (v6 baseline unchanged).
+_RAW_STRIP_W12 = None
+
+
+def set_raw_strip_threshold(w12):
+    """Enable mod-lower-weight raw generation below (w1,w2) >= w12 for the CACHED
+    accessors. Must be set BEFORE any raw is cached (run start, before search)."""
+    global _RAW_STRIP_W12
+    _RAW_STRIP_W12 = tuple(w12) if w12 is not None else None
+
+
+def get_raw_strip_threshold():
+    """Current cached-raw strip threshold (w1,w2), or None if disabled."""
+    return _RAW_STRIP_W12
 
 
 def filter_top_sector(expr):
@@ -2430,10 +2483,13 @@ class IBPEnvironment:
             self._raw_eq_cache = _LRURawEqCache()
 
     def get_raw_equation_cached(self, ibp_op, seed):
-        """Cached version of get_raw_equation."""
+        """Cached version of get_raw_equation. Cached value is generated
+        mod-lower-weight when a strip threshold is set (v7 search); replay must
+        use the UNSTRIPPED get_raw_equation directly (default min_w12=None)."""
         key = (ibp_op, seed)
         if key not in self._raw_eq_cache:
-            self._raw_eq_cache[key] = get_raw_equation(self.ibp_t, self.li_t, ibp_op, seed)
+            self._raw_eq_cache[key] = get_raw_equation(
+                self.ibp_t, self.li_t, ibp_op, seed, min_w12=_RAW_STRIP_W12)
         return self._raw_eq_cache[key]
 
     def get_valid_actions_cached(self, target, subs, filter_mode='subsector'):

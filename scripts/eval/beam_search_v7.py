@@ -1813,9 +1813,18 @@ def replay_full_expr(start_expr, path, env):
     """
     expr = dict(start_expr)
     subs = {}  # raw subs for replay
+    # UNSTRIPPED raws for replay: the search's env._raw_eq_cache may hold
+    # sub-weight-STRIPPED raws (mod-lower-weight), which would give an incomplete
+    # final_expr. Replay needs the FULL raws, so recompute them into a small
+    # local cache (just the path's ~len(path) raws), independent of the search.
+    _full_raw_cache = {}
     for (target, ibp_op, delta) in path:
         seed = tuple(target[i] + delta[i] for i in range(ibp_env.N_INDICES))
-        raw = env.get_raw_equation_cached(ibp_op, seed)
+        _rk = (ibp_op, seed)
+        raw = _full_raw_cache.get(_rk)
+        if raw is None:
+            raw = ibp_env.get_raw_equation(env.ibp_t, env.li_t, ibp_op, seed)
+            _full_raw_cache[_rk] = raw
         # Apply current subs to raw to get cached
         from sailir.ibp_env import apply_all_substitutions
         cached = apply_all_substitutions(raw, subs)
@@ -1958,6 +1967,12 @@ def main():
     start_w12 = (start_w[0], start_w[1])
     print(f'  start integral weight = {start_w}', flush=True)
     print(f'  active threshold      = (w1,w2) >= {start_w12}', flush=True)
+    # Strip sub-weight from the CACHED raws used by the search (cu built mod-
+    # lower-weight). Must be BEFORE any raw is cached. Replay uses the unstripped
+    # get_raw_equation, so final_expr is unaffected. SAILIR_STRIP_RAWS=0 disables.
+    if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0':
+        ibp_env.set_raw_strip_threshold(start_w12)
+        print(f'  raw-strip: cached raws stripped to (w1,w2) >= {start_w12}', flush=True)
 
     target_sector = tuple(get_sector_mask(start_int))
     print(f'  target_sector = {target_sector}', flush=True)

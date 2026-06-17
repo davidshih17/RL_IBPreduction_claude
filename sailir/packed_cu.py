@@ -109,7 +109,9 @@ def compute_indirect_substituted_incremental_packed(
     def _get_raw_cached(ibp_op, seed):
         key = (ibp_op, seed)
         if key not in raw_eq_cache:
-            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+            raw_eq_cache[key] = get_raw_equation(
+                ibp_t, li_t, ibp_op, seed,
+                min_w12=ibp_env.get_raw_strip_threshold())
         return raw_eq_cache[key]
 
     if new_sub_int in sub_cache:
@@ -187,6 +189,7 @@ def enumerate_valid_actions_with_indirect_cache_packed(
     as the dict version.
     """
     import numpy as _np
+    import sailir.ibp_env as _ibp_env
     from sailir.ibp_env import (
         get_raw_equation, apply_resolved_subs, cached_union_bitmask,
         sector_bitmask, action_introduces_outside_sector,
@@ -207,7 +210,9 @@ def enumerate_valid_actions_with_indirect_cache_packed(
     def _get_raw_cached(ibp_op, seed):
         key = (ibp_op, seed)
         if key not in raw_eq_cache:
-            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+            raw_eq_cache[key] = get_raw_equation(
+                ibp_t, li_t, ibp_op, seed,
+                min_w12=_ibp_env.get_raw_strip_threshold())
         return raw_eq_cache[key]
 
     valid = []
