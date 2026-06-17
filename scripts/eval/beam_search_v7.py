@@ -64,13 +64,12 @@ def _aux_to_result(aux_flat, env):
         seed = tuple(sub_int[i] - shift[i] for i in range(n_indices))
         raw = env.get_raw_equation_cached(ibp_op, seed)
         idx = raw_id_to_idx[(ibp_op, seed)]
-        cached = cached_unique[idx]
-        # v7: cu entries are PackedEq — convert to dict at the consumption
-        # boundary so enumerate/solve stay on the verified dict path. Transient
-        # (one state at a time); the persistent aux stays packed.
-        if isinstance(cached, PackedEq):
-            cached = cached.to_dict(_V7_REGISTRY)
-        result.append((sub_int, ibp_op, shift, raw, cached, union_bms[idx]))
+        # v7 Stage 2b: cu entries stay PackedEq in the result — the packed
+        # enumerate consumes them directly (id-membership searchsorted), so NO
+        # dict conversion here (that per-step transient is what capped the
+        # memory win and cost the time).
+        result.append((sub_int, ibp_op, shift, raw,
+                       cached_unique[idx], union_bms[idx]))
     return result
 
 
@@ -310,8 +309,19 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     """
     n_idx = ibp_env.N_INDICES
     seed = tuple(target[i] + delta[i] for i in range(n_idx))
-    raw = env.get_raw_equation_cached(ibp_op, seed)
-    cached = apply_resolved_subs(raw, state.resolved_subs)
+    # v7 Stage 2b: REUSE the already-resolved cu entry when present (indirect
+    # actions). compute_indirect's invariant (target_sector=None, entry not
+    # pruned): cu[(ibp_op,seed)] == apply_resolved_subs(raw, resolved_subs), so
+    # this is bit-identical and skips the re-resolution that grows with
+    # |resolved_subs|. Falls back to recompute on a cu miss (direct/pruned).
+    cached = None
+    if state.aux_flat is not None:
+        _idx = state.aux_flat[2].get((ibp_op, seed))
+        if _idx is not None:
+            cached = _v7_as_dict(state.aux_flat[0][_idx])
+    if cached is None:
+        raw = env.get_raw_equation_cached(ibp_op, seed)
+        cached = apply_resolved_subs(raw, state.resolved_subs)
     if target not in cached or cached[target] == 0:
         return None
     sol = solve_ibp_for(cached, target)
@@ -525,6 +535,12 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     if resume_from is not None and os.path.exists(resume_from):
         with open(resume_from, 'rb') as f:
             d = pickle.load(f)
+            if isinstance(d, dict) and d.get('_streamed'):
+                # streamed checkpoint: meta dict, then n_states state-dicts as
+                # independent pickle frames (see _stream_dump_ckpt).
+                _n = d['n_states']
+                d = dict(d)
+                d['beam'] = [pickle.load(f) for _ in range(_n)]
         resume_step = d['step']
         beam = []
         # Convert saved aux from picklable (op, seed)-keyed form back to id()-
@@ -1058,10 +1074,10 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 _ct['rs_max'] = max(_ct['rs_max'], len(s.resolved_subs))
             for target in tied:
                 _t = time.time() if _v5_prof else 0
-                valid = enumerate_valid_actions_with_indirect_cache(
-                    target, indirect_cache, dummy_subs, s.resolved_subs,
+                valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
+                    target, indirect_cache, s.resolved_subs,
                     env.ibp_t, env.li_t, env.shifts, 'subsector',
-                    env._raw_eq_cache,
+                    env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                 )
                 if _v5_prof:
                     _p1['gv'] += time.time() - _t
@@ -1147,10 +1163,10 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     rid_p = s.aux_flat[2]
                     N_ = ibp_env.N_INDICES
                     for tgt in tied:
-                        raw_valid = enumerate_valid_actions_with_indirect_cache(
-                            tgt, ic, dummy_subs, s.resolved_subs,
+                        raw_valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
+                            tgt, ic, s.resolved_subs,
                             env.ibp_t, env.li_t, env.shifts, 'subsector',
-                            env._raw_eq_cache,
+                            env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                         )
                         unblocked = []
                         for (op, dlt) in raw_valid:
@@ -1293,10 +1309,10 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         _hist_p = (_sol_history.get(expr_fp_)
                                     if _sol_history is not None else None)
                         for tgt in tied:
-                            raw_valid = enumerate_valid_actions_with_indirect_cache(
-                                tgt, ic, dummy_subs, st.resolved_subs,
+                            raw_valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
+                                tgt, ic, st.resolved_subs,
                                 env.ibp_t, env.li_t, env.shifts, 'subsector',
-                                env._raw_eq_cache,
+                                env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                             )
                             filtered = ([(op, dlt) for (op, dlt) in raw_valid
                                           if (tgt, op, dlt) not in ts_]
@@ -1658,14 +1674,34 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                           f' = {list(_big.items())[:4]}', flush=True)
                 print(f'  rid[:3] = {list(_rid.items())[:3]}', flush=True)
 
-        def _serialize_beam_for_ckpt():
-            out = []
-            for s in beam:
-                sd = s._asdict()
-                if sd.get('aux_flat') is not None:
-                    sd['aux_flat'] = _aux_to_picklable(sd['aux_flat'])
-                out.append(sd)
-            return out
+        def _stream_dump_ckpt(path):
+            # Stream the checkpoint ONE beam-state at a time so each state's
+            # to_dict-materialized cu is freed before the next. memray showed
+            # the whole-beam to_dict (was _serialize_beam_for_ckpt) at 5.2GB /
+            # 59% of peak — the entire beam's packed cu materialized as dicts
+            # simultaneously. Each state is an INDEPENDENT pickle frame (fresh
+            # memo per pickle.dump) so `del sd` actually frees it; a single
+            # shared Pickler would pin every object in its memo and save
+            # nothing. Format: a meta dict (_streamed=True, n_states) then
+            # n_states state-dicts in one file; the resume path detects
+            # _streamed and reads n_states frames. Serialization-only change:
+            # the live beam is untouched (s._asdict() + _aux_to_picklable both
+            # create fresh objects), so trajectory/result stay bit-identical.
+            with open(path, 'wb') as f:
+                pickle.dump({
+                    '_streamed': True,
+                    'step': step + 1,
+                    'n_states': len(beam),
+                    'target_sector': target_sector,
+                    'start_w12': start_w12,
+                    'tabu_dict': _serialize_tabu_for_ckpt(),
+                }, f)
+                for s in beam:
+                    sd = s._asdict()
+                    if sd.get('aux_flat') is not None:
+                        sd['aux_flat'] = _aux_to_picklable(sd['aux_flat'])
+                    pickle.dump(sd, f)
+                    del sd
 
         def _serialize_tabu_for_ckpt():
             # Convert {frozenset(expr_items): set((target, op, delta), ...)} to
@@ -1758,16 +1794,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f'n_bt={len(_bt_tabu) if _bt_tabu else 0}',
                   flush=True)
 
-        # Checkpoint (rolling, overwrites)
+        # Checkpoint (rolling, overwrites) — streamed one state at a time.
         if ckpt_path and (step + 1) % ckpt_every == 0:
-            with open(ckpt_path, 'wb') as f:
-                pickle.dump({
-                    'step': step + 1,
-                    'beam': _serialize_beam_for_ckpt(),
-                    'target_sector': target_sector,
-                    'start_w12': start_w12,
-                    'tabu_dict': _serialize_tabu_for_ckpt(),
-                }, f)
+            _stream_dump_ckpt(ckpt_path)
             if verbose:
                 print(f'  [ckpt] wrote {ckpt_path} at step {step+1}', flush=True)
         # KEPT versioned checkpoints every SAILIR_KEEP_CKPT_EVERY steps (not
@@ -1776,27 +1805,13 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         _keep_every = int(os.environ.get('SAILIR_KEEP_CKPT_EVERY', '0'))
         if ckpt_path and _keep_every > 0 and (step + 1) % _keep_every == 0:
             _kp = f'{ckpt_path}.keep_step{step + 1:05d}'
-            with open(_kp, 'wb') as f:
-                pickle.dump({
-                    'step': step + 1,
-                    'beam': _serialize_beam_for_ckpt(),
-                    'target_sector': target_sector,
-                    'start_w12': start_w12,
-                    'tabu_dict': _serialize_tabu_for_ckpt(),
-                }, f)
+            _stream_dump_ckpt(_kp)
             if verbose:
                 print(f'  [keep-ckpt] wrote {_kp}', flush=True)
         # Per-step thick checkpoint (for bit-identical incremental verification)
         if ckpt_every_step and ckpt_path:
             step_path = f'{ckpt_path}.step{step + 1:04d}'
-            with open(step_path, 'wb') as f:
-                pickle.dump({
-                    'step': step + 1,
-                    'beam': _serialize_beam_for_ckpt(),
-                    'target_sector': target_sector,
-                    'start_w12': start_w12,
-                    'tabu_dict': _serialize_tabu_for_ckpt(),
-                }, f)
+            _stream_dump_ckpt(step_path)
 
     return beam, best_state
 

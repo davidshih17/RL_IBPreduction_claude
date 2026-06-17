@@ -46,7 +46,6 @@ def main():
     rc_dict = {}
     rc_pack = {}
     reg = IntegralRegistry()
-    packed_rs_cache = {}
 
     dict_aux = ([], [], {}, [])
     pack_aux = ([], [], {}, [])
@@ -88,7 +87,7 @@ def main():
         _res_p, pack_aux = compute_indirect_substituted_incremental_packed(
             pack_aux, new_sub_int, new_resolved_sol, resolved_subs,
             ibp_t, li_t, shifts, rc_pack,
-            reg, packed_rs_cache, PRIME, N, ibp_env,
+            reg, PRIME, N, ibp_env,
             ibp_env.get_raw_equation, target_sector=None)
 
         d_cu, d_ubm, d_rid, d_iraws = dict_aux
@@ -104,8 +103,25 @@ def main():
         assert p_rid == d_rid, f"step {step}: rid mismatch"
         assert p_iraws == d_iraws, f"step {step}: iraws mismatch"
 
+        # Stage 2b: packed enumerate == dict enumerate on several targets
+        n_enum = 0
+        if d_cu:
+            from sailir.packed_cu import (
+                enumerate_valid_actions_with_indirect_cache_packed as enum_packed)
+            for tg in list(cu_integrals(d_cu))[:6]:
+                dv = ibp_env.enumerate_valid_actions_with_indirect_cache(
+                    tg, _res_d, None, resolved_subs, ibp_t, li_t, shifts,
+                    'subsector', rc_dict)
+                pv = enum_packed(
+                    tg, _res_p, resolved_subs, ibp_t, li_t, shifts,
+                    'subsector', rc_pack, reg, N)
+                assert dv == pv, (
+                    f"step {step} ENUMERATE mismatch target {tg}\n"
+                    f" dict={dv}\n pack={pv}")
+                n_enum += 1
+
         print(f"step {step:2d}: sub={new_sub_int[:4]}... "
-              f"|cu|={len(d_cu)} |iraws|={len(d_iraws)} OK")
+              f"|cu|={len(d_cu)} |iraws|={len(d_iraws)} enum_ok={n_enum} OK")
 
     print(f"\nPASS: packed compute_indirect == dict over {n_steps} steps "
           f"(cu/ubm/rid/iraws all bit-identical). registry={len(reg)}")

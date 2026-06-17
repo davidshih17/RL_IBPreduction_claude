@@ -171,6 +171,90 @@ def compute_indirect_substituted_incremental_packed(
     return result, (new_cu, new_ubm, new_rid, new_iraws)
 
 
+def enumerate_valid_actions_with_indirect_cache_packed(
+        target, indirect_cache, resolved_subs, ibp_t, li_t, shifts,
+        filter_mode, raw_eq_cache, reg, N_INDICES):
+    """Packed-cu equivalent of
+    ibp_env.enumerate_valid_actions_with_indirect_cache.
+
+    indirect_cache entries are (sub_int, ibp_op, shift, raw_DICT, cached_PACKED,
+    union_bm). Phase 1a (direct) is UNCHANGED (raws are dicts). Phase 1b's
+    membership `target in cached and cached[target] != 0` becomes
+    `target_id in cached.ids` (binary search) — NO dict materialization, so the
+    cu stays packed the whole way (this is what removes the convert-at-boundary
+    transient + overhead). PackedEq never stores zero coeffs, so id-membership
+    is exactly equivalent. Returns the SAME valid-action list (order included)
+    as the dict version.
+    """
+    import numpy as _np
+    from sailir.ibp_env import (
+        get_raw_equation, apply_resolved_subs, cached_union_bitmask,
+        sector_bitmask, action_introduces_outside_sector,
+        action_introduces_higher_sector_general)
+
+    if filter_mode == 'subsector':
+        should_filter = action_introduces_outside_sector
+    elif filter_mode == 'higher_only':
+        should_filter = action_introduces_higher_sector_general
+    elif filter_mode == 'none':
+        should_filter = None
+    else:
+        raise ValueError(f"Unknown filter_mode: {filter_mode}")
+    fast_subsector_filter = (filter_mode == 'subsector')
+    target_bm = sector_bitmask(target) if fast_subsector_filter else None
+    not_target_bm = (~target_bm) if fast_subsector_filter else None
+
+    def _get_raw_cached(ibp_op, seed):
+        key = (ibp_op, seed)
+        if key not in raw_eq_cache:
+            raw_eq_cache[key] = get_raw_equation(ibp_t, li_t, ibp_op, seed)
+        return raw_eq_cache[key]
+
+    valid = []
+    seen = set()
+
+    # Phase 1a: direct actions (dict raws — unchanged from the dict version)
+    for ibp_op, shift_list in shifts.items():
+        for shift in shift_list:
+            seed = tuple(target[i] - shift[i] for i in range(N_INDICES))
+            raw = _get_raw_cached(ibp_op, seed)
+            if target not in raw or raw[target] == 0:
+                continue
+            cached = apply_resolved_subs(raw, resolved_subs)
+            if target not in cached or cached[target] == 0:
+                continue
+            if fast_subsector_filter:
+                if (cached_union_bitmask(cached) & not_target_bm) != 0:
+                    continue
+            elif should_filter is not None and should_filter(cached, target):
+                continue
+            delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
+            if (ibp_op, delta) not in seen:
+                seen.add((ibp_op, delta))
+                valid.append((ibp_op, delta))
+
+    # Phase 1b: indirect cache (PACKED cached — id-membership, no dict)
+    target_id = reg.get_id(target)
+    for sub_int, ibp_op, shift, raw, cached, union_bm in indirect_cache:
+        if target in raw and raw[target] != 0:
+            continue
+        ids = cached.ids
+        pos = _np.searchsorted(ids, target_id)
+        if pos >= len(ids) or ids[pos] != target_id:
+            continue                       # target not in cached
+        if fast_subsector_filter:
+            if (union_bm & not_target_bm) != 0:
+                continue
+        elif should_filter is not None and should_filter(cached.to_dict(reg), target):
+            continue                       # rare non-subsector path only
+        seed = tuple(sub_int[i] - shift[i] for i in range(N_INDICES))
+        delta = tuple(seed[i] - target[i] for i in range(N_INDICES))
+        if (ibp_op, delta) not in seen:
+            seen.add((ibp_op, delta))
+            valid.append((ibp_op, delta))
+    return valid
+
+
 def _resolve_packed(praw, raw_dict, resolved_subs, reg, packed_rs_cache, prime):
     """apply_resolved_subs on a packed raw, converting only the subs that appear.
 
