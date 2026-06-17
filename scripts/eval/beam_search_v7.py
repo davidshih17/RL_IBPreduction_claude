@@ -178,7 +178,7 @@ def _v7_as_dict(eq):
 
 State_v5 = namedtuple(
     'State_v5',
-    ['expr', 'resolved_subs', 'sub_accum',
+    ['expr', 'resolved_subs',
      'score', 'path', 'n_non_masters',
      'max_w12', 'total_w12',  # cached sort keys, computed once at construction
      'aux_flat'],  # (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
@@ -206,45 +206,35 @@ def strip_passenger(d, start_w12):
 # v5 substitution math (Option F + weight strip)
 # ============================================================================
 
-def apply_substitution_v5(expr_t, sub_accum, sub_int, sol,
-                          target_sector, start_w12):
-    """Apply substitution; route results by (sector, weight):
+def apply_substitution_v5(expr_t, sub_int, sol, target_sector, start_w12):
+    """Apply substitution, keeping ONLY active target-sector terms in expr:
       - active target-sector terms → new_expr_t
-      - passenger target-sector terms (below start_w) → discarded (recovered
-        by replay; their cumulative effect on the final expression is exactly
-        what the path encodes)
-      - sub-sector terms → new_sub_accum (Option F)
+      - passenger target-sector terms (below start_w) → discarded
+      - sub-sector terms → discarded
+    All discarded (sub-weight + sub-sector) spillover is recovered by
+    replay_full_expr at the end (the worker's final_expr), so nothing needs to
+    be accumulated here. (Removed the old sub_accum / Option-F bucket: it was
+    write-only and redundant with replay.)
     """
     if sub_int not in expr_t:
-        return expr_t, sub_accum
+        return expr_t
     coeff = expr_t[sub_int]
     new_expr_t = {k: v for k, v in expr_t.items() if k != sub_int}
-    new_sub_accum = dict(sub_accum) if sub_accum else {}
     nd = ibp_env.N_DENOMINATORS
     for integral, sub_coeff in sol.items():
         new_coeff = (coeff * sub_coeff) % ibp_env.PRIME
         if new_coeff == 0:
             continue
-        # Sector check
+        # Sub-sector spillover -> discarded (recovered by replay)
         in_target_sector = True
         for i in range(nd):
             if (1 if integral[i] > 0 else 0) != target_sector[i]:
                 in_target_sector = False
                 break
         if not in_target_sector:
-            # passenger sub-sector — accumulate
-            if integral in new_sub_accum:
-                s = (new_sub_accum[integral] + new_coeff) % ibp_env.PRIME
-                if s == 0:
-                    del new_sub_accum[integral]
-                else:
-                    new_sub_accum[integral] = s
-            else:
-                new_sub_accum[integral] = new_coeff
             continue
-        # Target-sector — check weight
+        # Target-sector passenger (lower weight) -> discarded (recovered by replay)
         if not is_active(integral, start_w12):
-            # passenger lower-weight in target sector — DISCARDED from active beam
             continue
         if integral in new_expr_t:
             s = (new_expr_t[integral] + new_coeff) % ibp_env.PRIME
@@ -254,7 +244,7 @@ def apply_substitution_v5(expr_t, sub_accum, sub_int, sol,
                 new_expr_t[integral] = s
         else:
             new_expr_t[integral] = new_coeff
-    return new_expr_t, new_sub_accum
+    return new_expr_t
 
 
 def add_sub_to_resolved_v5(resolved_subs, target, sol, start_w12):
@@ -327,8 +317,8 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     sol = solve_ibp_for(cached, target)
     if sol is None:
         return None
-    new_expr, new_sub_accum = apply_substitution_v5(
-        state.expr, state.sub_accum, target, sol, target_sector, start_w12,
+    new_expr = apply_substitution_v5(
+        state.expr, target, sol, target_sector, start_w12,
     )
 
     if lazy_rs:
@@ -351,7 +341,6 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     child = State_v5(
         expr=new_expr,
         resolved_subs=new_rs,
-        sub_accum=new_sub_accum,
         score=new_score,
         path=new_path,
         n_non_masters=len(nm),
@@ -563,6 +552,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 else:
                     s['max_w12'] = (0, 0)
                     s['total_w12'] = (0, 0)
+            s.pop('sub_accum', None)   # tolerate pre-removal checkpoints
             beam.append(State_v5(**s))
         if verbose:
             print(f'[v6 RESUME] loaded {len(beam)} beam states from step '
@@ -579,7 +569,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         initial = State_v5(
             expr=dict(start_expr),
             resolved_subs={},
-            sub_accum={},
             score=0.0,
             path=[],
             n_non_masters=len(initial_nm),
@@ -1261,8 +1250,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                                 'expr': dict(st.expr),
                                 'resolved_subs': (dict(st.resolved_subs)
                                                    if st.resolved_subs else None),
-                                'sub_accum': (dict(st.sub_accum)
-                                              if st.sub_accum else None),
                                 'path': list(st.path) if st.path else [],
                                 'score': float(st.score),
                                 'max_w12': tuple(st.max_w12),
