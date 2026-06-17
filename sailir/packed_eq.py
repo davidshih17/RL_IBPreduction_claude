@@ -19,6 +19,13 @@ testable in isolation. See memory: project-sailir-v7-packed-representation.
 """
 import numpy as np
 
+# Optional nogil C kernel for substitute_one (built via _setup_cython.py).
+# Falls back to the numpy version below when the .so is absent.
+try:
+    from _packed_kernels import substitute_one_merge as _SUB_MERGE_CY
+except ImportError:
+    _SUB_MERGE_CY = None
+
 
 class IntegralRegistry:
     """Interns integral tuples <-> dense int32 ids. One instance per env.
@@ -130,6 +137,16 @@ def substitute_one(eq, sub_id, rep_ids, rep_coeffs, prime):
     rep_ids: int array of replacement integral ids; rep_coeffs: int array of
     replacement coeffs (already reduced mod prime).
     """
+    if _SUB_MERGE_CY is not None:
+        # nogil sorted-merge kernel. eq.ids/coeffs are contiguous int32/int16
+        # (PackedEq invariant); rep arrays coerced to int32/int64 contiguous.
+        res = _SUB_MERGE_CY(
+            eq.ids, eq.coeffs, int(sub_id),
+            np.ascontiguousarray(rep_ids, dtype=np.int32),
+            np.ascontiguousarray(rep_coeffs, dtype=np.int64), prime)
+        if res is None:
+            return eq                   # sub_id absent -> unchanged
+        return PackedEq(res[0], res[1])
     pos = int(np.searchsorted(eq.ids, sub_id))
     if pos >= len(eq.ids) or eq.ids[pos] != sub_id:
         return eq                       # sub_id not present -> unchanged

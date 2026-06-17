@@ -9,7 +9,8 @@ setup(
     ext_modules=cythonize(
         ['sailir/_add_sub_inner.pyx',
          'sailir/_enumerate_inner.pyx',
-         'sailir/_cic_inner.pyx'],
+         'sailir/_cic_inner.pyx',
+         'sailir/_packed_kernels.pyx'],
         language_level=3,
     ),
     zip_safe=False,
