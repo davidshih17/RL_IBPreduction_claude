@@ -81,6 +81,38 @@ def add_sub_to_resolved_packed(rs_packed, target, sol, reg, active_id, prime):
     return new_resolved
 
 
+def apply_resolved_subs_dict_x_packed(expr, rs_packed, reg, prime):
+    """dict expr  x  {sub_int: PackedEq} resolved_subs  ->  dict.
+
+    Bit-identical to ibp_env.apply_resolved_subs(expr, {sub_int: dict}): same
+    single pass (rs solutions never contain sub-keys), same key-expansion order
+    (`[k for k in expr if k in rs]`), same zero-drop filter. Within a solution
+    the accumulation order differs (packed ids are sorted) but += mod prime is
+    order-independent, so the result dict is identical.
+
+    Used where a DICT raw must be resolved against the packed State.resolved_subs
+    (enumerate Phase 1a + the apply_action cu-miss fallback).
+    """
+    if not rs_packed:
+        return dict(expr)
+    result = dict(expr)
+    keys_to_expand = [k for k in result if k in rs_packed]
+    for sub_int in keys_to_expand:
+        if sub_int in result and result[sub_int] != 0:
+            coeff = result.pop(sub_int)
+            sol = rs_packed[sub_int]            # PackedEq
+            ids = sol.ids
+            coeffs = sol.coeffs
+            for j in range(len(ids)):
+                k = reg.get_tuple(int(ids[j]))
+                new_coeff = (coeff * int(coeffs[j])) % prime
+                if k in result:
+                    result[k] = (result[k] + new_coeff) % prime
+                else:
+                    result[k] = new_coeff
+    return {k: v for k, v in result.items() if v != 0}
+
+
 def to_dict_view(rs_packed, reg):
     """{sub_int: {integral: coeff}} reconstruction for verification."""
     return {k: v.to_dict(reg) for k, v in rs_packed.items()}
