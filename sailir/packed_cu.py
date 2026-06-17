@@ -26,22 +26,29 @@ import numpy as np
 from .packed_eq import PackedEq, substitute_one, apply_resolved_subs, union_bitmask
 
 
-def _get_packed_sub(sub_int, sol_dict, reg, packed_rs_cache):
-    """Return (sol_ids:int32, sol_coeffs:int64) for a sub solution, caching by
-    sub_int. sol_dict is the dict {integral: coeff}; safe to cache because
-    resolved_subs values are immutable once produced (COW in add_sub_to_resolved).
+def _get_packed_sub(sub_int, sol, reg, packed_rs_cache):
+    """Return (sol_ids:int32, sol_coeffs) for a sub solution, caching by sub_int.
+
+    `sol` is either a dict {integral: coeff} (dict resolved_subs) OR a PackedEq
+    (packed resolved_subs, Stage 3b) — detected by the `ids` attribute. When it
+    is already a PackedEq we reuse its arrays directly (no dict->packed repack;
+    int16 coeffs are upcast by the GF kernels, verified in test_packed_rs_ops).
+    Safe to cache because resolved_subs values are immutable once produced (COW
+    in add_sub_to_resolved).
     """
     cached = packed_rs_cache.get(sub_int)
     if cached is not None:
         return cached
-    if sol_dict:
-        ids = np.fromiter((reg.get_id(k) for k in sol_dict), np.int32, len(sol_dict))
-        coeffs = np.fromiter((sol_dict[k] for k in sol_dict), np.int64, len(sol_dict))
+    if hasattr(sol, 'ids'):                 # already a PackedEq
+        result = (sol.ids, sol.coeffs)
+    elif sol:                               # dict {integral: coeff}
+        ids = np.fromiter((reg.get_id(k) for k in sol), np.int32, len(sol))
+        coeffs = np.fromiter((sol[k] for k in sol), np.int64, len(sol))
+        result = (ids, coeffs)
     else:
-        ids = np.empty(0, np.int32)
-        coeffs = np.empty(0, np.int64)
-    packed_rs_cache[sub_int] = (ids, coeffs)
-    return ids, coeffs
+        result = (np.empty(0, np.int32), np.empty(0, np.int64))
+    packed_rs_cache[sub_int] = result
+    return result
 
 
 def _sector_propagator_bm_from(ibp_env, target_sector):
@@ -194,6 +201,11 @@ def enumerate_valid_actions_with_indirect_cache_packed(
         get_raw_equation, apply_resolved_subs, cached_union_bitmask,
         sector_bitmask, action_introduces_outside_sector,
         action_introduces_higher_sector_general)
+    from sailir.packed_rs_ops import apply_resolved_subs_dict_x_packed
+    # packed resolved_subs (Stage 3b) carry PackedEq values; the dict-raw Phase-1a
+    # resolution then needs the dict x packed helper instead of dict x dict.
+    _rs_packed = bool(resolved_subs) and hasattr(
+        next(iter(resolved_subs.values())), 'ids')
 
     if filter_mode == 'subsector':
         should_filter = action_introduces_outside_sector
@@ -225,7 +237,9 @@ def enumerate_valid_actions_with_indirect_cache_packed(
             raw = _get_raw_cached(ibp_op, seed)
             if target not in raw or raw[target] == 0:
                 continue
-            cached = apply_resolved_subs(raw, resolved_subs)
+            cached = (apply_resolved_subs_dict_x_packed(
+                          raw, resolved_subs, reg, _ibp_env.PRIME)
+                      if _rs_packed else apply_resolved_subs(raw, resolved_subs))
             if target not in cached or cached[target] == 0:
                 continue
             if fast_subsector_filter:

@@ -151,8 +151,13 @@ from beam_search_utils import get_non_masters, get_sector_mask, filter_to_sector
 # transiently. One IntegralRegistry per worker process (module global).
 from sailir.packed_eq import IntegralRegistry, PackedEq
 from sailir import packed_cu as _packed_cu
+from sailir.packed_rs_ops import (
+    add_sub_to_resolved_packed, apply_resolved_subs_dict_x_packed)
 
 _V7_REGISTRY = None          # IntegralRegistry, set in main()
+_PACKED_RS = False           # Stage 3b: when True, State.resolved_subs values are
+                             # PackedEq (int32/int16) instead of dicts. Set in
+                             # main() from --packed-rs / SAILIR_PACKED_RS.
 _V7_PACKED_RS_CACHE = None   # {sub_int: (ids, coeffs)}, grown lazily
 
 
@@ -200,6 +205,16 @@ def is_active(integral, start_w12):
 def strip_passenger(d, start_w12):
     """Return new dict containing only active-weight entries."""
     return {k: v for k, v in d.items() if is_active(k, start_w12)}
+
+
+def _rs_as_dict(resolved_subs):
+    """Dict view {sub_int: {integral: coeff}} of resolved_subs for the dict-only
+    from-scratch compute path. Packed (Stage 3b) -> materialize each PackedEq
+    value to a dict (transient, one state at a time); else pass through."""
+    if _PACKED_RS and resolved_subs:
+        reg = _V7_REGISTRY
+        return {k: v.to_dict(reg) for k, v in resolved_subs.items()}
+    return resolved_subs
 
 
 # ============================================================================
@@ -252,6 +267,14 @@ def add_sub_to_resolved_v5(resolved_subs, target, sol, start_w12):
     passenger-weight entries. `sol` may be unstripped; we strip after every
     write.
     """
+    if _PACKED_RS:
+        # Stage 3b: resolved_subs values are PackedEq. sol arrives as a dict
+        # (from solve_ibp_for); pack it and delegate to the verified packed op.
+        reg = _V7_REGISTRY
+        sol_packed = sol if hasattr(sol, 'ids') else PackedEq.from_dict(sol, reg)
+        active_id = lambda i: is_active(reg.get_tuple(i), start_w12)  # noqa: E731
+        return add_sub_to_resolved_packed(
+            resolved_subs, target, sol_packed, reg, active_id, ibp_env.PRIME)
     # Step 1: resolve sol against existing RS, then strip passenger
     resolved_sol = apply_resolved_subs(sol, resolved_subs)
     resolved_sol = strip_passenger(resolved_sol, start_w12)
@@ -311,7 +334,9 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
             cached = _v7_as_dict(state.aux_flat[0][_idx])
     if cached is None:
         raw = env.get_raw_equation_cached(ibp_op, seed)
-        cached = apply_resolved_subs(raw, state.resolved_subs)
+        cached = (apply_resolved_subs_dict_x_packed(
+                      raw, state.resolved_subs, _V7_REGISTRY, ibp_env.PRIME)
+                  if _PACKED_RS else apply_resolved_subs(raw, state.resolved_subs))
     if target not in cached or cached[target] == 0:
         return None
     sol = solve_ibp_for(cached, target)
@@ -1044,7 +1069,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 else:
                     fresh_dummy = dummy_subs
                 indirect_cache, new_aux = compute_indirect_substituted_with_aux(
-                    fresh_dummy, s.resolved_subs,
+                    fresh_dummy, _rs_as_dict(s.resolved_subs),
                     env.ibp_t, env.li_t, env.shifts,
                     env._raw_eq_cache,
                 )
@@ -1851,6 +1876,11 @@ def main():
     p.add_argument('--integral', required=True,
                    help='Comma-separated indices for starting integral')
     p.add_argument('--prime', type=int, default=1009)
+    p.add_argument('--packed-rs', action='store_true',
+                   default=(os.environ.get('SAILIR_PACKED_RS', '0') == '1'),
+                   help='Stage 3b: store State.resolved_subs values as PackedEq '
+                        '(int32/int16) instead of dicts. Bit-identical; lower '
+                        'memory. Also enabled by SAILIR_PACKED_RS=1.')
     p.add_argument('--beam-width', type=int, default=40)
     p.add_argument('--top-k', type=int, default=None,
                    help='Number of model-top actions tried per (parent,target)'
@@ -1942,9 +1972,13 @@ def main():
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
     env = IBPEnvironment()
-    global _V7_REGISTRY, _V7_PACKED_RS_CACHE
+    global _V7_REGISTRY, _V7_PACKED_RS_CACHE, _PACKED_RS
     _V7_REGISTRY = IntegralRegistry()
     _V7_PACKED_RS_CACHE = {}
+    _PACKED_RS = args.packed_rs
+    if _PACKED_RS:
+        print('  packed-rs: State.resolved_subs values stored as PackedEq',
+              flush=True)
     if _memprobe_mod is not None:
         _memprobe_mod.record_milestone('rss_after_env_kb')
 
