@@ -75,6 +75,8 @@ def init_from_topology(topology: Topology) -> None:
     global FAMILY_NAME, KINEMATIC_INVARIANTS, KINEMATICS
     global IBP_TEMPLATES, LI_TEMPLATES
     global MASTERS_SET, MASTERS_BY_SECTOR, MASTER_SECTORS
+    global _MASTER_SECTOR_TUPLES_CACHE
+    _MASTER_SECTOR_TUPLES_CACHE = None      # invalidate: MASTERS_SET changes below
     _TOPOLOGY = topology
     _topology_module.configure(topology)
     N_INDICES = topology.n_indices
@@ -598,9 +600,23 @@ def get_sector_id(integral):
 
 
 # Sectors covered by the topology's master basis (sector tuples, like get_sector output).
-# Recomputed each access to handle re-init; cheap.
+# MASTERS_SET is fixed after init_from_topology, so this frozenset (a few hundred
+# bytes) is built ONCE and cached — it was being rebuilt millions of times per run
+# (profiled: 2.4M calls -> 147M get_sector calls). Invalidated in init_from_topology.
+_MASTER_SECTOR_TUPLES_CACHE = None
+_SECTOR_CACHE_OFF = None      # lazily read SAILIR_NO_SECTOR_CACHE once (A/B switch)
+
+
 def _master_sector_tuples() -> frozenset:
-    return frozenset(get_sector(m) for m in MASTERS_SET)
+    global _MASTER_SECTOR_TUPLES_CACHE, _SECTOR_CACHE_OFF
+    if _SECTOR_CACHE_OFF is None:
+        import os
+        _SECTOR_CACHE_OFF = (os.environ.get('SAILIR_NO_SECTOR_CACHE') == '1')
+    if _SECTOR_CACHE_OFF:
+        return frozenset(get_sector(m) for m in MASTERS_SET)
+    if _MASTER_SECTOR_TUPLES_CACHE is None:
+        _MASTER_SECTOR_TUPLES_CACHE = frozenset(get_sector(m) for m in MASTERS_SET)
+    return _MASTER_SECTOR_TUPLES_CACHE
 
 
 PAPER_MASTER_SECTORS = _master_sector_tuples
