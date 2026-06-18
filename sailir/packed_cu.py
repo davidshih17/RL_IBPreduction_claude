@@ -30,8 +30,10 @@ from .packed_eq import PackedEq, substitute_one, apply_resolved_subs, union_bitm
 # numpy if the extension isn't built.
 try:
     from _packed_kernels import contains_sorted as _CONTAINS_CY
+    from _packed_kernels import phase1b_packed as _PHASE1B_CY
 except ImportError:
     _CONTAINS_CY = None
+    _PHASE1B_CY = None
 
 
 def _get_packed_sub(sub_int, sol, reg, packed_rs_cache):
@@ -262,6 +264,12 @@ def enumerate_valid_actions_with_indirect_cache_packed(
 
     # Phase 1b: indirect cache (PACKED cached — id-membership, no dict)
     target_id = reg.get_id(target)
+    if fast_subsector_filter and _PHASE1B_CY is not None:
+        # Cython fast path: the whole per-entry loop (filters + membership
+        # binary search + delta + dedup) compiled to C, mutating seen/valid.
+        _PHASE1B_CY(indirect_cache, target, target_id, not_target_bm,
+                    seen, valid, N_INDICES)
+        return valid
     for sub_int, ibp_op, shift, raw, cached, union_bm in indirect_cache:
         if target in raw and raw[target] != 0:
             continue

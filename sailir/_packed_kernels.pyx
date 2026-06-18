@@ -39,6 +39,73 @@ def contains_sorted(int[::1] ids, long target_id):
     return found
 
 
+def phase1b_packed(list indirect_cache, tuple target, long target_id,
+                   long not_target_bm, set seen, list valid, int n_indices):
+    """Cython Phase-1b loop for the PACKED cu (fast_subsector filter mode).
+
+    Bit-identical to enumerate's Python Phase-1b loop: same three filters
+    (1: skip direct actions where target in raw with nonzero coeff; 2: target
+    must be present in cached.ids via binary search; 3: sector bitmask), same
+    seed/delta construction, same dedup via `seen`, same append order into
+    `valid`. Mutates `seen` and `valid` in place; returns None.
+
+    This compiles the per-entry loop/object-handling (the ~80s self-time at
+    depth) to C, while membership uses an inline binary search over the int32
+    cached.ids (replacing the per-entry contains_sorted call + numpy dispatch).
+    """
+    cdef Py_ssize_t n = len(indirect_cache)
+    cdef Py_ssize_t idx, i, lo, hi, mid, m
+    cdef tuple entry, sub_int, shift, seed, delta, key
+    cdef object raw_obj, cached_obj, ibp_op
+    cdef long union_bm
+    cdef int[::1] ids
+    cdef bint found
+
+    for idx in range(n):
+        entry = <tuple>indirect_cache[idx]
+        # entry = (sub_int, ibp_op, shift, raw_DICT, cached_PACKED, union_bm)
+        sub_int = <tuple>entry[0]
+        ibp_op = entry[1]
+        shift = <tuple>entry[2]
+        raw_obj = entry[3]
+        cached_obj = entry[4]
+        union_bm = <long>entry[5]
+
+        # Filter 1: skip direct actions (target in raw with non-zero value).
+        if target in <dict>raw_obj:
+            if (<dict>raw_obj)[target] != 0:
+                continue
+        # Filter 2: target_id present in cached.ids (sorted int32) — binary search.
+        ids = cached_obj.ids
+        m = ids.shape[0]
+        lo = 0
+        hi = m
+        found = False
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if ids[mid] < target_id:
+                lo = mid + 1
+            elif ids[mid] > target_id:
+                hi = mid
+            else:
+                found = True
+                break
+        if not found:
+            continue
+        # Filter 3: sector bitmask.
+        if (union_bm & not_target_bm) != 0:
+            continue
+
+        # seed = sub_int - shift ; delta = seed - target (two-step, matches the
+        # committed Python form exactly).
+        seed = tuple([sub_int[i] - shift[i] for i in range(n_indices)])
+        delta = tuple([seed[i] - target[i] for i in range(n_indices)])
+        key = (ibp_op, delta)
+        if key not in seen:
+            seen.add(key)
+            valid.append(key)
+
+
 def substitute_one_merge(int[::1] eq_ids, short[::1] eq_coeffs, long sub_id,
                          int[::1] rep_ids, long[::1] rep_coeffs, long prime):
     """eq_ids / rep_ids ascending-sorted. Substitute sub_id -> c*replacement.
