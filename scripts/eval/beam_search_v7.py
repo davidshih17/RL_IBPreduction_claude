@@ -1173,9 +1173,14 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # Build tasks for model batched inference
         if n_workers > 1:
             # Parallel enumerate: fork workers over disjoint parent slices.
+            # The main process blocks in select() while workers run, so this
+            # wall-clock IS the P1 phase duration (recorded under _p1['gv']).
+            _t = time.time() if _v5_prof else 0
             tasks, _aux_updates = _forkpool_enumerate(beam, n_workers)
             for _pi, _na in _aux_updates.items():
                 beam[_pi] = beam[_pi]._replace(aux_flat=_na)
+            if _v5_prof:
+                _p1['gv'] += time.time() - _t
         else:
             # === serial enumerate path — original code, indent-only change ===
             tasks = []  # (parent_idx, target, valid)
