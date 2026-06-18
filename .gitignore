@@ -47,6 +47,7 @@ smoke_checkpoints/
 # Compiled extensions and Cython generated C (keep .pyx, not .c/.so)
 *.so
 sailir/_*_inner.c
+sailir/_packed_kernels.c
 
 # In-place backup files from refactor experiments
 *.bak-pre-*
