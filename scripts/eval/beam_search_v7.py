@@ -27,6 +27,7 @@ import argparse
 import math
 import os
 import pickle
+import select
 import sys
 import time
 from collections import namedtuple
@@ -536,8 +537,18 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                    iraws_keep_first=None,
                    lazy_rs=True,
                    model_batch_chunk=8,
-                   top_k=None):
+                   top_k=None,
+                   n_workers=1):
     """Sequential beam search, v5 strip-active semantics.
+
+    n_workers: if >1, parallelize ONLY the per-step enumerate phase (P1) across
+               this many forked processes (the GIL-bound enumerate loop can't be
+               thread-parallelized). At n_workers==1 the original serial enumerate
+               path runs verbatim — the fork-pool is never constructed, so the
+               optimized single-worker code path is byte-for-byte unchanged and
+               carries ZERO pooling overhead. Complements --n-threads (which
+               parallelizes the model_fwd phase via torch threads); the two use
+               the same cores in disjoint phases (enumerate vs model).
 
     resume_from: path to a ckpt.pkl (or result.pkl) from a prior run; resumes
                  the beam from there at its recorded step.
@@ -963,6 +974,135 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     _sol_history = ({} if (_tabu_audit_on or _tabu_sol_fallback) else None)
     _sol_fallback_count = 0
 
+    # ----- enumerate fork-pool (ONLY constructed/entered when n_workers > 1) ---
+    # The per-step enumerate phase (P1) is GIL-bound — dict membership, set/list
+    # dedup, tuple building — so threads can't parallelize it; we fork processes
+    # that inherit the beam copy-on-write and each enumerate a DISJOINT slice of
+    # parents. The packed cu (numpy-backed PackedEq) keeps the beam to few Python
+    # objects, so a child's read-only traversal dirties only small header pages,
+    # not the big coefficient buffers — that is what makes fork-COW cheap here.
+    # Bit-identical to the serial loop: same three filters, same seed/delta, same
+    # per-parent target order; results are re-sorted by parent_idx (stable) so the
+    # model batch sees the identical task order. aux_flat is a pure derived cache
+    # of resolved_subs, so a worker that rebuilds it returns the packed aux for the
+    # main process to store (perf memo) — correctness is independent of it.
+    def _enum_slice(parent_indices, beam):
+        local_tasks = []          # (parent_idx, target, valid) in per-parent order
+        local_aux = {}            # parent_idx -> rebuilt PackedEq aux (rare path)
+        for parent_idx in parent_indices:
+            s = beam[parent_idx]
+            if s.n_non_masters == 0:
+                continue
+            nm = get_non_masters(s.expr, target_sector)
+            mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
+            tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+            dummy_subs = {k: {} for k in s.resolved_subs.keys()}
+            if s.aux_flat is not None:
+                indirect_cache = _aux_to_result(s.aux_flat, env)
+            else:
+                if (iraws_window is not None or iraws_keep_first is not None):
+                    keys = list(s.resolved_subs.keys())
+                    keep = set()
+                    if iraws_keep_first is not None:
+                        keep.update(keys[:iraws_keep_first])
+                    if iraws_window is not None:
+                        keep.update(keys[-iraws_window:])
+                    if len(keep) < len(keys):
+                        keep_list = [k for k in keys if k in keep]
+                        fresh_dummy = {k: {} for k in keep_list}
+                    else:
+                        fresh_dummy = dummy_subs
+                else:
+                    fresh_dummy = dummy_subs
+                indirect_cache, new_aux = compute_indirect_substituted_with_aux(
+                    fresh_dummy, _rs_as_dict(s.resolved_subs),
+                    env.ibp_t, env.li_t, env.shifts,
+                    env._raw_eq_cache,
+                )
+                new_aux = _v7_aux_pack(new_aux)
+                local_aux[parent_idx] = new_aux  # aux_flat not read below; just memo
+            for target in tied:
+                valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
+                    target, indirect_cache, s.resolved_subs,
+                    env.ibp_t, env.li_t, env.shifts, 'subsector',
+                    env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
+                )
+                if (not _bounded_tabu_on
+                        and tabu_dict is not None and valid):
+                    expr_fp = frozenset(s.expr.items())
+                    tabu_set = tabu_dict.get(expr_fp)
+                    if tabu_set:
+                        valid = [(op, dlt) for (op, dlt) in valid
+                                 if (target, op, dlt) not in tabu_set]
+                elif _bounded_tabu_on and valid:
+                    _bt_key = (frozenset(s.expr.items()), target)
+                    _bt_set = _bt_tabu.get(_bt_key)
+                    if _bt_set:
+                        _nblk = sum(1 for a in valid if a in _bt_set)
+                        if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
+                            valid = [a for a in valid if a not in _bt_set]
+                if valid:
+                    local_tasks.append((parent_idx, target, valid))
+        return local_tasks, local_aux
+
+    def _forkpool_enumerate(beam, n_workers):
+        # Round-robin partition of parents across workers (rough cost balance);
+        # the final task order is restored by a stable sort on parent_idx, so the
+        # partition scheme does not affect correctness.
+        n = len(beam)
+        parts = [list(range(w, n, n_workers)) for w in range(n_workers)]
+        parts = [p for p in parts if p]
+        children = []   # (pid, read_fd)
+        for part in parts:
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                # CHILD: inherits beam COW; compute slice, pickle to pipe, _exit.
+                # _exit (not sys.exit) so no atexit/buffer flush runs in the fork.
+                os.close(r)
+                try:
+                    payload = pickle.dumps(_enum_slice(part, beam),
+                                           pickle.HIGHEST_PROTOCOL)
+                    mv = memoryview(payload)
+                    while mv:
+                        nw = os.write(w, mv)
+                        mv = mv[nw:]
+                    os.close(w)
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            os.close(w)
+            children.append((pid, r))
+        # PARENT: drain all pipes concurrently (select) to avoid a pipe-full
+        # deadlock when a child's payload exceeds the pipe buffer, then reap.
+        bufs = {r: [] for _, r in children}
+        open_fds = set(bufs)
+        while open_fds:
+            ready, _, _ = select.select(list(open_fds), [], [])
+            for fd in ready:
+                chunk = os.read(fd, 1 << 20)
+                if chunk:
+                    bufs[fd].append(chunk)
+                else:
+                    os.close(fd)
+                    open_fds.discard(fd)
+        all_tasks = []
+        aux_updates = {}
+        bad = False
+        for pid, r in children:
+            _, status = os.waitpid(pid, 0)
+            raw = b''.join(bufs[r])
+            if status != 0 or not raw:
+                bad = True
+                continue
+            lt, la = pickle.loads(raw)
+            all_tasks.extend(lt)
+            aux_updates.update(la)
+        if bad:
+            raise RuntimeError('enumerate fork-pool: a worker failed')
+        all_tasks.sort(key=lambda t: t[0])  # stable -> per-parent target order kept
+        return all_tasks, aux_updates
+
     for step in range(resume_step, max_steps):
         # Termination: ANY beam state has drained — we only need one successful
         # path (the proof). Don't wait for every beam slot to finish.
@@ -1031,107 +1171,114 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
 
         # Per-state: compute indirect cache, enumerate tied targets, score actions
         # Build tasks for model batched inference
-        tasks = []  # (parent_idx, target, valid)
-        for parent_idx, s in enumerate(beam):
-            if s.n_non_masters == 0:
-                continue
-            _t = time.time() if _v5_prof else 0
-            nm = get_non_masters(s.expr, target_sector)
-            mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-            tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
-            if _v5_prof:
-                _p1['nm_tied'] += time.time() - _t
-            # Dummy subs (RS keys with empty values) — only used as keys for
-            # enumerate_valid_actions iteration (it reads keys, not values).
-            dummy_subs = {k: {} for k in s.resolved_subs.keys()}
-            # Use cached aux_flat if available, else rebuild from scratch.
-            _t = time.time() if _v5_prof else 0
-            if s.aux_flat is not None:
-                indirect_cache = _aux_to_result(s.aux_flat, env)
+        if n_workers > 1:
+            # Parallel enumerate: fork workers over disjoint parent slices.
+            tasks, _aux_updates = _forkpool_enumerate(beam, n_workers)
+            for _pi, _na in _aux_updates.items():
+                beam[_pi] = beam[_pi]._replace(aux_flat=_na)
+        else:
+            # === serial enumerate path — original code, indent-only change ===
+            tasks = []  # (parent_idx, target, valid)
+            for parent_idx, s in enumerate(beam):
+                if s.n_non_masters == 0:
+                    continue
+                _t = time.time() if _v5_prof else 0
+                nm = get_non_masters(s.expr, target_sector)
+                mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
+                tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
                 if _v5_prof:
-                    _ct['aux_repack_calls'] += 1
-            else:
-                # v7: depth-keyed from-scratch rebuild (no exprkeyed), then pack
-                # the cu for storage. The returned indirect_cache stays dict
-                # (consumed transiently by enumerate); only new_aux is packed.
-                if (iraws_window is not None or iraws_keep_first is not None):
-                    keys = list(s.resolved_subs.keys())
-                    keep = set()
-                    if iraws_keep_first is not None:
-                        keep.update(keys[:iraws_keep_first])
-                    if iraws_window is not None:
-                        keep.update(keys[-iraws_window:])
-                    if len(keep) < len(keys):
-                        keep_list = [k for k in keys if k in keep]
-                        fresh_dummy = {k: {} for k in keep_list}
+                    _p1['nm_tied'] += time.time() - _t
+                # Dummy subs (RS keys with empty values) — only used as keys for
+                # enumerate_valid_actions iteration (it reads keys, not values).
+                dummy_subs = {k: {} for k in s.resolved_subs.keys()}
+                # Use cached aux_flat if available, else rebuild from scratch.
+                _t = time.time() if _v5_prof else 0
+                if s.aux_flat is not None:
+                    indirect_cache = _aux_to_result(s.aux_flat, env)
+                    if _v5_prof:
+                        _ct['aux_repack_calls'] += 1
+                else:
+                    # v7: depth-keyed from-scratch rebuild (no exprkeyed), then pack
+                    # the cu for storage. The returned indirect_cache stays dict
+                    # (consumed transiently by enumerate); only new_aux is packed.
+                    if (iraws_window is not None or iraws_keep_first is not None):
+                        keys = list(s.resolved_subs.keys())
+                        keep = set()
+                        if iraws_keep_first is not None:
+                            keep.update(keys[:iraws_keep_first])
+                        if iraws_window is not None:
+                            keep.update(keys[-iraws_window:])
+                        if len(keep) < len(keys):
+                            keep_list = [k for k in keys if k in keep]
+                            fresh_dummy = {k: {} for k in keep_list}
+                        else:
+                            fresh_dummy = dummy_subs
                     else:
                         fresh_dummy = dummy_subs
-                else:
-                    fresh_dummy = dummy_subs
-                indirect_cache, new_aux = compute_indirect_substituted_with_aux(
-                    fresh_dummy, _rs_as_dict(s.resolved_subs),
-                    env.ibp_t, env.li_t, env.shifts,
-                    env._raw_eq_cache,
-                )
-                new_aux = _v7_aux_pack(new_aux)  # dict cu -> PackedEq for storage
+                    indirect_cache, new_aux = compute_indirect_substituted_with_aux(
+                        fresh_dummy, _rs_as_dict(s.resolved_subs),
+                        env.ibp_t, env.li_t, env.shifts,
+                        env._raw_eq_cache,
+                    )
+                    new_aux = _v7_aux_pack(new_aux)  # dict cu -> PackedEq for storage
+                    if _v5_prof:
+                        _ct['aux_build_calls'] += 1
+                    beam[parent_idx] = s._replace(aux_flat=new_aux)
+                    s = beam[parent_idx]
                 if _v5_prof:
-                    _ct['aux_build_calls'] += 1
-                beam[parent_idx] = s._replace(aux_flat=new_aux)
-                s = beam[parent_idx]
-            if _v5_prof:
-                _p1['aux'] += time.time() - _t
-            if _v5_prof:
-                _ct['n_iraws_total'] += len(indirect_cache)
-                if s.aux_flat:
-                    _ct['cu_size_max'] = max(_ct['cu_size_max'],
-                                              len(s.aux_flat[0]))
-                _ct['rs_max'] = max(_ct['rs_max'], len(s.resolved_subs))
-            for target in tied:
-                _t = time.time() if _v5_prof else 0
-                valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
-                    target, indirect_cache, s.resolved_subs,
-                    env.ibp_t, env.li_t, env.shifts, 'subsector',
-                    env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
-                )
+                    _p1['aux'] += time.time() - _t
                 if _v5_prof:
-                    _p1['gv'] += time.time() - _t
-                    _ct['enum_calls'] += 1
-                # Tabu: filter out (target, op, delta) tried previously from
-                # this expr fingerprint.
-                if (not _bounded_tabu_on
-                        and tabu_dict is not None and valid):
+                    _ct['n_iraws_total'] += len(indirect_cache)
+                    if s.aux_flat:
+                        _ct['cu_size_max'] = max(_ct['cu_size_max'],
+                                                  len(s.aux_flat[0]))
+                    _ct['rs_max'] = max(_ct['rs_max'], len(s.resolved_subs))
+                for target in tied:
                     _t = time.time() if _v5_prof else 0
-                    expr_fp = frozenset(s.expr.items())
-                    tabu_set = tabu_dict.get(expr_fp)
-                    if tabu_set:
-                        valid = [(op, dlt) for (op, dlt) in valid
-                                 if (target, op, dlt) not in tabu_set]
+                    valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
+                        target, indirect_cache, s.resolved_subs,
+                        env.ibp_t, env.li_t, env.shifts, 'subsector',
+                        env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
+                    )
                     if _v5_prof:
-                        _p1['tabu'] += time.time() - _t
-                # Aggressive tabu: remove this (expr_fp,target)'s tabu'd actions
-                # here — BEFORE the max_actions truncation — so the model sees
-                # the same tabu-free window as baseline (byte-identical). TWO
-                # cases keep the FULL list instead, deferring to the pick loop:
-                #  • EXHAUSTED (every valid action tabu'd): filtering would drop
-                #    the task (the trap → stuck). Keep the full list so the pick
-                #    loop CYCLES — re-picks the top-K best to retry under the
-                #    evolved RS instead of dying.
-                #  • OVER fixed cap (only when SAILIR_TABU_CAP>0): pick loop
-                #    re-allows the highest-prob overflow using model probs.
-                elif _bounded_tabu_on and valid:
-                    _t = time.time() if _v5_prof else 0
-                    _bt_key = (frozenset(s.expr.items()), target)
-                    _bt_set = _bt_tabu.get(_bt_key)
-                    if _bt_set:
-                        _nblk = sum(1 for a in valid if a in _bt_set)
-                        if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
-                            valid = [a for a in valid if a not in _bt_set]
-                    if _v5_prof:
-                        _p1['tabu'] += time.time() - _t
-                if valid:
-                    if _v5_prof:
-                        _ct['n_valid_total'] += len(valid)
-                    tasks.append((parent_idx, target, valid))
+                        _p1['gv'] += time.time() - _t
+                        _ct['enum_calls'] += 1
+                    # Tabu: filter out (target, op, delta) tried previously from
+                    # this expr fingerprint.
+                    if (not _bounded_tabu_on
+                            and tabu_dict is not None and valid):
+                        _t = time.time() if _v5_prof else 0
+                        expr_fp = frozenset(s.expr.items())
+                        tabu_set = tabu_dict.get(expr_fp)
+                        if tabu_set:
+                            valid = [(op, dlt) for (op, dlt) in valid
+                                     if (target, op, dlt) not in tabu_set]
+                        if _v5_prof:
+                            _p1['tabu'] += time.time() - _t
+                    # Aggressive tabu: remove this (expr_fp,target)'s tabu'd actions
+                    # here — BEFORE the max_actions truncation — so the model sees
+                    # the same tabu-free window as baseline (byte-identical). TWO
+                    # cases keep the FULL list instead, deferring to the pick loop:
+                    #  • EXHAUSTED (every valid action tabu'd): filtering would drop
+                    #    the task (the trap → stuck). Keep the full list so the pick
+                    #    loop CYCLES — re-picks the top-K best to retry under the
+                    #    evolved RS instead of dying.
+                    #  • OVER fixed cap (only when SAILIR_TABU_CAP>0): pick loop
+                    #    re-allows the highest-prob overflow using model probs.
+                    elif _bounded_tabu_on and valid:
+                        _t = time.time() if _v5_prof else 0
+                        _bt_key = (frozenset(s.expr.items()), target)
+                        _bt_set = _bt_tabu.get(_bt_key)
+                        if _bt_set:
+                            _nblk = sum(1 for a in valid if a in _bt_set)
+                            if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
+                                valid = [a for a in valid if a not in _bt_set]
+                        if _v5_prof:
+                            _p1['tabu'] += time.time() - _t
+                    if valid:
+                        if _v5_prof:
+                            _ct['n_valid_total'] += len(valid)
+                        tasks.append((parent_idx, target, valid))
 
         # Instrumentation: dump tasks/valid lists at a specific step
         _dump_step = os.environ.get('V5_DUMP_VALIDS_AT_STEP')
@@ -1931,6 +2078,11 @@ def main():
                         '(glibc retains free pages from large unchunked '
                         "forwards). None = no chunking (original behavior).")
     p.add_argument('--n-threads', type=int, default=1)
+    p.add_argument('--n-workers', type=int, default=1,
+                   help='processes for the enumerate phase (P1). 1 = serial '
+                        '(original path, zero pooling overhead). >1 forks this '
+                        'many workers per step over disjoint parents. Independent '
+                        'of --n-threads, which parallelizes the model (P2).')
     p.add_argument('--device', default='cpu')
     args = p.parse_args()
 
@@ -2032,6 +2184,7 @@ def main():
         lazy_rs=args.lazy_rs,
         model_batch_chunk=args.model_batch_chunk,
         top_k=args.top_k,
+        n_workers=args.n_workers,
     )
 
     print(f'\n== DONE — beam size {len(beam)} ==', flush=True)
