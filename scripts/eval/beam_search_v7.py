@@ -178,6 +178,43 @@ def _v7_as_dict(eq):
     return eq.to_dict(_V7_REGISTRY) if isinstance(eq, PackedEq) else eq
 
 
+def _remap_packed_eq(pe, base_N, remap_arr):
+    """Relabel a PackedEq's worker-local new ids (>= base_N) to global ids via
+    remap_arr (indexed by id - base_N), re-sorting to keep the ascending-id
+    invariant. ids < base_N (the shared registry base at fork) are untouched.
+
+    No-op (returns pe unchanged) when the entry has no new id — since ids are
+    sorted, that's just ids[-1] < base_N. Within one worker the new ids are
+    distinct tuples -> distinct globals, and globals (>= base_N) never collide
+    with retained base ids (< base_N), so the remap is a pure relabel+sort with
+    no coefficient recombination."""
+    ids = pe.ids
+    if ids.shape[0] == 0 or ids[-1] < base_N:
+        return pe
+    new_ids = ids.astype(np.int32, copy=True)
+    mask = ids >= base_N
+    new_ids[mask] = remap_arr[ids[mask] - base_N]
+    order = np.argsort(new_ids, kind='stable')
+    return PackedEq(np.ascontiguousarray(new_ids[order]),
+                    np.ascontiguousarray(pe.coeffs[order]))
+
+
+def _remap_state(c, base_N, remap_arr):
+    """Remap every PackedEq carrying a worker-local new id in a materialized
+    survivor: the aux_flat cu (the registering part) and — defensively — the
+    resolved_subs values (mat_rs is registry-neutral, so these are no-ops). ubm/
+    rid/iraws are tuple/index-keyed (bitmask is tuple-derived), so they're
+    portable as-is. cu order is preserved, so rid's cu-index map stays valid."""
+    new_rs = {k: _remap_packed_eq(v, base_N, remap_arr)
+              for k, v in c.resolved_subs.items()}
+    new_c = c._replace(resolved_subs=new_rs)
+    if c.aux_flat is not None:
+        cu, ubm, rid, iraws = c.aux_flat
+        new_cu = [_remap_packed_eq(pe, base_N, remap_arr) for pe in cu]
+        new_c = new_c._replace(aux_flat=(new_cu, ubm, rid, iraws))
+    return new_c
+
+
 # ============================================================================
 # v5 State
 # ============================================================================
@@ -1790,10 +1827,23 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                             if s.aux_flat is not None)
         if n_workers > 1 and os.environ.get('SAILIR_P4_FORK') == '1':
             _t_mat = time.time() if _v5_prof else 0
+            # Registry-safe P4 fork. Each worker materializes a disjoint survivor
+            # slice; attach_aux registers new integrals in the worker's COW
+            # registry, so the returned PackedEq carry worker-local ids the main
+            # never saw. To stay BIT-IDENTICAL (not just same-reduction), the main
+            # reassigns global ids in the EXACT order serial would: serial
+            # registers new integrals as survivors 0,1,2,... materialize, so we
+            # capture each survivor's new tuples (in its registration order) and
+            # replay get_id in beam-index order. That reproduces serial's id
+            # values -> identical PackedEq sort order -> identical model scores.
+            # Then relabel each worker's states local->global.
+            _base_N = len(_V7_REGISTRY)
 
             def _mat_slice(indices):
                 out = {}
+                new_by_s = {}            # survivor idx -> its new tuples, in order
                 for i in indices:
+                    _b = len(_V7_REGISTRY)
                     c = beam[i]
                     ps, tg, sl = cand_metadata[meta_by_id[id(c)]]
                     if lazy_rs:
@@ -1806,12 +1856,33 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                             iraws_keep_first=iraws_keep_first,
                         )
                     out[i] = c
-                return out
+                    new_by_s[i] = _V7_REGISTRY._to_tuple[_b:]
+                return out, new_by_s
 
             _mat_parts = _round_robin_parts(len(beam), n_workers)
-            for _d in _forkpool_map(_mat_slice, _mat_parts):
-                for _i, _c in _d.items():
-                    beam[_i] = _c
+            _results = _forkpool_map(_mat_slice, _mat_parts)
+            # Pass 1: replay registration in beam-index order -> serial id values.
+            _all_new = {}
+            for _states, _new_by_s in _results:
+                _all_new.update(_new_by_s)
+            for _i in sorted(_all_new):
+                for _T in _all_new[_i]:
+                    _V7_REGISTRY.get_id(_T)
+            # Pass 2: per worker, build local(base_N+k)->global remap from the
+            # worker's tuples in its own processing order, then relabel + place.
+            for _w, (_states, _new_by_s) in enumerate(_results):
+                _wt = []
+                for _i in _mat_parts[_w]:
+                    _wt.extend(_new_by_s[_i])
+                if _wt:
+                    _remap = np.empty(len(_wt), dtype=np.int32)
+                    for _k, _T in enumerate(_wt):
+                        _remap[_k] = _V7_REGISTRY.get_id(_T)
+                    for _i, _c in _states.items():
+                        beam[_i] = _remap_state(_c, _base_N, _remap)
+                else:
+                    for _i, _c in _states.items():
+                        beam[_i] = _c
             if _v5_prof:
                 # Can't split mat_rs/attach_aux across the fork boundary; the
                 # whole parallel P4 wall-clock lands under mat_rs.
