@@ -1045,36 +1045,39 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     local_tasks.append((parent_idx, target, valid))
         return local_tasks, local_aux
 
-    def _forkpool_enumerate(beam, n_workers):
-        # Round-robin partition of parents across workers (rough cost balance);
-        # the final task order is restored by a stable sort on parent_idx, so the
-        # partition scheme does not affect correctness.
-        n = len(beam)
-        parts = [list(range(w, n, n_workers)) for w in range(n_workers)]
-        parts = [p for p in parts if p]
+    def _forkpool_map(slice_fn, partitions):
+        # Generic fork-pool: one child per partition runs slice_fn(partition) and
+        # pickles its result back through a pipe; the parent drains all pipes with
+        # select() (avoids a pipe-full deadlock on large payloads), reaps, and
+        # returns [result_0, result_1, ...] in partition order. Raises if any
+        # worker fails. Children _exit (no atexit/buffer flush in the fork).
+        # Shared by the enumerate (P1) and materialize (P4) parallel paths.
         children = []   # (pid, read_fd)
-        for part in parts:
+        for part in partitions:
             r, w = os.pipe()
             pid = os.fork()
             if pid == 0:
-                # CHILD: inherits beam COW; compute slice, pickle to pipe, _exit.
-                # _exit (not sys.exit) so no atexit/buffer flush runs in the fork.
+                # CHILD: inherits state COW; compute slice, pickle ('OK', result)
+                # or ('ERR', traceback) to the pipe, _exit. Pickling is INSIDE the
+                # try so an unpicklable result is reported, not silently lost.
                 os.close(r)
                 try:
-                    payload = pickle.dumps(_enum_slice(part, beam),
+                    payload = pickle.dumps(('OK', slice_fn(part)),
                                            pickle.HIGHEST_PROTOCOL)
+                except BaseException:
+                    import traceback
+                    payload = pickle.dumps(('ERR', traceback.format_exc()),
+                                           pickle.HIGHEST_PROTOCOL)
+                try:
                     mv = memoryview(payload)
                     while mv:
                         nw = os.write(w, mv)
                         mv = mv[nw:]
+                finally:
                     os.close(w)
-                except BaseException:
-                    os._exit(1)
-                os._exit(0)
+                    os._exit(0)
             os.close(w)
             children.append((pid, r))
-        # PARENT: drain all pipes concurrently (select) to avoid a pipe-full
-        # deadlock when a child's payload exceeds the pipe buffer, then reap.
         bufs = {r: [] for _, r in children}
         open_fds = set(bufs)
         while open_fds:
@@ -1086,20 +1089,42 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 else:
                     os.close(fd)
                     open_fds.discard(fd)
+        results = []
+        errs = []
+        for pid, r in children:
+            os.waitpid(pid, 0)
+            raw = b''.join(bufs[r])
+            if not raw:
+                errs.append('worker produced no output')
+                results.append(None)
+                continue
+            tag, val = pickle.loads(raw)
+            if tag == 'ERR':
+                errs.append(val)
+                results.append(None)
+            else:
+                results.append(val)
+        if errs:
+            raise RuntimeError('fork-pool worker failed:\n'
+                               + '\n---\n'.join(errs))
+        return results
+
+    def _round_robin_parts(n, n_workers):
+        # Round-robin partition of range(n) across workers (rough cost balance);
+        # callers that need original order re-sort, so the scheme is correctness-
+        # neutral. Empty partitions (n < n_workers) are dropped.
+        parts = [list(range(w, n, n_workers)) for w in range(n_workers)]
+        return [p for p in parts if p]
+
+    def _forkpool_enumerate(beam, n_workers):
+        # Parallel P1: each worker enumerates a disjoint parent slice. Final task
+        # order is restored by a stable sort on parent_idx (partition-independent).
+        parts = _round_robin_parts(len(beam), n_workers)
         all_tasks = []
         aux_updates = {}
-        bad = False
-        for pid, r in children:
-            _, status = os.waitpid(pid, 0)
-            raw = b''.join(bufs[r])
-            if status != 0 or not raw:
-                bad = True
-                continue
-            lt, la = pickle.loads(raw)
+        for lt, la in _forkpool_map(lambda part: _enum_slice(part, beam), parts):
             all_tasks.extend(lt)
             aux_updates.update(la)
-        if bad:
-            raise RuntimeError('enumerate fork-pool: a worker failed')
         all_tasks.sort(key=lambda t: t[0])  # stable -> per-parent target order kept
         return all_tasks, aux_updates
 
@@ -1746,28 +1771,69 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                                               []).append((step, sol_fp_p))
 
         # Post-selection survivors: materialize lazy_rs THEN attach aux in a
-        # single pass so the original `c` is still in meta_by_id.
-        _t_mat = time.time() if _v5_prof else 0
-        _t_aux = 0.0
-        for i, c in enumerate(beam):
-            parent_state, target, sol = cand_metadata[meta_by_id[id(c)]]
-            if lazy_rs:
-                c = _materialize_lazy_rs(c, parent_state, target, sol, start_w12)
-            if use_incremental_aux:
-                _t1 = time.time() if _v5_prof else 0
-                c = _attach_incremental_aux(
-                    c, parent_state, target, env, target_sector,
-                    use_exprkeyed=use_exprkeyed,
-                    iraws_window=iraws_window,
-                    iraws_keep_first=iraws_keep_first,
-                )
-                if _v5_prof:
-                    _t_aux += time.time() - _t1
-                    _ct['attach_calls'] += 1
-            beam[i] = c
-        if _v5_prof:
-            _p4['mat_rs'] = _p4.get('mat_rs', 0.0) + (time.time() - _t_mat - _t_aux)
-            _p4['attach_aux'] += _t_aux
+        # single pass so the original `c` is still in meta_by_id. Each survivor
+        # is independent (beam[i] = f(c_i) using only read-only metadata/env).
+        #
+        # BLOCKED — naive fork is INCORRECT here: _attach_incremental_aux builds
+        # new raw equations that REGISTER new integrals in _V7_REGISTRY. In a
+        # forked worker those registrations land in the child's COW registry; the
+        # returned PackedEq states carry ids the MAIN registry never saw, so the
+        # next step's enumerate hits reg.get_tuple(unknown_id) -> IndexError.
+        # (P1 is immune because its results are registry-independent (op,delta)
+        # tuples.) Forking P4 needs a registry-merge/remap or an aux-build
+        # relocation — gated behind SAILIR_P4_FORK (default OFF) pending that fix.
+        # Until then n_workers>1 runs P1-fork + P4-serial.
+        if n_workers > 1 and os.environ.get('SAILIR_P4_FORK') == '1':
+            _t_mat = time.time() if _v5_prof else 0
+
+            def _mat_slice(indices):
+                out = {}
+                for i in indices:
+                    c = beam[i]
+                    ps, tg, sl = cand_metadata[meta_by_id[id(c)]]
+                    if lazy_rs:
+                        c = _materialize_lazy_rs(c, ps, tg, sl, start_w12)
+                    if use_incremental_aux:
+                        c = _attach_incremental_aux(
+                            c, ps, tg, env, target_sector,
+                            use_exprkeyed=use_exprkeyed,
+                            iraws_window=iraws_window,
+                            iraws_keep_first=iraws_keep_first,
+                        )
+                    out[i] = c
+                return out
+
+            _mat_parts = _round_robin_parts(len(beam), n_workers)
+            for _d in _forkpool_map(_mat_slice, _mat_parts):
+                for _i, _c in _d.items():
+                    beam[_i] = _c
+            if _v5_prof:
+                # Can't split mat_rs/attach_aux across the fork boundary; the
+                # whole parallel P4 wall-clock lands under mat_rs.
+                _p4['mat_rs'] = _p4.get('mat_rs', 0.0) + (time.time() - _t_mat)
+        else:
+            # === serial P4 — original code, unchanged ===
+            _t_mat = time.time() if _v5_prof else 0
+            _t_aux = 0.0
+            for i, c in enumerate(beam):
+                parent_state, target, sol = cand_metadata[meta_by_id[id(c)]]
+                if lazy_rs:
+                    c = _materialize_lazy_rs(c, parent_state, target, sol, start_w12)
+                if use_incremental_aux:
+                    _t1 = time.time() if _v5_prof else 0
+                    c = _attach_incremental_aux(
+                        c, parent_state, target, env, target_sector,
+                        use_exprkeyed=use_exprkeyed,
+                        iraws_window=iraws_window,
+                        iraws_keep_first=iraws_keep_first,
+                    )
+                    if _v5_prof:
+                        _t_aux += time.time() - _t1
+                        _ct['attach_calls'] += 1
+                beam[i] = c
+            if _v5_prof:
+                _p4['mat_rs'] = _p4.get('mat_rs', 0.0) + (time.time() - _t_mat - _t_aux)
+                _p4['attach_aux'] += _t_aux
 
         # Track best so far: use (max_w, n_non_masters) only — ignore score.
         # Score is cumulative negative log-prob, so the initial state always
@@ -1806,12 +1872,14 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 p1_parts = ' '.join(f'{k}={v:.2f}s' for k, v in _p1.items())
                 p3_parts = ' '.join(f'{k}={v:.2f}s' for k, v in _p3.items())
                 p2_parts = ' '.join(f'{k}={v:.2f}s' for k, v in _p2.items())
+                p4_parts = ' '.join(f'{k}={v:.2f}s' for k, v in _p4.items())
                 print(f'  PROF step={step+1} t_step={step_t:.2f}s '
                       f'P1={p1_t:.2f}s P2={p2_t:.2f}s P3={p3_t:.2f}s '
                       f'P4={p4_t:.2f}s residual={step_t-total:.2f}s', flush=True)
                 print(f'    P1: {p1_parts}', flush=True)
                 print(f'    P2: {p2_parts}', flush=True)
                 print(f'    P3: {p3_parts}', flush=True)
+                print(f'    P4: {p4_parts}', flush=True)
                 print(f'    cts: ' + ' '.join(f'{k}={v}' for k, v in _ct.items()),
                       flush=True)
         # Explicit aux dump (SAILIR_DUMP_AUX_STEPS="10,25"): print the best
