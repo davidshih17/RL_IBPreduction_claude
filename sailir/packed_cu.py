@@ -25,6 +25,14 @@ import numpy as np
 
 from .packed_eq import PackedEq, substitute_one, apply_resolved_subs, union_bitmask
 
+# Optional nogil C kernel for the Phase-1b id-membership (binary search),
+# replacing per-entry np.searchsorted + its dispatch overhead. Falls back to
+# numpy if the extension isn't built.
+try:
+    from _packed_kernels import contains_sorted as _CONTAINS_CY
+except ImportError:
+    _CONTAINS_CY = None
+
 
 def _get_packed_sub(sub_int, sol, reg, packed_rs_cache):
     """Return (sol_ids:int32, sol_coeffs) for a sub solution, caching by sub_int.
@@ -257,10 +265,14 @@ def enumerate_valid_actions_with_indirect_cache_packed(
     for sub_int, ibp_op, shift, raw, cached, union_bm in indirect_cache:
         if target in raw and raw[target] != 0:
             continue
-        ids = cached.ids
-        pos = _np.searchsorted(ids, target_id)
-        if pos >= len(ids) or ids[pos] != target_id:
-            continue                       # target not in cached
+        if _CONTAINS_CY is not None:
+            if not _CONTAINS_CY(cached.ids, target_id):
+                continue                   # target not in cached (nogil binsearch)
+        else:
+            ids = cached.ids
+            pos = _np.searchsorted(ids, target_id)
+            if pos >= len(ids) or ids[pos] != target_id:
+                continue                   # target not in cached (numpy fallback)
         if fast_subsector_filter:
             if (union_bm & not_target_bm) != 0:
                 continue

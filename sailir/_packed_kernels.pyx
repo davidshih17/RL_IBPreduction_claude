@@ -17,6 +17,28 @@ dropped), produced in canonical sorted-unique order.
 import numpy as np
 
 
+def contains_sorted(int[::1] ids, long target_id):
+    """True iff target_id is present in the ascending-sorted `ids` (nogil binary
+    search). Replaces the per-entry np.searchsorted(ids, target_id) +
+    bounds/equality membership test in enumerate Phase-1b, killing the numpy
+    dispatch overhead. Bit-identical membership result."""
+    cdef Py_ssize_t lo = 0, hi = ids.shape[0], mid
+    cdef bint found = False
+    if hi == 0:
+        return False
+    with nogil:
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if ids[mid] < target_id:
+                lo = mid + 1
+            elif ids[mid] > target_id:
+                hi = mid
+            else:
+                found = True
+                break
+    return found
+
+
 def substitute_one_merge(int[::1] eq_ids, short[::1] eq_coeffs, long sub_id,
                          int[::1] rep_ids, long[::1] rep_coeffs, long prime):
     """eq_ids / rep_ids ascending-sorted. Substitute sub_id -> c*replacement.
