@@ -1817,9 +1817,17 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # returned PackedEq states carry ids the MAIN registry never saw, so the
         # next step's enumerate hits reg.get_tuple(unknown_id) -> IndexError.
         # (P1 is immune because its results are registry-independent (op,delta)
-        # tuples.) Forking P4 needs a registry-merge/remap or an aux-build
-        # relocation — gated behind SAILIR_P4_FORK (default OFF) pending that fix.
-        # Until then n_workers>1 runs P1-fork + P4-serial.
+        # tuples.) The registry-merge/remap below makes the fork CORRECT and
+        # bit-identical (FINAL REDUCTION IDENTICAL on (7,4)). BUT it is a MEASURED
+        # NET LOSS and stays gated OFF: same-node A/B (node24, nw8+nthr8) was
+        # SLOWER at every step (e.g. step29 97.1s on vs 69.4s off) and +13% peak
+        # RSS (1877 vs 1659 MB). Cause: unlike P1's tiny (op,delta) outputs, each
+        # P4 worker returns a full materialized state (resolved_subs + packed
+        # aux_flat cu, ~1MB+), and pickling ~40 of those back + deserializing
+        # serially in the main + the remap costs more than the 123s of attach_aux
+        # we parallelized. Fork-IPC only pays when worker OUTPUT is small. To make
+        # P4 fork win, the big arrays must go via SHARED MEMORY (ship handles, not
+        # pickles) — not done. Default OFF; n_workers>1 runs P1-fork + P4-serial.
         _reg_probe = os.environ.get('SAILIR_REG_PROBE') == '1'
         if _reg_probe:
             _reg_p4_start = len(_V7_REGISTRY)
