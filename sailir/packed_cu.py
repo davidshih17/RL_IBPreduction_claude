@@ -22,8 +22,18 @@ resolved_subs stay dicts at this stage (Stage 3 migrates them); we convert the
 needed sub solutions to packed lazily, cached by sub_int in `packed_rs_cache`.
 """
 import numpy as np
+import os as _os
+import time as _time
 
 from .packed_eq import PackedEq, substitute_one, apply_resolved_subs, union_bitmask
+
+# Thread-viability probe (SAILIR_P4_TPROBE=1): splits attach_aux time into the
+# nogil-mergeable substitute_one calls (Phase A) vs the GIL-bound Python glue
+# (raw-building/registry/result). If subone dominates, threads (nogil) can
+# parallelize P4 without IPC or a registry remap; if glue dominates, they can't.
+_TPROBE = _os.environ.get('SAILIR_P4_TPROBE') == '1'
+_TP = {'total': 0.0, 'subone': 0.0, 'phaseB': 0.0,
+       'n_calls': 0, 'n_subone': 0, 'sub_terms': 0}
 
 # Optional nogil C kernel for the Phase-1b id-membership (binary search),
 # replacing per-entry np.searchsorted + its dispatch overhead. Falls back to
@@ -88,6 +98,7 @@ def compute_indirect_substituted_incremental_packed(
     new_resolved_subs is a fixed snapshot, so a local cache is both correct and
     avoids re-converting the same solution twice in this call.
     """
+    _t_fn = _time.perf_counter() if _TPROBE else 0.0
     packed_rs_cache = {}
     prev_cu, prev_ubm, prev_rid, prev_iraws = prev_aux
 
@@ -102,7 +113,14 @@ def compute_indirect_substituted_incremental_packed(
     _ts_bm = (ibp_env._sector_propagator_bm(target_sector)
               if target_sector is not None else 0)
     for old_c, old_ub in zip(prev_cu, prev_ubm):
-        new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
+        if _TPROBE:
+            _t0 = _time.perf_counter()
+            new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
+            _TP['subone'] += _time.perf_counter() - _t0
+            _TP['n_subone'] += 1
+            _TP['sub_terms'] += old_c.ids.shape[0]
+        else:
+            new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
         if new_c is old_c:
             new_cu.append(old_c)
             new_ubm.append(old_ub)
@@ -155,6 +173,7 @@ def compute_indirect_substituted_incremental_packed(
             raws_to_apply.append(raw)
 
     if raws_to_apply:
+        _tb = _time.perf_counter() if _TPROBE else 0.0
         # resolve each new raw against the full resolved_subs, in packed form
         for raw in raws_to_apply:
             praw = PackedEq.from_dict(raw, reg)
@@ -168,6 +187,8 @@ def compute_indirect_substituted_incremental_packed(
             else:
                 new_cu.append(c)
                 new_ubm.append(ub)
+        if _TPROBE:
+            _TP['phaseB'] += _time.perf_counter() - _tb
 
     new_iraws = prev_iraws + new_iraws_for_new
 
@@ -187,6 +208,9 @@ def compute_indirect_substituted_incremental_packed(
         idx = new_rid[(op, seed)]
         result.append((sub_int, op, sh, raw, new_cu[idx], new_ubm[idx]))
 
+    if _TPROBE:
+        _TP['total'] += _time.perf_counter() - _t_fn
+        _TP['n_calls'] += 1
     return result, (new_cu, new_ubm, new_rid, new_iraws)
 
 

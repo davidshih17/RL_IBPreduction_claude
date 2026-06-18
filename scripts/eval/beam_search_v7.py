@@ -2354,6 +2354,20 @@ def main():
     )
 
     print(f'\n== DONE — beam size {len(beam)} ==', flush=True)
+    if os.environ.get('SAILIR_P4_TPROBE') == '1':
+        _tp = _packed_cu._TP
+        _tot = _tp['total'] or 1.0
+        _glue = _tp['total'] - _tp['subone'] - _tp['phaseB']
+        print(f"[TPROBE attach_aux split over {_tp['n_calls']} calls] "
+              f"total={_tp['total']:.1f}s | "
+              f"subone(nogil-mergeable)={_tp['subone']:.1f}s "
+              f"({100*_tp['subone']/_tot:.1f}%) | "
+              f"phaseB(raw-build/registry,GIL)={_tp['phaseB']:.1f}s "
+              f"({100*_tp['phaseB']/_tot:.1f}%) | "
+              f"other-glue(GIL)={_glue:.1f}s ({100*_glue/_tot:.1f}%) | "
+              f"n_subone={_tp['n_subone']} "
+              f"avg_terms={_tp['sub_terms']/max(_tp['n_subone'],1):.1f}",
+              flush=True)
     print(f'best state: n_non_masters={best_state.n_non_masters} '
           f'mw={max_w12(best_state.expr, target_sector)} '
           f'path_len={len(best_state.path)} '
