@@ -33,7 +33,34 @@ from .packed_eq import PackedEq, substitute_one, apply_resolved_subs, union_bitm
 # parallelize P4 without IPC or a registry remap; if glue dominates, they can't.
 _TPROBE = _os.environ.get('SAILIR_P4_TPROBE') == '1'
 _TP = {'total': 0.0, 'subone': 0.0, 'phaseB': 0.0,
-       'n_calls': 0, 'n_subone': 0, 'sub_terms': 0}
+       'n_calls': 0, 'n_subone': 0, 'sub_terms': 0,
+       'n_noop': 0, 'noop_terms': 0, 'hit_terms': 0}
+
+# Phase-1 smart-coding fast path for attach_aux's Phase A (default ON; set
+# SAILIR_PHASEA_LEGACY=1 to force the old wrapper loop for same-node A/B timing).
+_PHASEA_LEGACY = _os.environ.get('SAILIR_PHASEA_LEGACY') == '1'
+
+# Direct handle to the same nogil merge kernel substitute_one dispatches to, so
+# Phase A can call it once-per-entry WITHOUT the per-call wrapper overhead
+# (int()/ascontiguousarray x2/None-check/dispatch), with the substitution target
+# hoisted out of the loop.
+try:
+    from _packed_kernels import substitute_one_merge as _SUB_MERGE_CY
+except ImportError:
+    _SUB_MERGE_CY = None
+
+# Cached int64 bitmask array for a vectorized union_bitmask. The registry is
+# append-only, so rebuild only when it grows -> ONE bounded array (size = #ids),
+# never a per-call allocation. Memory-bounded by construction.
+_BM_CACHE = {'arr': None, 'n': -1}
+
+
+def _bm_array(reg):
+    n = len(reg._bm)
+    if _BM_CACHE['n'] != n:
+        _BM_CACHE['arr'] = np.array(reg._bm, dtype=np.int64)
+        _BM_CACHE['n'] = n
+    return _BM_CACHE['arr']
 
 # Optional nogil C kernel for the Phase-1b id-membership (binary search),
 # replacing per-entry np.searchsorted + its dispatch overhead. Falls back to
@@ -112,27 +139,46 @@ def compute_indirect_substituted_incremental_packed(
     new_ubm = []
     _ts_bm = (ibp_env._sector_propagator_bm(target_sector)
               if target_sector is not None else 0)
-    for old_c, old_ub in zip(prev_cu, prev_ubm):
-        if _TPROBE:
-            _t0 = _time.perf_counter()
-            new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
-            _TP['subone'] += _time.perf_counter() - _t0
-            _TP['n_subone'] += 1
-            _TP['sub_terms'] += old_c.ids.shape[0]
-        else:
-            new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
-        if new_c is old_c:
-            new_cu.append(old_c)
-            new_ubm.append(old_ub)
-        else:
-            new_ub = union_bitmask(new_c, reg)
-            if (target_sector is not None
-                    and ibp_env._entry_rejected_by_sector(new_ub, _ts_bm)):
+    _sector = target_sector is not None
+    if _SUB_MERGE_CY is not None and not _PHASEA_LEGACY:
+        # Phase-1 fast path: substitution target hoisted out of the loop, merge
+        # kernel called directly (no wrapper), union_bitmask vectorized over the
+        # cached registry bitmask array. Bit-identical to the legacy loop below;
+        # memory-neutral (one cached array + a per-entry transient gather).
+        _merge = _SUB_MERGE_CY
+        _sid = int(new_sub_id)
+        _sol_i = np.ascontiguousarray(sol_ids, dtype=np.int32)
+        _sol_c = np.ascontiguousarray(sol_coeffs, dtype=np.int64)
+        _bm = _bm_array(reg)
+        for old_c, old_ub in zip(prev_cu, prev_ubm):
+            res = _merge(old_c.ids, old_c.coeffs, _sid, _sol_i, _sol_c, prime)
+            if res is None:                       # new_sub_id absent -> unchanged
+                new_cu.append(old_c)
+                new_ubm.append(old_ub)
+                continue
+            rids = res[0]
+            new_ub = int(np.bitwise_or.reduce(_bm[rids])) if rids.shape[0] else 0
+            if _sector and ibp_env._entry_rejected_by_sector(new_ub, _ts_bm):
                 new_cu.append(PackedEq.empty())
                 new_ubm.append(0)
             else:
-                new_cu.append(new_c)
+                new_cu.append(PackedEq(rids, res[1]))
                 new_ubm.append(new_ub)
+    else:
+        # Legacy wrapper loop (kernel unavailable, or SAILIR_PHASEA_LEGACY=1).
+        for old_c, old_ub in zip(prev_cu, prev_ubm):
+            new_c = substitute_one(old_c, new_sub_id, sol_ids, sol_coeffs, prime)
+            if new_c is old_c:
+                new_cu.append(old_c)
+                new_ubm.append(old_ub)
+            else:
+                new_ub = union_bitmask(new_c, reg)
+                if _sector and ibp_env._entry_rejected_by_sector(new_ub, _ts_bm):
+                    new_cu.append(PackedEq.empty())
+                    new_ubm.append(0)
+                else:
+                    new_cu.append(new_c)
+                    new_ubm.append(new_ub)
 
     new_rid = dict(prev_rid)
 

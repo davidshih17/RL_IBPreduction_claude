@@ -1,0 +1,12 @@
+universe = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/eval/archive/phaseA_ab_wrapper.sh
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/phaseA_ab.out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/phaseA_ab.err
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/phaseA_ab.log
+request_cpus = 8
+request_memory = 32GB
+request_disk = 50GB
+Requirements = (TARGET.KFlops > 3000000)
+priority = 1000000000
++JobFlavour = "workday"
+queue

@@ -2368,6 +2368,14 @@ def main():
               f"n_subone={_tp['n_subone']} "
               f"avg_terms={_tp['sub_terms']/max(_tp['n_subone'],1):.1f}",
               flush=True)
+        _nz = _tp['n_subone'] - _tp['n_noop']
+        print(f"[TPROBE noop split] n_subone={_tp['n_subone']} | "
+              f"NO-OP (sub_id absent, wasted visit)={_tp['n_noop']} "
+              f"({100*_tp['n_noop']/max(_tp['n_subone'],1):.1f}%) | "
+              f"real substitutions={_nz} "
+              f"({100*_nz/max(_tp['n_subone'],1):.1f}%) | "
+              f"avg_terms: noop={_tp['noop_terms']/max(_tp['n_noop'],1):.1f}",
+              flush=True)
     print(f'best state: n_non_masters={best_state.n_non_masters} '
           f'mw={max_w12(best_state.expr, target_sector)} '
           f'path_len={len(best_state.path)} '
