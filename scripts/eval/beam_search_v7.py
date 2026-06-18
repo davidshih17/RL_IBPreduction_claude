@@ -1783,6 +1783,11 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # tuples.) Forking P4 needs a registry-merge/remap or an aux-build
         # relocation — gated behind SAILIR_P4_FORK (default OFF) pending that fix.
         # Until then n_workers>1 runs P1-fork + P4-serial.
+        _reg_probe = os.environ.get('SAILIR_REG_PROBE') == '1'
+        if _reg_probe:
+            _reg_p4_start = len(_V7_REGISTRY)
+            _cu_total = sum(len(s.aux_flat[0]) for s in beam
+                            if s.aux_flat is not None)
         if n_workers > 1 and os.environ.get('SAILIR_P4_FORK') == '1':
             _t_mat = time.time() if _v5_prof else 0
 
@@ -1834,6 +1839,15 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             if _v5_prof:
                 _p4['mat_rs'] = _p4.get('mat_rs', 0.0) + (time.time() - _t_mat - _t_aux)
                 _p4['attach_aux'] += _t_aux
+        if _reg_probe:
+            # New integrals registered during P4 = the remap workload a fork would
+            # have to reconcile. _cu_total = packed cu entries across survivors =
+            # arrays that might need a remap/re-sort scan.
+            _reg_p4_new = len(_V7_REGISTRY) - _reg_p4_start
+            print(f'  [REGPROBE step {step+1}] reg {_reg_p4_start}->'
+                  f'{len(_V7_REGISTRY)} (+{_reg_p4_new} new in P4) '
+                  f'beam={len(beam)} cu_total={_cu_total} '
+                  f'new_per_cu={_reg_p4_new/max(_cu_total,1):.4f}', flush=True)
 
         # Track best so far: use (max_w, n_non_masters) only — ignore score.
         # Score is cumulative negative log-prob, so the initial state always
