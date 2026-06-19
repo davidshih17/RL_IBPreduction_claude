@@ -562,6 +562,115 @@ def total_w12(expr, target_sector):
     return (sum(weight(k)[0] for k in nms), sum(weight(k)[1] for k in nms))
 
 
+# ===========================================================================
+# Action-cap selection strategies (experiment; env SAILIR_ACTION_SELECT)
+# ---------------------------------------------------------------------------
+# When a (parent,target) task has > max_actions valid actions, only max_actions
+# are fed to the model. Default 'first900' = valid[:max_actions] = the OLDEST
+# actions (enumerate order is Phase-1a directs then Phase-1b indirects in iraws
+# append/oldest->newest order); left as-is so prepare_batched_input still caps it
+# (bit-identical). The other strategies pre-select here, post-tabu:
+#   last900    newest actions (valid[-max_actions:])
+#   maxweight  lowest max (w1,w2) over the action's RHS  (#2)
+#   shortest   fewest RHS terms                          (#3)
+#   sumweight  lowest (Sum w1, Sum w2) over the RHS       (#4)
+# Metric is over the resolved relation's RHS AFTER modding out subweight (already
+# stripped: cu built with min_w12 raw-strip), subsector and masters and the
+# target itself — i.e. exactly get_non_masters(relation, target_sector), matching
+# the single-step max_w12/total_w12 criterion.
+_ACTION_SELECT = os.environ.get('SAILIR_ACTION_SELECT', 'first900')
+_METRIC_STRATEGIES = ('maxweight', 'shortest', 'sumweight')
+# per-id metric arrays, cached + grown like packed_cu._bm_array (bounded memory)
+_METRIC_CACHE = {'n': -1, 'wt1': None, 'wt2': None, 'ism': None, 'sec': None}
+
+
+def _secbm_of(integral):
+    """Sector bitmask matching beam_search_utils.get_sector_mask (skip ISP)."""
+    bm = 0
+    j = 0
+    isp = set(ibp_env.ISP_POSITIONS)
+    for i in range(ibp_env.N_INDICES):
+        if i in isp:
+            continue
+        if integral[i] > 0:
+            bm |= (1 << j)
+        j += 1
+    return bm
+
+
+def _metric_arrays(reg):
+    """Per-id (wt1, wt2, ism, sec) int arrays for the metric strategies. Append-
+    only registry -> rebuild only when it grows (one bounded set of arrays)."""
+    n = len(reg._to_tuple)
+    if _METRIC_CACHE['n'] == n:
+        return _METRIC_CACHE
+    old = _METRIC_CACHE['n'] if _METRIC_CACHE['n'] > 0 else 0
+    wt1 = np.empty(n, np.int64)
+    wt2 = np.empty(n, np.int64)
+    ism = np.empty(n, np.uint8)
+    sec = np.empty(n, np.int64)
+    if old:
+        wt1[:old] = _METRIC_CACHE['wt1']
+        wt2[:old] = _METRIC_CACHE['wt2']
+        ism[:old] = _METRIC_CACHE['ism']
+        sec[:old] = _METRIC_CACHE['sec']
+    for i in range(old, n):
+        t = reg._to_tuple[i]
+        w = weight(t)
+        wt1[i] = w[0]
+        wt2[i] = w[1]
+        ism[i] = 1 if is_master(t) else 0
+        sec[i] = _secbm_of(t)
+    _METRIC_CACHE.update(n=n, wt1=wt1, wt2=wt2, ism=ism, sec=sec)
+    return _METRIC_CACHE
+
+
+def _select_actions(valid, target, aux_flat, max_actions, strategy):
+    """Pick which <=max_actions actions reach the model. valid is a list of
+    (op, delta); aux_flat = (cu, ubm, rid, iraws) of the parent. Bit-identical
+    no-op for 'first900' (handled by the caller, never invoked)."""
+    nv = len(valid)
+    if nv <= max_actions:
+        return valid
+    if strategy == 'last900':
+        return valid[-max_actions:]
+    # metric strategies: recover each action's RHS via rid[(op, target+delta)].
+    arr = _metric_arrays(_V7_REGISTRY)
+    wt1, wt2, ism, sec = arr['wt1'], arr['wt2'], arr['ism'], arr['sec']
+    cu = aux_flat[0]
+    rid = aux_flat[2]
+    tid = _V7_REGISTRY.get_id(target)
+    tsec = int(sec[tid])
+    N = ibp_env.N_INDICES
+    BIGW = 1 << 20
+    keys = np.empty(nv, dtype=np.int64)
+    for ai in range(nv):
+        op, delta = valid[ai]
+        seed = tuple(target[i] + delta[i] for i in range(N))
+        idx = rid.get((op, seed))
+        if idx is None:
+            keys[ai] = -(1 << 62)          # direct / not in cu -> always keep
+            continue
+        ids = cu[idx].ids
+        # in-target-sector non-master RHS terms (exclude target itself)
+        m = (sec[ids] == tsec) & (ism[ids] == 0) & (ids != tid)
+        sel_ids = ids[m]
+        if sel_ids.shape[0] == 0:
+            keys[ai] = -(1 << 61)          # pure-master/sub RHS -> reduces -> keep
+            continue
+        if strategy == 'maxweight':
+            w1 = wt1[sel_ids]
+            j = int(np.lexsort((wt2[sel_ids], w1))[-1])
+            keys[ai] = int(w1[j]) * BIGW + int(wt2[sel_ids][j])
+        elif strategy == 'shortest':
+            keys[ai] = int(sel_ids.shape[0])
+        else:  # sumweight
+            keys[ai] = int(wt1[sel_ids].sum()) * BIGW + int(wt2[sel_ids].sum())
+    sel = np.argpartition(keys, max_actions)[:max_actions]
+    sel.sort()                              # keep original order among the chosen
+    return [valid[i] for i in sel]
+
+
 def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                    beam_width=40, max_steps=1000, device='cpu',
                    beam_sort='mixed', max_actions=900, ckpt_path=None,
@@ -1079,6 +1188,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
                             valid = [a for a in valid if a not in _bt_set]
                 if valid:
+                    if _ACTION_SELECT != 'first900':
+                        valid = _select_actions(valid, target, s.aux_flat,
+                                                max_actions, _ACTION_SELECT)
                     local_tasks.append((parent_idx, target, valid))
         return local_tasks, local_aux
 
@@ -1343,6 +1455,9 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         if _v5_prof:
                             _p1['tabu'] += time.time() - _t
                     if valid:
+                        if _ACTION_SELECT != 'first900':
+                            valid = _select_actions(valid, target, s.aux_flat,
+                                                    max_actions, _ACTION_SELECT)
                         if _v5_prof:
                             _ct['n_valid_total'] += len(valid)
                         tasks.append((parent_idx, target, valid))
