@@ -672,16 +672,29 @@ def _select_actions(valid, target, aux_flat, max_actions, strategy):
     nv = len(valid)
     if nv <= max_actions:
         return valid
+    cu = aux_flat[0]
+    rid = aux_flat[2]
+    N = ibp_env.N_INDICES
     if strategy == 'last900':
-        return valid[-max_actions:]
+        # Keep ALL directs (not in rid, same as the metric strategies) + the LAST
+        # (max_actions - n_directs) indirects (newest in enumerate order), in
+        # original order. Fixes the old valid[-max_actions:], which sliced off the
+        # front where the directs live -> doubly broken (no directs + tail only).
+        direct_idx, indirect_idx = [], []
+        for ai in range(nv):
+            op, delta = valid[ai]
+            seed = tuple(target[i] + delta[i] for i in range(N))
+            (direct_idx if rid.get((op, seed)) is None
+             else indirect_idx).append(ai)
+        nkeep = max_actions - len(direct_idx)
+        sel = (sorted(direct_idx + indirect_idx[-nkeep:]) if nkeep > 0
+               else sorted(direct_idx[:max_actions]))
+        return [valid[i] for i in sel]
     # metric strategies: recover each action's RHS via rid[(op, target+delta)].
     arr = _metric_arrays(_V7_REGISTRY)
     wt1, wt2, ism, sec = arr['wt1'], arr['wt2'], arr['ism'], arr['sec']
-    cu = aux_flat[0]
-    rid = aux_flat[2]
     tid = _V7_REGISTRY.get_id(target)
     tsec = int(sec[tid])
-    N = ibp_env.N_INDICES
     BIGW = 1 << 20
     keys = np.empty(nv, dtype=np.int64)
     for ai in range(nv):
