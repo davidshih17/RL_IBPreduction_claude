@@ -32,6 +32,46 @@ import sys
 import time
 from collections import namedtuple
 
+
+def _cap_incidental_threads():
+    """When running parallel (>1 enumerate workers OR >1 model threads), pin the
+    incidental numpy/OpenMP/BLAS threadpools to 1 thread and park idle threads.
+
+    WHY: those pools default to the node's FULL core count (e.g. 128) and idle
+    OpenMP/BLAS threads spin-wait (OMP_WAIT_POLICY=ACTIVE) by default. Each forked
+    enumerate worker is a separate process with its own pool, and torch's pool in
+    the main spins during the fork phase -> total CPU drifts past the requested
+    cores and Condor HOLDS the job ("cpu usage exceeded RequestCpus"). The model
+    keeps its threads via torch.set_num_threads(--n-threads), which is independent
+    of these caps (verified: t_step unchanged with caps on).
+
+    MUST run before numpy/torch import (pools size themselves at import/first use),
+    so we peek argv here rather than wait for argparse. setdefault() respects any
+    value the caller set explicitly. Only fires for the parallel configs (the
+    single-worker/single-thread path is untouched)."""
+    av = sys.argv
+
+    def _val(flag):
+        for i, a in enumerate(av):
+            if a == flag and i + 1 < len(av):
+                return av[i + 1]
+            if a.startswith(flag + '='):
+                return a.split('=', 1)[1]
+        return None
+    try:
+        nw = int(_val('--n-workers') or 1)
+        nt = int(_val('--n-threads') or 1)
+    except ValueError:
+        nw = nt = 1
+    if nw > 1 or nt > 1:
+        for k in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                  'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+            os.environ.setdefault(k, '1')
+        os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
+
+
+_cap_incidental_threads()
+
 import numpy as np
 import torch
 
