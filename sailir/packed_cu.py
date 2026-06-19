@@ -49,6 +49,14 @@ try:
 except ImportError:
     _SUB_MERGE_CY = None
 
+# Phase-2: the whole Phase A loop fused into one C kernel (Phase-1 + the per-entry
+# PackedEq churn and Python dispatch removed). Used when target_sector is None
+# (the incremental caller's only mode); falls back to the Phase-1 loop otherwise.
+try:
+    from _packed_kernels import phaseA_substitute_all as _PHASEA_CY
+except ImportError:
+    _PHASEA_CY = None
+
 # Cached int64 bitmask array for a vectorized union_bitmask. The registry is
 # append-only, so rebuild only when it grows -> ONE bounded array (size = #ids),
 # never a per-call allocation. Memory-bounded by construction.
@@ -140,7 +148,14 @@ def compute_indirect_substituted_incremental_packed(
     _ts_bm = (ibp_env._sector_propagator_bm(target_sector)
               if target_sector is not None else 0)
     _sector = target_sector is not None
-    if _SUB_MERGE_CY is not None and not _PHASEA_LEGACY:
+    if _PHASEA_CY is not None and not _sector and not _PHASEA_LEGACY:
+        # Phase-2: fused C loop. Returns the finished (new_cu, new_ubm) directly.
+        new_cu, new_ubm = _PHASEA_CY(
+            prev_cu, prev_ubm, int(new_sub_id),
+            np.ascontiguousarray(sol_ids, dtype=np.int32),
+            np.ascontiguousarray(sol_coeffs, dtype=np.int64),
+            prime, _bm_array(reg), PackedEq)
+    elif _SUB_MERGE_CY is not None and not _PHASEA_LEGACY:
         # Phase-1 fast path: substitution target hoisted out of the loop, merge
         # kernel called directly (no wrapper), union_bitmask vectorized over the
         # cached registry bitmask array. Bit-identical to the legacy loop below;

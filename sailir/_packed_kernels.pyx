@@ -193,3 +193,127 @@ def substitute_one_merge(int[::1] eq_ids, short[::1] eq_coeffs, long sub_id,
     # stored cu entry (k can be << n+m after GF cancellation). .copy() gives an
     # exactly-k array and lets the over-allocated buffer be freed.
     return out_ids_arr[:k].copy(), out_coeffs_arr[:k].copy()
+
+
+def phaseA_substitute_all(list prev_cu, list prev_ubm, long sub_id,
+                          int[::1] rep_ids, long[::1] rep_coeffs, long prime,
+                          long[::1] reg_bm, object PackedEq_cls):
+    """Fused Phase A of attach_aux: substitute sub_id -> rep into EVERY cu entry
+    in one compiled loop. Bit-identical to the Python loop
+
+        for old_c, old_ub in zip(prev_cu, prev_ubm):
+            new_c = substitute_one(old_c, sub_id, rep_ids, rep_coeffs, prime)
+            if new_c is old_c: keep old_c, old_ub
+            else: keep new_c, union_bitmask(new_c)
+
+    but the per-entry substitute_one wrapper, the intermediate PackedEq for the
+    merge, and the per-entry union_bitmask Python loop are all inlined into C.
+    Assumes target_sector is None (the incremental caller's only mode); the
+    sector-rejection case is left to the Python fallback.
+
+    Memory: ONE reusable scratch buffer (largest entry + rep), reused across all
+    entries; only CHANGED entries allocate a compact .copy() (which they must, it
+    is stored). No per-entry buffer growth.
+
+    Returns (new_cu list, new_ubm list).
+    """
+    cdef Py_ssize_t n = len(prev_cu), m = rep_ids.shape[0]
+    cdef Py_ssize_t k, en, lo, hi, mid, sub_pos, i, j, kk, cap, max_en = 0
+    cdef long c, eid, rid, rc, acc, ubm
+    cdef int[::1] eq_ids
+    cdef short[::1] eq_coeffs
+    cdef int[::1] out_ids
+    cdef short[::1] out_coeffs
+    cdef object old_c
+
+    new_cu = [None] * n
+    new_ubm = [0] * n
+
+    for k in range(n):
+        en = (<object>prev_cu[k]).ids.shape[0]
+        if en > max_en:
+            max_en = en
+    cap = max_en + m
+    if cap < 1:
+        cap = 1
+    out_ids_arr = np.empty(cap, dtype=np.int32)
+    out_coeffs_arr = np.empty(cap, dtype=np.int16)
+    out_ids = out_ids_arr
+    out_coeffs = out_coeffs_arr
+
+    for k in range(n):
+        old_c = prev_cu[k]
+        eq_ids = old_c.ids
+        eq_coeffs = old_c.coeffs
+        en = eq_ids.shape[0]
+        lo = 0
+        hi = en
+        sub_pos = -1
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if eq_ids[mid] < sub_id:
+                lo = mid + 1
+            elif eq_ids[mid] > sub_id:
+                hi = mid
+            else:
+                sub_pos = mid
+                break
+        if sub_pos == -1:                       # sub_id absent -> entry unchanged
+            new_cu[k] = old_c
+            new_ubm[k] = prev_ubm[k]
+            continue
+        c = eq_coeffs[sub_pos]
+        i = 0
+        j = 0
+        kk = 0
+        ubm = 0
+        while True:
+            while i < en and i == sub_pos:
+                i += 1
+            if i >= en and j >= m:
+                break
+            if i >= en:
+                rc = (c * rep_coeffs[j]) % prime
+                if rc != 0:
+                    out_ids[kk] = rep_ids[j]
+                    out_coeffs[kk] = <short> rc
+                    ubm |= reg_bm[rep_ids[j]]
+                    kk += 1
+                j += 1
+                continue
+            if j >= m:
+                out_ids[kk] = eq_ids[i]
+                out_coeffs[kk] = eq_coeffs[i]
+                ubm |= reg_bm[eq_ids[i]]
+                kk += 1
+                i += 1
+                continue
+            eid = eq_ids[i]
+            rid = rep_ids[j]
+            if eid < rid:
+                out_ids[kk] = eq_ids[i]
+                out_coeffs[kk] = eq_coeffs[i]
+                ubm |= reg_bm[eid]
+                kk += 1
+                i += 1
+            elif rid < eid:
+                rc = (c * rep_coeffs[j]) % prime
+                if rc != 0:
+                    out_ids[kk] = rep_ids[j]
+                    out_coeffs[kk] = <short> rc
+                    ubm |= reg_bm[rid]
+                    kk += 1
+                j += 1
+            else:
+                acc = (eq_coeffs[i] + c * rep_coeffs[j]) % prime
+                if acc != 0:
+                    out_ids[kk] = eq_ids[i]
+                    out_coeffs[kk] = <short> acc
+                    ubm |= reg_bm[eid]
+                    kk += 1
+                i += 1
+                j += 1
+        new_cu[k] = PackedEq_cls(out_ids_arr[:kk].copy(),
+                                 out_coeffs_arr[:kk].copy())
+        new_ubm[k] = ubm
+    return new_cu, new_ubm
