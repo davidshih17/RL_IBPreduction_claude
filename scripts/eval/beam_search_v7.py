@@ -2243,12 +2243,24 @@ def main():
                         'this many rows. Bounds transient activation memory '
                         '(glibc retains free pages from large unchunked '
                         "forwards). None = no chunking (original behavior).")
-    p.add_argument('--n-threads', type=int, default=1)
+    # OPTIMAL PRODUCTION SETTING: --n-threads 8 --n-workers 8 (on an 8-core
+    # request). Measured same-node (7,4): 8/8 = ~319s vs 4/4 = ~438s (+37%).
+    # Breakdown of the loss at 4: ~85% is the model (P2, scales ~1.8x with
+    # threads) and ~15% enumerate (P1). Since the 8-core request is dictated by
+    # the model threads and is reserved for the whole job, run 8 workers too —
+    # fewer would just idle reserved cores during enumerate. Defaults stay 1/1
+    # for reproducible single-core runs and quick login sanity checks.
+    p.add_argument('--n-threads', type=int, default=1,
+                   help='torch threads for the model phase (P2). PRODUCTION: 8. '
+                        'The model is ~40%% of the run and scales ~1.8x from 4->8 '
+                        'threads. Sets request_cpus.')
     p.add_argument('--n-workers', type=int, default=1,
                    help='processes for the enumerate phase (P1). 1 = serial '
                         '(original path, zero pooling overhead). >1 forks this '
                         'many workers per step over disjoint parents. Independent '
-                        'of --n-threads, which parallelizes the model (P2).')
+                        'of --n-threads (model, P2). PRODUCTION: set equal to '
+                        '--n-threads (8) — those cores are reserved for the whole '
+                        'job, so fewer workers just idle them during enumerate.')
     p.add_argument('--device', default='cpu')
     args = p.parse_args()
 
