@@ -618,6 +618,21 @@ def total_w12(expr, target_sector):
 # stripped: cu built with min_w12 raw-strip), subsector and masters and the
 # target itself — i.e. exactly get_non_masters(relation, target_sector), matching
 # the single-step max_w12/total_w12 criterion.
+#
+# EXPERIMENT FINDINGS (pentagonbox 74/84/longrunner/memhog, 8/8): wall-time, not
+# step count, is the real metric. first900 wins on easy (74,84) and the
+# first900-friendly hard case (longrunner). The metric strategies are a MAJOR win
+# (~14-16x faster) exactly when first900 is pathological (memhog: 720 steps @
+# 13.7s/step -> ~170 steps @ 3.6s/step). Among the metrics, MAXWEIGHT is the
+# robust all-rounder / consensus winner: lowest SUMMED wall-time across the suite
+# (~1.9x faster than first900) because it captures the memhog win without
+# shortest's catastrophic longrunner blowup (10205s). last900 (newest) is bad even
+# with directs kept. Default stays first900 (bit-identical); set maxweight via env
+# for the pathological/compute-dominating integrals. The metric compute itself is
+# free (74: identical 4.3s/step); cost differences are which states the path
+# visits. NOTE: known train/inference target-ordering mismatch — training data
+# (generate_multisector_data.py) targets ONE integral by full (r,s,lex) order;
+# this beam search targets ALL (r,s)-tied integrals. Alignment is the next step.
 _ACTION_SELECT = os.environ.get('SAILIR_ACTION_SELECT', 'first900')
 _METRIC_STRATEGIES = ('maxweight', 'shortest', 'sumweight')
 # per-id metric arrays, cached + grown like packed_cu._bm_array (bounded memory)
