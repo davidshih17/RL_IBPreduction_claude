@@ -63,50 +63,24 @@ def _cap_incidental_threads():
         nt = int(_val('--n-threads') or 1)
     except ValueError:
         nw = nt = 1
-    ncap = max(1, nw, nt)                       # == request_cpus
     if nw > 1 or nt > 1:
         for k in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
                   'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
             os.environ.setdefault(k, '1')
         os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
-        # Route MKL through GNU OpenMP (libgomp) instead of Intel OpenMP
-        # (libiomp5). Intel's runtime throws a fatal assertion
-        # (kmp_affinity.cpp) when a forked child's available procs disagree with
-        # what it detected at init — which is exactly our case (fork pool +
-        # sched_setaffinity). libgomp is the same runtime torch already uses,
-        # respects sched_setaffinity + OMP_NUM_THREADS, and (verified) keeps the
-        # model 8-threaded. Do NOT use MKL_THREADING_LAYER=SEQUENTIAL: it forces
-        # the model matmuls to 1 thread. Do NOT set KMP_AFFINITY=disabled.
-        os.environ.setdefault('MKL_THREADING_LAYER', 'GNU')
-    # HARD CAP via CPU affinity (env thread-caps alone do NOT keep total CPU <=
-    # request: numpy ops in the maxweight metric + each forked worker inherently
-    # use slightly >1 core, so usage drifts ~1.2x past request -> Condor holds.
-    # Verified: pinning the tree to N cores makes the OS confine ALL threads /
-    # forked children to N cores -> measured CPU CANNOT exceed N). Fire ALWAYS
-    # (a 1-cpu worker's numpy metric wants ~1.2 cores too). Pin to ncap cores at
-    # a PID-derived offset so MANY workers sharing a node spread across cores
-    # instead of all piling on core 0. If Condor already cpuset-isolates the job
-    # (len(allowed)==ncap) we skip and let its cpuset stand. SAILIR_NO_CPU_PIN=1.
-    if os.environ.get('SAILIR_NO_CPU_PIN', '0') != '1':
-        _msg = ''
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-            n = len(allowed)
-            if 0 < ncap < n:
-                start = (os.getpid() * ncap) % n
-                want = {allowed[(start + i) % n] for i in range(ncap)}
-                os.sched_setaffinity(0, want)
-                got = sorted(os.sched_getaffinity(0))
-                _msg = (f"PINNED ncap={ncap} allowed={n} -> got {got}"
-                        if set(got) == want else
-                        f"PIN-MISMATCH ncap={ncap} want={sorted(want)} got={got}")
-            else:
-                _msg = (f"NO-PIN ncap={ncap} allowed={n} "
-                        f"(allowed<=ncap; relying on cgroup cpuset)")
-        except Exception as _e:   # noqa: BLE001 - want to SEE any failure
-            _msg = f"PIN-FAILED ncap={ncap}: {type(_e).__name__}: {_e}"
-        sys.stderr.write(f"[CPU-PIN] {_msg}\n")
-        sys.stderr.flush()
+        # HARD CAP via CPU affinity (env caps alone don't keep total CPU <=
+        # request: numpy + each forked worker use slightly >1 core, so n_workers
+        # ~= 1.2*n_workers cores -> Condor holds). Pin the tree to ncap cores so
+        # the OS confines all threads/children there; measured CPU then cannot
+        # exceed ncap. Verified: pin to N -> exactly N. SAILIR_NO_CPU_PIN=1 off.
+        if os.environ.get('SAILIR_NO_CPU_PIN', '0') != '1':
+            try:
+                ncap = max(nw, nt)
+                allowed = sorted(os.sched_getaffinity(0))
+                if 0 < ncap < len(allowed):
+                    os.sched_setaffinity(0, set(allowed[:ncap]))
+            except (AttributeError, OSError):
+                pass
 
 
 _cap_incidental_threads()
@@ -315,65 +289,54 @@ State_v5.__new__.__defaults__ = (None, None, None)  # max_w12, total_w12, aux_fl
 # !!! THIS BEAM SEARCH IS ALWAYS RUN AS A SINGLE-STEP (ONE-WEIGHT-LEVEL)       !!!
 # !!! REDUCER. IT DOES *NOT* REDUCE THE START INTEGRAL ALL THE WAY TO MASTERS. !!!
 #
-# Every expression is STRIPPED to the "active bucket" (is_active, below) AS IT
-# IS BUILT (see apply_substitution_v5), so get_non_masters() / n_non_masters
-# count ONLY the active non-masters — NOT every non-master integral. Therefore
-# `n_non_masters == 0` means "the ACTIVE BUCKET is drained", i.e. the start
-# integral has been reduced by ONE weight level into a "passenger expansion": a
-# combination of strictly-lower-weight integrals (the passengers, recovered by
-# replay). The ORCHESTRATOR chains these one-step reductions level by level. A
-# single worker NEVER has "reach the masters" as its goal.
-#
-# DO NOT read `n_non_masters == 0` as "reduced to masters." It is "active bucket
-# drained = one level done." The ground-truth training generator
-# (generate_multisector_data.py) DOES reduce fully to masters and has NO strip;
-# that is a DIFFERENT loop — do not transplant its semantics onto this code.
+# Every expression is STRIPPED to the "active bucket" (is_active, below) as it
+# is built (apply_substitution_v5), so get_non_masters() / n_non_masters count
+# ONLY the active non-masters. `n_non_masters == 0` therefore means "the ACTIVE
+# BUCKET is drained" = the start integral reduced by ONE weight level into a
+# passenger expansion (lower-weight integrals, recovered by replay). The
+# orchestrator chains the levels. A worker NEVER targets masters as its goal.
+# DO NOT read `n_non_masters == 0` as "reduced to masters" — that is the
+# training generator (generate_multisector_data.py: no strip), a DIFFERENT loop.
+# (v8 difference from v7: the active bucket / target / strip / beam use the FULL
+# total ordering instead of (w1,w2); it is still a single-step reducer.)
 # ============================================================================
 
-def is_active(integral, start_w12):
-    """True iff integral's weight (w1, w2) is lex-≥ start_w12. Defines the
-    ACTIVE BUCKET for the single-step reduction (see the banner above)."""
-    w = weight(integral)
-    return (w[0], w[1]) >= start_w12
-
-
-def strip_passenger(d, start_w12):
-    """Return new dict containing only active-weight entries (drops passengers
-    = sub-weight integrals, which the one-step reducer leaves for the next
-    level / the replay)."""
-    return {k: v for k, v in d.items() if is_active(k, start_w12)}
-
-
-# --- Single-step SUCCESS criterion -----------------------------------------
-# Default success = the (w1,w2) active bucket is drained (n_non_masters == 0).
-# SAILIR_SUCCESS_TOTAL=1 switches the success test to the FULL TOTAL ORDERING:
-# the start is reduced as soon as NO non-master remains at-or-above the start in
-# the total ordering (-r, -s, |abs|). The total-active set is a SUBSET of the
-# (w1,w2)-active set, so this fires no later than the default -> the single step
-# is even shorter (strictly <= the steps of the default criterion).
-_SUCCESS_TOTAL = os.environ.get('SAILIR_SUCCESS_TOTAL', '0') == '1'
-_START_TOTAL_KEY = None   # set in main() = _target_key(start_int)
-
-
 def _target_key(i):
-    """Total-ordering key matching the training-data target selection:
-    (-r, -s, |abs|-tuple). Smaller = higher in the total ordering."""
+    """Total-ordering key matching the training-data target selection
+    (generate_multisector_data.py line 640): sort ascending by (-r, -s, |abs|),
+    take [0] -> highest (r, s), tie-broken by the lexicographically SMALLEST
+    |abs|. v8 targets this SINGLE integral (no (r,s)-ties)."""
     w = weight(i)
     return (-w[0], -w[1], w[2])
 
 
-def _is_success(s, target_sector):
-    """Single-step success test. Default: (w1,w2) active bucket drained. With
-    SAILIR_SUCCESS_TOTAL=1: no non-master remains at-or-above the start in the
-    full total ordering ('reduce by total weight')."""
-    if not _SUCCESS_TOTAL:
-        return s.n_non_masters == 0
-    if s.n_non_masters == 0:
-        return True   # (w1,w2)-active drained => total-active (a subset) drained
-    for k in get_non_masters(s.expr, target_sector):
-        if _target_key(k) <= _START_TOTAL_KEY:
-            return False
-    return True
+# SAILIR_NO_SUBWEIGHT_STRIP=1: do NOT strip sub-weight at all (is_active always
+# True). Only sub-SECTOR terms are dropped. This turns v8 into a FULL reduction
+# of the whole sector to masters (n_non_masters==0 then = sector reduced to
+# masters), matching the training generator's setup exactly (no weight strip,
+# single total-ordering target). Higher memory (no passenger strip); main() also
+# skips the raw-strip when this is set. NOT the single-step reducer.
+_NO_SUBWEIGHT_STRIP = os.environ.get('SAILIR_NO_SUBWEIGHT_STRIP', '0') == '1'
+
+
+def is_active(integral, start_w12):
+    """v8: True iff `integral` is AT-OR-ABOVE the start in the FULL total ordering
+    (the one used to pick the target) -> it still needs reducing. start_w12 is the
+    start's total-ordering key _target_key(start_int). Strictly WEAKER than v7's
+    (w1,w2) >= start: only the single targeted integral (+ exact key-ties / any
+    strictly-higher (r,s)) is active, so the one-step reduction finishes much
+    sooner. (The raw-strip threshold uses the SAME total ordering — set in main()
+    as the 3-tuple (r, s, |abs|) — so raws and is_active agree on sub-weight.)
+    SAILIR_NO_SUBWEIGHT_STRIP=1 -> always True (no sub-weight strip; only
+    sub-sector terms get dropped, in apply_substitution_v5)."""
+    if _NO_SUBWEIGHT_STRIP:
+        return True
+    return _target_key(integral) <= start_w12
+
+
+def strip_passenger(d, start_w12):
+    """Return new dict containing only active-weight entries."""
+    return {k: v for k, v in d.items() if is_active(k, start_w12)}
 
 
 def _rs_as_dict(resolved_subs):
@@ -525,7 +488,7 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     new_path = state.path + [(target, ibp_op, delta)]
     new_score = state.score + math.log(action_prob + 1e-10)
     nm = get_non_masters(new_expr, target_sector)
-    mw, tw = _mw_tw_from_nm(nm)   # beam-ranking weights (total ordering if SAILIR_BEAM_TOTAL)
+    mw, tw = _mw_tw_from_nm(nm)   # full total-ordering beam-ranking weights
     child = State_v5(
         expr=new_expr,
         resolved_subs=new_rs,
@@ -673,28 +636,31 @@ def prepare_batched_input_v5_dummy(batch_data, device, max_subs=50,
 # Beam search loop
 # ============================================================================
 
-# SAILIR_BEAM_TOTAL=1: rank the beam by the FULL total ordering instead of just
-# (w1,w2). max_w12 -> (r, s, -|abs|) of the heaviest non-master (larger=heavier),
-# total_w12 -> (Sum r, Sum s, -Sum|abs|). Default (unset) = v7 (w1,w2) ranking.
-# Also flips the maxweight action-clip metric to total weight (see _select_actions).
-_BEAM_TOTAL = os.environ.get('SAILIR_BEAM_TOTAL', '0') == '1'
-
-
 def _mw_tw_from_nm(nm):
-    """(max_w12, total_w12) over a non-master iterable. Single source of truth so
-    construction / resume / initial / the helpers can't drift. Default = (w1,w2);
-    SAILIR_BEAM_TOTAL=1 = full total ordering (larger=heavier)."""
+    """(max_w12, total_w12) over a non-master iterable, in the FULL TOTAL
+    ordering, in ONE pass. Single source of truth for the beam-ranking weights
+    (state construction, resume, initial state, and the max_w12/total_w12
+    helpers all route through here so they cannot drift).
+
+      max_w12   = heaviest non-master's key (r, s, -|abs|-tuple)  [LARGER=HEAVIER]
+      total_w12 = (Sum r, Sum s, -Sum|abs| componentwise)         [LARGER=HEAVIER]
+
+    Both are 'larger = heavier', so the existing ASCENDING sort_weight /
+    sort_totalweight still put the most-reduced state first — now resolving
+    same-(r,s) states by the total ordering (smaller |abs| = heavier) instead of
+    treating them as tied. Empty -> ((0,0,()),(0,0,())) = fully-reduced sentinel
+    (sorts first). Memory: one abs-sum list + two result tuples per call
+    (bounded); compute: one pass, same weight() calls as the old (r,s) version
+    plus an O(N_INDICES) abs accumulate."""
     if not nm:
-        return ((0, 0, ()), (0, 0, ())) if _BEAM_TOTAL else ((0, 0), (0, 0))
-    if not _BEAM_TOTAL:
-        wl = [(weight(k)[0], weight(k)[1]) for k in nm]
-        return max(wl), (sum(w[0] for w in wl), sum(w[1] for w in wl))
-    sr = ss = 0
+        return (0, 0, ()), (0, 0, ())
+    sr = 0
+    ss = 0
     asum = None
-    best_tk = None
+    best_tk = None          # heaviest by _target_key (smaller key = heavier)
     best_w = None
     for k in nm:
-        w = weight(k)
+        w = weight(k)       # (r, s, |abs|-tuple)
         r = w[0]
         s = w[1]
         a = w[2]
@@ -777,13 +743,19 @@ def _secbm_of(integral):
 
 
 def _metric_arrays(reg):
-    """Per-id (wt1, wt2, ism, sec) int arrays for the metric strategies. Append-
-    only registry -> rebuild only when it grows (one bounded set of arrays)."""
+    """Per-id (twk, wt1, wt2, ism, sec) int arrays for the metric strategies.
+    twk = packed FULL-TOTAL-ORDERING weight scalar, LARGER = higher weight:
+        (r << 50) | (s << 44) | (ABS44 - packed_|abs|)
+    where packed_|abs| puts index 0 most-significant (4 bits/index, clamp 15),
+    so among equal (r,s) a SMALLER |abs|-tuple gives a LARGER twk = higher in the
+    total ordering (matches _target_key). maxweight ranks by twk (total weight);
+    wt1/wt2 kept for the additive sumweight aggregate. Append-only registry ->
+    rebuild only when it grows (one bounded set of arrays)."""
     n = len(reg._to_tuple)
     if _METRIC_CACHE['n'] == n:
         return _METRIC_CACHE
     old = _METRIC_CACHE['n'] if _METRIC_CACHE['n'] > 0 else 0
-    twk = np.empty(n, np.int64)   # packed total-weight scalar (larger = heavier)
+    twk = np.empty(n, np.int64)
     wt1 = np.empty(n, np.int64)
     wt2 = np.empty(n, np.int64)
     ism = np.empty(n, np.uint8)
@@ -859,15 +831,12 @@ def _select_actions(valid, target, aux_flat, max_actions, strategy):
             keys[ai] = -(1 << 61)          # pure-master/sub RHS -> reduces -> keep
             continue
         if strategy == 'maxweight':
-            if _BEAM_TOTAL:
-                keys[ai] = int(twk[sel_ids].max())   # highest TOTAL-weight RHS term
-            else:
-                w1 = wt1[sel_ids]
-                j = int(np.lexsort((wt2[sel_ids], w1))[-1])
-                keys[ai] = int(w1[j]) * BIGW + int(wt2[sel_ids][j])
+            # highest TOTAL-WEIGHT RHS term (full total ordering); keep actions
+            # whose worst introduced term is lowest -> argpartition lowest max.
+            keys[ai] = int(twk[sel_ids].max())
         elif strategy == 'shortest':
             keys[ai] = int(sel_ids.shape[0])
-        else:  # sumweight
+        else:  # sumweight: additive (r,s) aggregate (sum is not total-ordering)
             keys[ai] = int(wt1[sel_ids].sum()) * BIGW + int(wt2[sel_ids].sum())
     sel = np.argpartition(keys, max_actions)[:max_actions]
     sel.sort()                              # keep original order among the chosen
@@ -1327,11 +1296,11 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         local_aux = {}            # parent_idx -> rebuilt PackedEq aux (rare path)
         for parent_idx in parent_indices:
             s = beam[parent_idx]
-            if _is_success(s, target_sector):   # single-step: active bucket drained
+            if s.n_non_masters == 0:
                 continue
             nm = get_non_masters(s.expr, target_sector)
-            mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-            tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+            _tgt = min(nm, key=_target_key)  # v8: single full-ordering target (no ties)
+            tied = [_tgt]
             dummy_subs = {k: {} for k in s.resolved_subs.keys()}
             if s.aux_flat is not None:
                 indirect_cache = _aux_to_result(s.aux_flat, env)
@@ -1378,10 +1347,11 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
                             valid = [a for a in valid if a not in _bt_set]
                 if valid:
+                    _full_nv = len(valid)   # pre-cap count (for cap-bite logging)
                     if _ACTION_SELECT != 'first900':
                         valid = _select_actions(valid, target, s.aux_flat,
                                                 max_actions, _ACTION_SELECT)
-                    local_tasks.append((parent_idx, target, valid))
+                    local_tasks.append((parent_idx, target, valid, _full_nv))
         return local_tasks, local_aux
 
     def _forkpool_map(slice_fn, partitions):
@@ -1470,7 +1440,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     for step in range(resume_step, max_steps):
         # Termination: ANY beam state has drained — we only need one successful
         # path (the proof). Don't wait for every beam slot to finish.
-        winning = next((s for s in beam if _is_success(s, target_sector)), None)
+        winning = next((s for s in beam if s.n_non_masters == 0), None)
         if winning is not None:
             best_state = winning
             if verbose:
@@ -1549,12 +1519,12 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             # === serial enumerate path — original code, indent-only change ===
             tasks = []  # (parent_idx, target, valid)
             for parent_idx, s in enumerate(beam):
-                if _is_success(s, target_sector):   # single-step: active bucket drained
+                if s.n_non_masters == 0:
                     continue
                 _t = time.time() if _v5_prof else 0
                 nm = get_non_masters(s.expr, target_sector)
-                mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                _tgt = min(nm, key=_target_key)  # v8: single full-ordering target (no ties)
+                tied = [_tgt]
                 if _v5_prof:
                     _p1['nm_tied'] += time.time() - _t
                 # Dummy subs (RS keys with empty values) — only used as keys for
@@ -1645,12 +1615,13 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         if _v5_prof:
                             _p1['tabu'] += time.time() - _t
                     if valid:
+                        _full_nv = len(valid)   # pre-cap count
                         if _ACTION_SELECT != 'first900':
                             valid = _select_actions(valid, target, s.aux_flat,
                                                     max_actions, _ACTION_SELECT)
                         if _v5_prof:
                             _ct['n_valid_total'] += len(valid)
-                        tasks.append((parent_idx, target, valid))
+                        tasks.append((parent_idx, target, valid, _full_nv))
 
         # Instrumentation: dump tasks/valid lists at a specific step
         _dump_step = os.environ.get('V5_DUMP_VALIDS_AT_STEP')
@@ -1660,7 +1631,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             with open(_dump_path, 'wb') as _df:
                 pickle.dump([
                     (pi, tuple(tg), tuple((op, tuple(d)) for op, d in v))
-                    for pi, tg, v in tasks
+                    for pi, tg, v, *_ in tasks
                 ], _df)
             print(f'  [DUMP] valids at step {step+1} → {_dump_path}', flush=True)
 
@@ -1679,8 +1650,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     nm = get_non_masters(s.expr, target_sector)
                     if not nm:
                         continue
-                    mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                    tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                    _tgt = min(nm, key=_target_key)  # v8: single full-ordering target
+                    tied = [_tgt]
                     expr_fp_ = frozenset(s.expr.items())
                     ts_ = (tabu_dict.get(expr_fp_)
                            if tabu_dict is not None else None)
@@ -1726,7 +1697,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                                 # what was previously tabu'd → allow.
                                 unblocked.append((op, dlt))
                         if unblocked:
-                            tasks.append((parent_idx, tgt, unblocked))
+                            tasks.append((parent_idx, tgt, unblocked, len(unblocked)))
                             n_unblocked_total += len(unblocked)
                 if tasks:
                     _sol_fallback_count += 1
@@ -1823,8 +1794,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         nm = get_non_masters(st.expr, target_sector)
                         if not nm:
                             continue
-                        mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                        tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                        _tgt = min(nm, key=_target_key)  # v8: single full-ordering target
+                        tied = [_tgt]
                         # rebuild indirect_cache for re-enumeration
                         ic = (_aux_to_result(st.aux_flat, env)
                               if st.aux_flat is not None else None)
@@ -1901,7 +1872,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # next. None / 0 / >= len(batch_data) means no chunking (original).
         _t = time.time() if _v5_prof else 0
         batch_data = []
-        for parent_idx, target, valid in tasks:
+        for parent_idx, target, valid, *_ in tasks:
             s = beam[parent_idx]
             batch_data.append((s.expr, s.resolved_subs, valid, target_sector, target))
         # Compute the global action width once so probs_all shape is stable.
@@ -1937,7 +1908,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # For each task, take top-K actions by prob, apply, generate candidates
         K = max(1, top_k if top_k is not None else beam_width // 2)
         _pick_dump_step = [] if _pick_dump_dir else None
-        for ti, (parent_idx, target, valid) in enumerate(tasks):
+        for ti, (parent_idx, target, valid, _full_nv) in enumerate(tasks):
             n_v = min(len(valid), probs.shape[1])
             row = probs[ti, :n_v].numpy()
             parent_state = beam[parent_idx]
@@ -2253,12 +2224,18 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             rs_vsz = sum(len(v) for v in best_in_beam.resolved_subs.values())
             # v6: count distinct exprs in beam to measure diversity gain.
             n_uniq_expr = len({frozenset(s.expr.items()) for s in beam})
+            # Pre-cap valid-action counts per task (t[3]) -> see when the
+            # max_actions cap bites (nvalid_max >= max_actions => truncated).
+            _fnvs = [t[3] for t in tasks] if tasks else [0]
+            _ncap = sum(1 for x in _fnvs if x > max_actions)
             print(f'[v6 step {step+1:>3}] beam={len(beam)} '
                   f'uniq_expr={n_uniq_expr} '
                   f'best mw={mw_best} nm={nm_best} '
                   f'rs={sz_rs} rs_vsz={rs_vsz} '
                   f'expr={len(best_in_beam.expr)} '
                   f'cand={len(candidates)} '
+                  f'nvalid_max={max(_fnvs)} nvalid_tot={sum(_fnvs)} '
+                  f'capped={_ncap}/{len(_fnvs)} '
                   f't_step={time.time()-t_step:.1f}s '
                   f't_total={time.time()-t0:.1f}s',
                   flush=True)
@@ -2594,17 +2571,6 @@ def main():
         _memprobe_mod.record_milestone('rss_at_import_kb')
 
     torch.set_num_threads(args.n_threads)
-    # torch's INTER-op pool is SEPARATE from set_num_threads (intra-op) and
-    # defaults to the node core count -> on heavy batches it spills past
-    # request_cpus (the intra-op pool already uses all n_threads, leaving no
-    # headroom). Cap it to 1 whenever we are multi-threaded/forked, matching the
-    # _cap_incidental_threads philosophy. SAILIR_CAP_INTEROP=0 forces it off.
-    if (os.environ.get('SAILIR_CAP_INTEROP', '1') != '0'
-            and (args.n_threads > 1 or args.n_workers > 1)):
-        try:
-            torch.set_num_interop_threads(1)
-        except RuntimeError:
-            pass   # already initialized / parallel work started
 
     print(f'== v5 beam search ==', flush=True)
     print(f'  topology      = {args.topology}', flush=True)
@@ -2646,20 +2612,27 @@ def main():
     integral_str = args.integral.strip("'").strip('"')
     start_int = tuple(int(x) for x in integral_str.split(','))
     start_w = weight(start_int)
-    start_w12 = (start_w[0], start_w[1])
-    global _START_TOTAL_KEY
-    _START_TOTAL_KEY = _target_key(start_int)   # for SAILIR_SUCCESS_TOTAL=1
+    # v8: start_w12 is the FULL total-ordering key (-r,-s,|abs|) consumed by
+    # is_active (the weaker active criterion). The raw-strip uses the SAME total
+    # ordering (consistency): threshold = (r, s, |abs|-tuple) = start_w itself.
+    start_w12 = _target_key(start_int)
+    start_raw_thr = (start_w[0], start_w[1], start_w[2])  # = full weight tuple
     print(f'  start integral weight = {start_w}', flush=True)
-    print(f'  active threshold      = (w1,w2) >= {start_w12}', flush=True)
-    print(f'  SINGLE-STEP reducer; success criterion = '
-          f'{"TOTAL-weight active bucket drained" if _SUCCESS_TOTAL else "(w1,w2) active bucket drained"}',
+    print(f'  active threshold (v8 total order) = _target_key <= {start_w12}',
           flush=True)
     # Strip sub-weight from the CACHED raws used by the search (cu built mod-
     # lower-weight). Must be BEFORE any raw is cached. Replay uses the unstripped
     # get_raw_equation, so final_expr is unaffected. SAILIR_STRIP_RAWS=0 disables.
-    if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0':
-        ibp_env.set_raw_strip_threshold(start_w12)
-        print(f'  raw-strip: cached raws stripped to (w1,w2) >= {start_w12}', flush=True)
+    # v8: total-ordering raw-strip (3-tuple) so the raws and is_active AGREE on
+    # what is sub-weight (same-(r,s) larger-|abs| terms are stripped too).
+    if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0' and not _NO_SUBWEIGHT_STRIP:
+        ibp_env.set_raw_strip_threshold(start_raw_thr)
+        print(f'  raw-strip (v8 total order): cached raws stripped to '
+              f'key <= {start_w12}', flush=True)
+    if _NO_SUBWEIGHT_STRIP:
+        print('  SAILIR_NO_SUBWEIGHT_STRIP=1: NO sub-weight strip (raws + expr + '
+              'RS keep all weights); only sub-SECTOR dropped -> FULL reduction to '
+              'masters (training-matched), NOT single-step.', flush=True)
 
     target_sector = tuple(get_sector_mask(start_int))
     print(f'  target_sector = {target_sector}', flush=True)
@@ -2727,9 +2700,8 @@ def main():
     except OSError:
         pass
 
-    if _is_success(best_state, target_sector):
-        print('SUCCESS — single-step reduction done: active bucket drained '
-              '(start_int reduced one weight level -> passenger expansion)', flush=True)
+    if best_state.n_non_masters == 0:
+        print('SUCCESS — active bucket drained (start_int = passenger expansion)', flush=True)
     else:
         print('INCOMPLETE — active bucket still has non-masters', flush=True)
 

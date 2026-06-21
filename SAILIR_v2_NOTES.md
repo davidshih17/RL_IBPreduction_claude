@@ -5,7 +5,26 @@ gotchas discovered while building/debugging v5 of the beam search (the
 strip-passenger / mod-out-by-sub-weight architecture). Intended as
 groundwork for SAILIR v2.
 
-Last updated: 2026-06-04.
+Last updated: 2026-06-19.
+
+---
+
+## 0. THE BEAM SEARCH IS A SINGLE-STEP REDUCER (read before anything else)
+
+`beam_search_v7.py` / `beam_search_v8.py` are **always run as a single-step
+(one-weight-level) reduction**. A worker reduces the start integral by **exactly
+one weight level** — NOT to master integrals. Each expression is stripped to the
+"active bucket" (`is_active`, weight ≥ start) as it is built, so
+`get_non_masters()` / `n_non_masters` count ONLY the **active** non-masters.
+Hence `n_non_masters == 0` = **"active bucket drained"** = the start reduced one
+level into a *passenger expansion* (lower-weight integrals, recovered by replay).
+The orchestrator chains the levels. **Do NOT read `n_non_masters == 0` as
+"reduced to masters"** — that is the training-data generator
+(`generate_multisector_data.py`, no strip), a *different* loop. (v8 uses the full
+total ordering for the active bucket/target/strip/beam; still single-step.)
+Toggle `SAILIR_SUCCESS_TOTAL=1` (v7) = success when no non-master remains
+at-or-above start in the full total ordering (subset of the (w1,w2) bucket →
+strictly ≤ steps). See the code banner at the "Weight-active partition" section.
 
 ---
 

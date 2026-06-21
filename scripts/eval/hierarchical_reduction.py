@@ -113,7 +113,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                          checkpoint_time_seconds=300, resume_from=None,
                          dedup_beam_by_content=False,
                          use_delta_worker=False, memory_gb=None,
-                         use_v6_worker=False):
+                         use_v6_worker=False, use_v7_worker=False):
     """Create a Condor submit file for a single-integral one-step reduction.
 
     PAPER DEFAULTS (matches trianglebox-paper recipe):
@@ -135,6 +135,13 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     """
 
     integral_str = ','.join(str(x) for x in integral)
+    if use_v7_worker:
+        # The worker runs beam_search_v7 at --n-threads 8 --n-workers 8 and pins
+        # itself to 8 cores. Request 10 (not 8) so the rare (~1%) transient during
+        # the 8-way enumerate fork-spawn — which Condor has sampled at ~9.9 even on
+        # a correctly 8-core-pinned job — has 2 cores of headroom and never trips
+        # "cpu usage exceeded RequestCpus". Steady state still uses 8.
+        cpus = 10
     # Worker now defaults to --paper-masters-only ON. Only emit a flag if we want to disable.
     paper_masters_flag = '' if paper_masters_only else ' --no-paper-masters-only'
     n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
@@ -174,8 +181,23 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
             memory = max(memory, memory_gb)
     else:
         memory = 4 * cpus
+    if use_v7_worker:
+        memory = max(memory, 12)   # floor for the 8/8 fork-pool v7 worker
 
-    if use_v6_worker:
+    if use_v7_worker:
+        # onestep_worker_v7.py: SUBPROCESS-runs the current beam_search_v7.py at
+        # --n-threads 8 --n-workers 8 with ALL v7 settings (SUCCESS_TOTAL=1 total-
+        # weight single-step success, (r,s) maxweight action-cap, GNU MKL layer +
+        # affinity pin so the 8-cpu fork pool stays <= request on Condor) and
+        # writes orchestrator-compatible result.pkl. Same CLI as v6.
+        worker_script = 'onestep_worker_v7.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}{resume_flag}')
+    elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
         # any()-termination + macro-dedup). Accepts the same CLI as
@@ -385,6 +407,13 @@ def main():
                              'Empirically 9.7\u00d7 faster + 10.9\u00d7 lower memory '
                              'than the delta worker on the canonical '
                              'pentagonbox long-runner integral.')
+    parser.add_argument('--use-v7-worker', action='store_true',
+                        help='Dispatch workers to onestep_worker_v7.py, which '
+                             'subprocess-runs the CURRENT beam_search_v7.py at '
+                             '--n-threads 8 --n-workers 8 with ALL v7 settings '
+                             '(SUCCESS_TOTAL total-weight single-step success, '
+                             '(r,s) maxweight action-cap, GNU MKL + affinity pin). '
+                             'Forces request_cpus=8.')
     parser.add_argument('--worker-memory-gb', type=int, default=None,
                         help='Override per-worker memory request (GB). '
                              'Default scales with cpus (4 * cpus). For the '
@@ -418,8 +447,29 @@ def main():
     print('Async Hierarchical Reduction with Memoization (v13)')
     print('='*70)
     print(f'Config:')
+    # Args that the v7 in-process worker IGNORES (it hardcodes its own probe
+    # recipe). Flag them so the dump is not misleading (e.g. beam_sort says
+    # "mixed" here but the worker always runs beam_sort='weight').
+    _v7_overridden = {'beam_sort', 'worker_dedup_beam_by_content', 'beam_width',
+                      'straggler_cpus', 'straggler2_cpus', 'straggler2_beam_width'}
     for k, v in vars(args).items():
-        print(f'  {k}: {v}')
+        note = '   [IGNORED by v7 worker — see note below]' \
+            if (getattr(args, 'use_v7_worker', False) and k in _v7_overridden) else ''
+        print(f'  {k}: {v}{note}')
+    if getattr(args, 'use_v7_worker', False):
+        print()
+        print('  --- v7 worker FIXED settings (what the search ACTUALLY uses) ---')
+        print('  worker            : onestep_worker_v7.py (in-process beam_search_v7)')
+        print('  beam_sort         : weight')
+        print('  n_threads         : 8        n_workers: 8   (8-core affinity pin)')
+        print('  max_actions       : 900      model_batch_chunk: 8')
+        print('  tabu              : True     use_exprkeyed: False')
+        print('  iraws_keep_first  : 50       lazy_rs: True   use_incremental_aux: True')
+        print('  SAILIR_SUCCESS_TOTAL=1  SAILIR_ACTION_SELECT=maxweight  '
+              'SAILIR_BEAM_TOTAL=unset')
+        print('  SAILIR_PACKED_RS=1  SAILIR_STRIP_RAWS=1  SAILIR_END_OF_STEP_TRIM=1  '
+              'SAILIR_TABU_CAP=0')
+        print('  (matches submit_v7_successonly_probes.sh exactly)')
     print()
 
     # Setup
@@ -534,9 +584,21 @@ def main():
                   f'{time.time()-t_rf:.1f}s', flush=True)
         expr = apply_substitutions(expr, cache, args.prime)
 
-    # --reduce-only: restrict this round to a target list. Seed expr to their
-    # sum and drop them from the (resumed) cache so they re-submit; anything not
-    # reachable from them never enters expr and is thus set aside.
+    # --reduce-only: restrict this round to a target list by DROPPING those
+    # integrals from the (resumed) cache so they re-submit. Seed expr from the
+    # REAL start integral replayed through the (target-dropped) cache — NOT a
+    # unit-coefficient bag of the targets.
+    #
+    # BUG FIX: the old seed `{ig: 1 for ig in targets}` gave every target a fake
+    # coefficient of 1. With those bogus weights, a target's coefficient could
+    # cancel to 0 mod prime via another substitution; the orchestrator's
+    # "cancel pending jobs whose integral is no longer in expr" logic then killed
+    # it as "no longer needed", it was never reduced, and the run falsely
+    # reported "0 non-masters / SUCCESS" — on the unit bag, not the real start.
+    # Seeding from the real start gives expr the TRUE coefficients, so a target
+    # leaves expr only when it genuinely doesn't contribute, the per-iteration
+    # non-master count is an honest live status, and the final 0-non-masters
+    # report is a true statement about the start integral.
     if args.reduce_only:
         targets = []
         with open(args.reduce_only) as f:
@@ -546,9 +608,12 @@ def main():
                     targets.append(tuple(int(x) for x in line.split(',')))
         for ig in targets:
             cache.pop(ig, None)
-        expr = apply_substitutions({ig: 1 for ig in targets}, cache, args.prime)
-        print(f'[REDUCE-ONLY] {len(targets)} targets; dropped from cache and '
-              f'seeded expr; |expr|={len(expr)}, |cache|={len(cache)}', flush=True)
+        expr = apply_substitutions({starting_integral: 1}, cache, args.prime)
+        n_nm_seed = len(get_non_masters(expr))
+        print(f'[REDUCE-ONLY] {len(targets)} targets dropped from cache; expr '
+              f'seeded from REAL start replay (true coefficients); '
+              f'|expr|={len(expr)}, non-masters={n_nm_seed}, '
+              f'|cache|={len(cache)}', flush=True)
 
     # integral -> path of its most-recent worker's .checkpoint file. Persists
     # across pending lifecycle (does NOT get cleared by obsolete-cancel) so a
@@ -665,6 +730,7 @@ def main():
                 dedup_beam_by_content=args.worker_dedup_beam_by_content,
                 use_delta_worker=args.use_delta_worker,
                 use_v6_worker=args.use_v6_worker,
+                use_v7_worker=args.use_v7_worker,
                 memory_gb=args.worker_memory_gb,
             )
 
@@ -758,6 +824,7 @@ def main():
                     dedup_beam_by_content=args.worker_dedup_beam_by_content,
                     use_delta_worker=args.use_delta_worker,
                     use_v6_worker=args.use_v6_worker,
+                use_v7_worker=args.use_v7_worker,
                     memory_gb=args.worker_memory_gb,
                 )
 
@@ -823,6 +890,7 @@ def main():
                     dedup_beam_by_content=True,  # force dedup at this level
                     use_delta_worker=args.use_delta_worker,
                     use_v6_worker=args.use_v6_worker,
+                use_v7_worker=args.use_v7_worker,
                     memory_gb=args.worker_memory_gb,
                 )
 

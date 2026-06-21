@@ -60,39 +60,49 @@ def parse_integral(base):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('sweep_root')
+    p.add_argument('sweep_root', nargs='+',
+                   help='One or more sweep dirs, applied in order: the start '
+                        'integral is replayed through round1 then round2 then '
+                        'round3, by UNIONing their work/results caches (later '
+                        'rounds override earlier on key collision).')
     p.add_argument('start_integral')
     p.add_argument('--prime', type=int, default=1009)
     p.add_argument('--out', default=None,
-                   help='Output path (default: <sweep_root>/replay_state.pkl)')
+                   help='Output path (default: <last sweep_root>/replay_state.pkl)')
     args = p.parse_args()
 
-    res_dir = os.path.join(args.sweep_root, 'work', 'results')
-    log_dir = os.path.join(args.sweep_root, 'work', 'logs')
+    sweep_roots = args.sweep_root
+    log_dir = os.path.join(sweep_roots[-1], 'work', 'logs')
     start = tuple(int(x) for x in args.start_integral.split(','))
-    out_path = args.out or os.path.join(args.sweep_root, 'replay_state.pkl')
+    out_path = args.out or os.path.join(sweep_roots[-1], 'replay_state.pkl')
 
     t0 = time.time()
-    print(f'[{time.time()-t0:5.1f}s] scanning {res_dir}/*.pkl ...', flush=True)
     cache = {}
     n_success = n_fail = 0
-    pkls = glob.glob(os.path.join(res_dir, '*.pkl'))
-    for i, f in enumerate(pkls):
-        try:
-            r = pickle.load(open(f, 'rb'))
-        except Exception:
-            continue
-        ig = r.get('original_integral')
-        if ig is None:
-            continue
-        if r.get('success'):
-            cache[ig] = r.get('final_expr', {})
-            n_success += 1
-        else:
-            cache[ig] = {ig: 1}
-            n_fail += 1
-        if (i + 1) % 20000 == 0:
-            print(f'[{time.time()-t0:5.1f}s]   {i+1}/{len(pkls)}', flush=True)
+    for sweep_root in sweep_roots:
+        res_dir = os.path.join(sweep_root, 'work', 'results')
+        print(f'[{time.time()-t0:5.1f}s] scanning {res_dir}/*.pkl ...', flush=True)
+        pkls = glob.glob(os.path.join(res_dir, '*.pkl'))
+        for i, f in enumerate(pkls):
+            if f.endswith('.bs7.pkl'):
+                continue
+            try:
+                r = pickle.load(open(f, 'rb'))
+            except Exception:
+                continue
+            ig = r.get('original_integral')
+            if ig is None:
+                continue
+            if r.get('success'):
+                cache[ig] = r.get('final_expr', {})
+                n_success += 1
+            else:
+                cache[ig] = {ig: 1}
+                n_fail += 1
+            if (i + 1) % 20000 == 0:
+                print(f'[{time.time()-t0:5.1f}s]   {i+1}/{len(pkls)}', flush=True)
+        print(f'[{time.time()-t0:5.1f}s]   after {sweep_root}: '
+              f'combined cache = {len(cache)}', flush=True)
     print(f'[{time.time()-t0:5.1f}s] cache: {n_success} success + '
           f'{n_fail} fail-identity = {len(cache)}', flush=True)
 

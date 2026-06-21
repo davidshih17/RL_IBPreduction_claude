@@ -201,12 +201,21 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
 
     Action indices: 0..n_ibp-1 are IBP, n_ibp..n_ibp+n_li-1 are LI.
 
-    min_w12: if not None, terms whose weight (w1,w2) < min_w12 are NEVER
+    min_w12: if not None, terms below the threshold in weight are NEVER
         generated (mod-lower-weight build). Each template term is independent
         (integral = seed+shift, coeff = eval_coeff(seed)), so skipping a
         sub-weight term cannot affect any surviving term — bit-identical to
         building the full dict and stripping after, but with zero extra
         allocation/free churn. Default None => full equation (replay path).
+
+        The threshold may be:
+          - a 2-tuple (m0, m1)        -> (r,s) strip (v7): keep (w0,w1) >= (m0,m1).
+          - a 3-tuple (m0, m1, abs0)  -> FULL TOTAL-ORDERING strip (v8): keep iff
+            the term is at-or-above the start in the total ordering
+            key=(-w0,-w1,|abs|), i.e. keep unless w0<m0, or (w0==m0 and w1<m1),
+            or (w0==m0 and w1==m1 and |abs|-tuple > abs0). The abs-tuple is built
+            ONLY at the (w0==m0 and w1==m1) boundary (rare), so the hot path is
+            untouched and the change is memory-neutral.
     """
     n_ibp = len(ibp_t)
     if ibp_op >= n_ibp:
@@ -229,7 +238,11 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
     # tuple. This avoids transient-garbage tuples (the ~28% stripped terms) that
     # would otherwise fragment the glibc heap and inflate peak_rss. The tuple is
     # built ONLY for terms we keep. Net SPEEDUP and lower memory vs the full path.
-    m0, m1 = min_w12
+    if len(min_w12) == 3:
+        m0, m1, abs0 = min_w12      # v8: full total-ordering threshold
+    else:
+        m0, m1 = min_w12            # v7: (r,s) threshold
+        abs0 = None
     for shift, coeff_str in template:
         w0 = 0
         w1 = 0
@@ -241,6 +254,12 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
                 w1 -= v
         if w0 < m0 or (w0 == m0 and w1 < m1):
             continue
+        if abs0 is not None and w0 == m0 and w1 == m1:
+            # boundary: same (r,s) as the start -> total-ordering tie-break on
+            # |abs|. A term with a lexicographically LARGER |abs|-tuple is BELOW
+            # the start in the total ordering, so it is sub-weight -> strip.
+            if tuple(abs(seed[i] + shift[i]) for i in range(N_INDICES)) > abs0:
+                continue
         c = eval_coeff(coeff_str, seed)
         if c != 0:
             integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
