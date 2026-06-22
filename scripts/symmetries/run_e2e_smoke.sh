@@ -17,7 +17,7 @@ run_topology () {
     echo "############# $NAME #############" >> $LOG
 
     echo ">>> datagen" >> $LOG
-    PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/generate_multisector_data.py \
+    PYTHONUNBUFFERED=1 "$PY" -u data-gen/generate_multisector_data.py \
         --topology $DIR \
         --n_scrambles 10 \
         --min_steps 2 --max_steps 4 \
@@ -27,7 +27,7 @@ run_topology () {
     echo "    exit=$?  $(wc -l < $OUTDIR/data.jsonl) samples" >> $LOG
 
     echo ">>> preprocess" >> $LOG
-    PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/preprocess_to_tensors.py \
+    PYTHONUNBUFFERED=1 "$PY" -u data-gen/preprocess_to_tensors.py \
         --topology $DIR \
         --input $OUTDIR/data.jsonl \
         --output_dir $OUTDIR/packed \
@@ -40,7 +40,7 @@ run_topology () {
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path('.').resolve()))
-sys.path.insert(0, str(Path('scripts/train').resolve()))
+sys.path.insert(0, str(Path('training').resolve()))
 import torch
 from sailir.topology import Topology
 from sailir.classifier import IBPActionClassifier

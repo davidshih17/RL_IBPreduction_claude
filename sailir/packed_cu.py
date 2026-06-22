@@ -45,7 +45,7 @@ _PHASEA_LEGACY = _os.environ.get('SAILIR_PHASEA_LEGACY') == '1'
 # (int()/ascontiguousarray x2/None-check/dispatch), with the substitution target
 # hoisted out of the loop.
 try:
-    from _packed_kernels import substitute_one_merge as _SUB_MERGE_CY
+    from sailir._packed_kernels import substitute_one_merge as _SUB_MERGE_CY
 except ImportError:
     _SUB_MERGE_CY = None
 
@@ -53,7 +53,7 @@ except ImportError:
 # PackedEq churn and Python dispatch removed). Used when target_sector is None
 # (the incremental caller's only mode); falls back to the Phase-1 loop otherwise.
 try:
-    from _packed_kernels import phaseA_substitute_all as _PHASEA_CY
+    from sailir._packed_kernels import phaseA_substitute_all as _PHASEA_CY
 except ImportError:
     _PHASEA_CY = None
 
@@ -74,8 +74,8 @@ def _bm_array(reg):
 # replacing per-entry np.searchsorted + its dispatch overhead. Falls back to
 # numpy if the extension isn't built.
 try:
-    from _packed_kernels import contains_sorted as _CONTAINS_CY
-    from _packed_kernels import phase1b_packed as _PHASE1B_CY
+    from sailir._packed_kernels import contains_sorted as _CONTAINS_CY
+    from sailir._packed_kernels import phase1b_packed as _PHASE1B_CY
 except ImportError:
     _CONTAINS_CY = None
     _PHASE1B_CY = None

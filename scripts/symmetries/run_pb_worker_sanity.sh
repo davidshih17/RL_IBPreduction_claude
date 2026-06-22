@@ -13,7 +13,7 @@ WORKER_ID=0
 N_SCRAMBLES=20      # small so it finishes quickly
 OUTDIR=$SAILIR_DIR/scripts/symmetries/tmp_pb_sanity
 
-PYTHONUNBUFFERED=1 bash $SAILIR_DIR/scripts/data_gen/datagen_worker_pentagonbox.sh \
+PYTHONUNBUFFERED=1 bash $SAILIR_DIR/data-gen/datagen_worker_pentagonbox.sh \
     $WORKER_ID $N_SCRAMBLES $OUTDIR > $LOG 2>&1
 echo "exit=$?"
 echo

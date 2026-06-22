@@ -92,16 +92,16 @@ the $8\times10^4$ trajectories / $1.06\times10^6$ samples reported in paper §IV
 export SAILIR_DIR=$(pwd)
 export PYTHON=$(which python)
 
-bash scripts/data_gen/submit_datagen.sh 100 1000
-condor_submit scripts/data_gen/datagen_job_custom.jdl
+bash data-gen/submit_datagen.sh 100 1000
+condor_submit data-gen/datagen_job_custom.jdl
 # ... wait for all 100 jobs to finish ...
-bash scripts/data_gen/merge_outputs.sh data/raw_jsonl/
+bash data-gen/merge_outputs.sh data/raw_jsonl/
 ```
 
 ### 2. Pack JSONL into tensors
 
 ```bash
-python scripts/data_gen/preprocess_to_tensors.py \
+python data-gen/preprocess_to_tensors.py \
     --topology   topology_input/trianglebox \
     --input      data/raw_jsonl/multisector_training_data.jsonl \
     --output_dir data/multisector/
@@ -115,7 +115,7 @@ streams them in sequence, so no concatenation step is needed.
 ### 3. Train
 
 ```bash
-python scripts/train/train_classifier.py \
+python training/train_classifier.py \
     --topology   topology_input/trianglebox \
     --data_dir   data/multisector/ \
     --output_dir checkpoints/ \
@@ -180,9 +180,9 @@ The pentagon-box pipeline mirrors the trianglebox flow with the
 export SAILIR_DIR=$(pwd)
 export PYTHON=$(which python)
 
-condor_submit scripts/data_gen/datagen_pentagonbox.jdl     # 100 × 1000 (= 1×)
+condor_submit data-gen/datagen_pentagonbox.jdl     # 100 × 1000 (= 1×)
 # or:
-condor_submit scripts/data_gen/datagen_pentagonbox_10x.jdl # 1000 × 1000 (= 10×)
+condor_submit data-gen/datagen_pentagonbox_10x.jdl # 1000 × 1000 (= 10×)
 ```
 
 Output JSONLs land in `data/pentagonbox_raw_jsonl/` (or
@@ -196,7 +196,7 @@ would exhaust memory. Each worker JSONL is preprocessed independently into
 its own packed shard:
 
 ```bash
-bash scripts/data_gen/submit_preprocess_pentagonbox_10x_batched.sh
+bash data-gen/submit_preprocess_pentagonbox_10x_batched.sh
 ```
 
 This submits the 1000 shards in throttled batches via Condor file transfer
@@ -209,13 +209,13 @@ to keep peak RAM bounded.
 ### Train
 
 ```bash
-condor_submit scripts/train/train_pentagonbox.sub
+condor_submit training/train_pentagonbox.sub
 ```
 
 Or directly:
 
 ```bash
-python scripts/train/train_classifier.py \
+python training/train_classifier.py \
     --topology   topology_input/pentagonbox \
     --data_dir   data/pentagonbox_packed/ \
     --output_dir checkpoints/pentagonbox/ \

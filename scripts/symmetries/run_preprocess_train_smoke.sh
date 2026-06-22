@@ -10,7 +10,7 @@ LOG=scripts/symmetries/logs/preprocess_train_smoke.log
 : > $LOG
 
 echo "==== preprocess trianglebox ====" >> $LOG
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/preprocess_to_tensors.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/preprocess_to_tensors.py \
     --topology topology_input/trianglebox \
     --input scripts/symmetries/tmp_datagen/tb_smoke.jsonl \
     --output_dir scripts/symmetries/tmp_datagen/tb_packed \
@@ -20,7 +20,7 @@ echo "tb preprocess exit=$?" >> $LOG
 
 echo >> $LOG
 echo "==== preprocess pentagon-box ====" >> $LOG
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/preprocess_to_tensors.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/preprocess_to_tensors.py \
     --topology topology_input/pentagonbox \
     --input scripts/symmetries/tmp_datagen/pb_smoke.jsonl \
     --output_dir scripts/symmetries/tmp_datagen/pb_packed \
@@ -30,7 +30,7 @@ echo "pb preprocess exit=$?" >> $LOG
 
 echo >> $LOG
 echo "==== train_classifier.py --help ====" >> $LOG
-PYTHONUNBUFFERED=1 "$PY" -u scripts/train/train_classifier.py --help >> $LOG 2>&1
+PYTHONUNBUFFERED=1 "$PY" -u training/train_classifier.py --help >> $LOG 2>&1
 echo "train --help exit=$?" >> $LOG
 
 cat $LOG | tail -40

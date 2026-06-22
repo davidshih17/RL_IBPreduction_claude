@@ -22,7 +22,7 @@ import numpy as np
 # Optional nogil C kernel for substitute_one (built via _setup_cython.py).
 # Falls back to the numpy version below when the .so is absent.
 try:
-    from _packed_kernels import substitute_one_merge as _SUB_MERGE_CY
+    from sailir._packed_kernels import substitute_one_merge as _SUB_MERGE_CY
 except ImportError:
     _SUB_MERGE_CY = None
 

@@ -14,21 +14,21 @@ SCRAMBLES=20
 
 echo "==== UN-REFACTORED (SAILIR main) ====" >> $LOG
 cd /het/p4/dshih/jet_images-deep_learning/SAILIR
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/generate_multisector_data.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/generate_multisector_data.py \
     --n_scrambles $SCRAMBLES \
     --min_steps 3 --max_steps 5 \
     --output $OUTDIR/old/trianglebox.jsonl \
     --start_seed $SEED \
     --prime 1009 \
-    --ibp_path scripts/data_gen/IBP \
-    --li_path scripts/data_gen/LI \
+    --ibp_path data-gen/IBP \
+    --li_path data-gen/LI \
     >> $LOG 2>&1
 echo "old exit=$?  $(wc -l < $OUTDIR/old/trianglebox.jsonl 2>/dev/null) samples" >> $LOG
 
 echo >> $LOG
 echo "==== REFACTORED (SAILIR_phase2, --topology) ====" >> $LOG
 cd /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/generate_multisector_data.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/generate_multisector_data.py \
     --topology topology_input/trianglebox \
     --n_scrambles $SCRAMBLES \
     --min_steps 3 --max_steps 5 \

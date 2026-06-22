@@ -47,10 +47,21 @@ Files in this directory:
 
 ## 2. Prerequisites (this cluster)
 
-- **Python** (with torch + the compiled `sailir` Cython kernels):
+- **Python** (with torch):
   `/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python`
+- **The compiled `sailir` Cython kernels.** Build them once per cluster /
+  Python version with:
+  ```bash
+  python sailir/_setup_cython.py build_ext --inplace
+  ```
+  This produces `sailir/_*.cpython-<ver>-<arch>.so` (the kernels live inside the
+  `sailir/` package). They are ABI-specific and gitignored — not portable, so
+  rebuild on a new machine. If absent, the code falls back to pure Python (much
+  slower) but still runs.
 - **A Condor cluster** reachable via `condor_submit` / `condor_q` (the workers
-  run as Condor jobs).
+  run as Condor jobs). The orchestrator runs interactively on the submit node;
+  the per-integral `--work-dir` must be on a **shared filesystem** (under
+  `results/` on `/het`), not node-local `/tmp`.
 - **The trained model**:
   `checkpoints/pentagonbox_10x_loop_100/best_model.pt`
 - **A topology** under `topology_input/` (see §4).
@@ -81,6 +92,31 @@ the pentagon-box (TA) family:
 
 Example: `1,1,1,1,1,1,1,1,-5,0,0` is the top sector with an ISP to the 5th power
 (the "(8,5)" integral).
+
+---
+
+## 3a. Kinematics (the finite-field point) — RECORD
+
+SAILIR reduces over the finite field `GF(prime)` at a **single fixed numeric
+point**: the spacetime dimension `d` and the five Mandelstam invariants are
+assigned specific integers. These are **deterministic, not random** —
+`Topology.from_dir` assigns the first N primes from
+`[31, 47, 53, 59, 61, 67, 71, 73, 79, 83]` to the N invariants in order, with
+`d = 41`. For the pentagon-box (TA) family the point is:
+
+| symbol | value |   | symbol | value |
+|--------|------:|---|--------|------:|
+| `d`    | **41** | | `s34` | **53** |
+| `s12`  | **31** | | `s45` | **59** |
+| `s23`  | **47** | | `s51` | **61** |
+| prime (`GF`) | **1009** | | | |
+
+**The same point is used for all three phases** — data-gen reads
+`topology.kinematics_values`, training learns on data generated there, and
+reduction runs there — so the model and the reductions are consistent. Any
+reduction result (the master coefficients in `final_expr`) is therefore valid at
+exactly this phase-space point mod 1009. Reproduce/inspect the values with
+`python reduction/_print_kinematics.py topology_input/pentagonbox`.
 
 ---
 

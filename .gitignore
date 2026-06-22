@@ -29,7 +29,7 @@ results/*/
 *.pdf
 !**/architecture_diagram.pdf
 
-# Training data is regenerable from scripts/data_gen/ and is too big for git
+# Training data is regenerable from data-gen/ and is too big for git
 data/
 *.jsonl
 *.jsonl.gz

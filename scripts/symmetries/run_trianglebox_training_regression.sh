@@ -20,7 +20,7 @@ mkdir -p $TMP/packed_old $TMP/packed_new
 
 echo "==== Preprocess (OLD) ====" >> $LOG
 cd /het/p4/dshih/jet_images-deep_learning/SAILIR
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/preprocess_to_tensors.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/preprocess_to_tensors.py \
     --input $TMP/new/trianglebox.jsonl \
     --output_dir $TMP/packed_old \
     --val_split 0.2 --test_split 0.2 \
@@ -30,7 +30,7 @@ echo "old preprocess exit=$?" >> $LOG
 echo >> $LOG
 echo "==== Preprocess (NEW) ====" >> $LOG
 cd $ROOT
-PYTHONUNBUFFERED=1 "$PY" -u scripts/data_gen/preprocess_to_tensors.py \
+PYTHONUNBUFFERED=1 "$PY" -u data-gen/preprocess_to_tensors.py \
     --topology topology_input/trianglebox \
     --input $TMP/new/trianglebox.jsonl \
     --output_dir $TMP/packed_new \
@@ -53,7 +53,7 @@ mkdir -p $TMP/ckpt_old $TMP/ckpt_new
 echo >> $LOG
 echo "==== Train (OLD), 3 epochs, CPU, tiny model ====" >> $LOG
 cd /het/p4/dshih/jet_images-deep_learning/SAILIR
-PYTHONUNBUFFERED=1 "$PY" -u scripts/train/train_classifier.py \
+PYTHONUNBUFFERED=1 "$PY" -u training/train_classifier.py \
     --data_dir $TMP/packed_old \
     --output_dir $TMP/ckpt_old \
     --epochs 3 --batch_size 4 --num_workers 0 \
@@ -65,7 +65,7 @@ echo "old train exit=$?" >> $LOG
 echo >> $LOG
 echo "==== Train (NEW), 3 epochs, CPU, tiny model ====" >> $LOG
 cd $ROOT
-PYTHONUNBUFFERED=1 "$PY" -u scripts/train/train_classifier.py \
+PYTHONUNBUFFERED=1 "$PY" -u training/train_classifier.py \
     --topology topology_input/trianglebox \
     --data_dir $TMP/packed_new \
     --output_dir $TMP/ckpt_new \

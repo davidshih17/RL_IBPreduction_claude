@@ -27,15 +27,15 @@ from sailir import topology as _topology_module
 from sailir.topology import Topology
 
 # Optional Cython fast paths. Built via
-# `python sailir/_setup_cython.py build_ext --inplace`; .so files live at
-# the project root. Each falls back to pure-Python when missing.
+# `python sailir/_setup_cython.py build_ext --inplace`; .so files live in
+# sailir/ (imported as sailir._*). Each falls back to pure-Python when missing.
 try:
-    from _enumerate_inner import phase1b_filter as _PHASE1B_CY
+    from sailir._enumerate_inner import phase1b_filter as _PHASE1B_CY
 except ImportError:
     _PHASE1B_CY = None
 
 try:
-    from _cic_inner import (
+    from sailir._cic_inner import (
         phase_a_apply as _PHASE_A_CY,
         build_result as _BUILD_RESULT_CY,
         cached_union_bitmask_cy as _UBM_CY,
@@ -118,9 +118,9 @@ def set_kinematics(**kwargs):
 
 
 # Default paths (kept for backward compat with old trianglebox scripts that
-# read IBP/LI directly from scripts/data_gen/ rather than topology_input/).
-IBP_PATH = Path(__file__).parent.parent / 'scripts/data_gen/IBP'
-LI_PATH = Path(__file__).parent.parent / 'scripts/data_gen/LI'
+# read IBP/LI directly from data-gen/ rather than topology_input/).
+IBP_PATH = Path(__file__).parent.parent / 'data-gen/IBP'
+LI_PATH = Path(__file__).parent.parent / 'data-gen/LI'
 
 
 def mod_inverse(a, p=None):
