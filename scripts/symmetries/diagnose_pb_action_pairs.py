@@ -14,7 +14,7 @@ from collections import Counter
 HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts/eval"))
+sys.path.insert(0, str(ROOT / "reduction"))
 
 from sailir.topology import Topology
 from sailir import ibp_env

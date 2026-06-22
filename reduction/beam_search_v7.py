@@ -114,8 +114,11 @@ _cap_incidental_threads()
 import numpy as np
 import torch
 
-sys.path.insert(0, '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2')
-sys.path.insert(0, '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/scripts/eval')
+# Resolve paths relative to this file (reduction/), not hardcoded, so the repo
+# can live anywhere: reduction/ -> repo root for `sailir`, plus this dir for siblings.
+_BS7_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_BS7_DIR))   # repo root (SAILIR_phase2) for `sailir`
+sys.path.insert(0, _BS7_DIR)                     # this dir (reduction/) for siblings
 
 from sailir import ibp_env
 from sailir.topology import Topology

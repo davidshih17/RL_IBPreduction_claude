@@ -82,8 +82,8 @@ import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent.parent))   # .../SAILIR_phase2
-sys.path.insert(0, str(_HERE))                  # .../scripts/eval
+sys.path.insert(0, str(_HERE.parent))   # .../SAILIR_phase2 (repo root) for `sailir`
+sys.path.insert(0, str(_HERE))          # .../reduction for sibling modules
 
 # Import beam_search_v7 FIRST. Its module top runs _cap_incidental_threads()
 # (thread caps + 8-core affinity pin) BEFORE it (internally) imports numpy/torch,

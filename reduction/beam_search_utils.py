@@ -14,9 +14,9 @@ must call ibp_env.init_from_topology(t) before using these helpers.
 import sys
 from pathlib import Path
 
-# Make the sailir/ package importable from this scripts/eval/ directory.
+# Make the sailir/ package importable from this reduction/ directory.
 _HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parent.parent.parent))
+sys.path.insert(0, str(_HERE.parent.parent))   # repo root (SAILIR_phase2)
 
 from sailir import ibp_env
 from sailir.ibp_env import filter_top_sector, is_master, weight

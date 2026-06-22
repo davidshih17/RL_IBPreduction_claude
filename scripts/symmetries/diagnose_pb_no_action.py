@@ -13,7 +13,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts/eval"))
+sys.path.insert(0, str(ROOT / "reduction"))
 
 import torch
 from sailir.topology import Topology

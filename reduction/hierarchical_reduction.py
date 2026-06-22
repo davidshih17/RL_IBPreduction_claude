@@ -31,13 +31,13 @@ from pathlib import Path
 from collections import defaultdict
 
 _HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parent.parent.parent))
-sys.path.insert(0, str(_HERE.parent))
+sys.path.insert(0, str(_HERE.parent.parent))   # repo root (SAILIR_phase2) for `sailir`
+sys.path.insert(0, str(_HERE.parent))          # this dir (reduction/) for siblings
 
 from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
 
-REPO_DIR = Path(__file__).parent.parent.parent.resolve()
+REPO_DIR = Path(__file__).parent.parent.resolve()
 PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with SAILIR_PYTHON env var if Condor workers need a different interpreter
 
 
@@ -235,7 +235,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
 
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
-arguments = -u {REPO_DIR}/scripts/eval/{worker_script}{worker_args}
+arguments = -u {REPO_DIR}/reduction/{worker_script}{worker_args}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log

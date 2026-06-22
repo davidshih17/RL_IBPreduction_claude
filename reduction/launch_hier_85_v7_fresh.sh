@@ -34,7 +34,7 @@ INTEGRAL_STR="1,1,1,1,1,1,1,1,-5,0,0"
 # Condor jobs). Send it to the background and stream stdout+stderr into a
 # single master log (unbuffered) so we can monitor without blocking.
 set -x
-PYTHONUNBUFFERED=1 $PYTHON -u $BASE/scripts/eval/hierarchical_reduction.py \
+PYTHONUNBUFFERED=1 $PYTHON -u $BASE/reduction/hierarchical_reduction.py \
     --topology $TOPOLOGY \
     --integral $INTEGRAL_STR \
     --output $OUTDIR/reduction.pkl \
