@@ -1,0 +1,24 @@
+diff --git a/src/kira/trivial_sym.cpp b/src/kira/trivial_sym.cpp
+index 88bdf0b..51824e7 100644
+--- a/src/kira/trivial_sym.cpp
++++ b/src/kira/trivial_sym.cpp
+@@ -22,6 +22,7 @@ along with Kira.  If not, see <http://www.gnu.org/licenses/>.
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <tuple>
+ 
+ #include "pyred/coeff_int.h"
+@@ -1635,6 +1636,11 @@ int Kira::skip_symmetry_topology(unsigned op) {
+ }
+ 
+ int Kira::skip_symmetry(string topoName, int j, int it, int itt) {
++  // SAILIR no-symmetry mode: KIRA_NO_SYMMETRY=1 makes Kira skip ALL sector
++  // symmetry relations (e.g. the k1<->k2 loop-exchange mapping sector 161 to
++  // master 152), so the derived master basis is the IBP+LI-only set. Lets us
++  // rederive the Kira masters "sans symmetry identities".
++  if (std::getenv("KIRA_NO_SYMMETRY")) return 1;
+   auto itSkip = integralfamily.skipSector[j].find(integralfamily.mask[j][it]);
+ 
+   if (itSkip != integralfamily.skipSector[j].end()) return 1;

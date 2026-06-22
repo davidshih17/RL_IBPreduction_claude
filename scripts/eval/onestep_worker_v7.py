@@ -51,8 +51,25 @@ os.environ['SAILIR_ACTION_SELECT'] = 'maxweight'
 #    sees the production 8/8 config and applies thread-caps + 8-core pin. It
 #    peeks sys.argv for --n-threads/--n-workers; our own parser uses
 #    parse_known_args() below so these extra flags are ignored. ──
-N_THREADS = 8
-N_WORKERS = 8
+# CPU count from --v7-cpus (default 8). Peeked from sys.argv BEFORE importing
+# beam_search_v7, because its import-time _cap_incidental_threads() reads the
+# injected --n-threads/--n-workers to size the affinity pin + thread caps.
+def _peek_v7_cpus(default=8):
+    for i, a in enumerate(sys.argv):
+        if a == '--v7-cpus' and i + 1 < len(sys.argv):
+            try:
+                return max(1, int(sys.argv[i + 1]))
+            except ValueError:
+                return default
+        if a.startswith('--v7-cpus='):
+            try:
+                return max(1, int(a.split('=', 1)[1]))
+            except ValueError:
+                return default
+    return default
+
+
+N_THREADS = N_WORKERS = _peek_v7_cpus()
 if '--n-threads' not in sys.argv:
     sys.argv += ['--n-threads', str(N_THREADS)]
 if '--n-workers' not in sys.argv:

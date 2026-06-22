@@ -113,7 +113,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                          checkpoint_time_seconds=300, resume_from=None,
                          dedup_beam_by_content=False,
                          use_delta_worker=False, memory_gb=None,
-                         use_v6_worker=False, use_v7_worker=False):
+                         use_v6_worker=False, use_v7_worker=False, v7_cpus=8):
     """Create a Condor submit file for a single-integral one-step reduction.
 
     PAPER DEFAULTS (matches trianglebox-paper recipe):
@@ -136,12 +136,12 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
 
     integral_str = ','.join(str(x) for x in integral)
     if use_v7_worker:
-        # The worker runs beam_search_v7 at --n-threads 8 --n-workers 8 and pins
-        # itself to 8 cores. Request 10 (not 8) so the rare (~1%) transient during
-        # the 8-way enumerate fork-spawn — which Condor has sampled at ~9.9 even on
-        # a correctly 8-core-pinned job — has 2 cores of headroom and never trips
-        # "cpu usage exceeded RequestCpus". Steady state still uses 8.
-        cpus = 10
+        # The worker runs beam_search_v7 at --n-threads v7_cpus --n-workers v7_cpus
+        # and pins itself to that many cores. For v7_cpus>1 the v7_cpus-way enumerate
+        # fork-spawn has a rare (~1%) transient that Condor samples slightly above
+        # the request, so add 2 cores of headroom. At v7_cpus==1 there is NO fork
+        # pool (serial enumerate), so request exactly 1.
+        cpus = v7_cpus + (2 if v7_cpus > 1 else 0)
     # Worker now defaults to --paper-masters-only ON. Only emit a flag if we want to disable.
     paper_masters_flag = '' if paper_masters_only else ' --no-paper-masters-only'
     n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
@@ -182,20 +182,23 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     else:
         memory = 4 * cpus
     if use_v7_worker:
-        memory = max(memory, 12)   # floor for the 8/8 fork-pool v7 worker
+        if v7_cpus > 1:
+            memory = max(memory, 12)   # floor for the multi-cpu fork-pool worker
+        else:
+            memory = memory_gb if memory_gb else 4  # flat for 1-cpu serial v7
 
     if use_v7_worker:
-        # onestep_worker_v7.py: SUBPROCESS-runs the current beam_search_v7.py at
-        # --n-threads 8 --n-workers 8 with ALL v7 settings (SUCCESS_TOTAL=1 total-
-        # weight single-step success, (r,s) maxweight action-cap, GNU MKL layer +
-        # affinity pin so the 8-cpu fork pool stays <= request on Condor) and
-        # writes orchestrator-compatible result.pkl. Same CLI as v6.
+        # onestep_worker_v7.py: runs beam_search_v7 IN-PROCESS at
+        # --n-threads v7_cpus --n-workers v7_cpus with ALL v7 settings
+        # (SUCCESS_TOTAL=1 total-weight single-step success, (r,s) maxweight
+        # action-cap, GNU MKL layer + affinity pin so the worker stays <= request
+        # on Condor). v7_cpus==1 => serial, no fork pool. Same CLI as v6.
         worker_script = 'onestep_worker_v7.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
                        f' --output {output_file}'
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
-                       f' --prime {prime} --device cpu -v'
+                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
                        f'{paper_masters_flag}{resume_flag}')
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
@@ -408,12 +411,17 @@ def main():
                              'than the delta worker on the canonical '
                              'pentagonbox long-runner integral.')
     parser.add_argument('--use-v7-worker', action='store_true',
-                        help='Dispatch workers to onestep_worker_v7.py, which '
-                             'subprocess-runs the CURRENT beam_search_v7.py at '
-                             '--n-threads 8 --n-workers 8 with ALL v7 settings '
-                             '(SUCCESS_TOTAL total-weight single-step success, '
-                             '(r,s) maxweight action-cap, GNU MKL + affinity pin). '
-                             'Forces request_cpus=8.')
+                        help='Dispatch workers to onestep_worker_v7.py, which runs '
+                             'the CURRENT beam_search_v7.py IN-PROCESS at '
+                             '--n-threads/--n-workers = --v7-cpus with ALL v7 '
+                             'settings (SUCCESS_TOTAL total-weight single-step '
+                             'success, (r,s) maxweight action-cap, GNU MKL + '
+                             'affinity pin).')
+    parser.add_argument('--v7-cpus', type=int, default=8,
+                        help='CPUs per v7 worker (= n-threads = n-workers). '
+                             'Default 8 (8/8 fork pool, request_cpus=10). Set 1 '
+                             'for serial, no fork pool, request_cpus=1 — many '
+                             'cheap workers instead of few fat ones.')
     parser.add_argument('--worker-memory-gb', type=int, default=None,
                         help='Override per-worker memory request (GB). '
                              'Default scales with cpus (4 * cpus). For the '
@@ -730,7 +738,7 @@ def main():
                 dedup_beam_by_content=args.worker_dedup_beam_by_content,
                 use_delta_worker=args.use_delta_worker,
                 use_v6_worker=args.use_v6_worker,
-                use_v7_worker=args.use_v7_worker,
+                use_v7_worker=args.use_v7_worker, v7_cpus=args.v7_cpus,
                 memory_gb=args.worker_memory_gb,
             )
 
@@ -824,7 +832,7 @@ def main():
                     dedup_beam_by_content=args.worker_dedup_beam_by_content,
                     use_delta_worker=args.use_delta_worker,
                     use_v6_worker=args.use_v6_worker,
-                use_v7_worker=args.use_v7_worker,
+                use_v7_worker=args.use_v7_worker, v7_cpus=args.v7_cpus,
                     memory_gb=args.worker_memory_gb,
                 )
 
@@ -890,7 +898,7 @@ def main():
                     dedup_beam_by_content=True,  # force dedup at this level
                     use_delta_worker=args.use_delta_worker,
                     use_v6_worker=args.use_v6_worker,
-                use_v7_worker=args.use_v7_worker,
+                use_v7_worker=args.use_v7_worker, v7_cpus=args.v7_cpus,
                     memory_gb=args.worker_memory_gb,
                 )
 

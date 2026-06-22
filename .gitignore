@@ -61,3 +61,6 @@ from_federica/
 # Test scratch dirs inside scripts/symmetries/
 scripts/symmetries/tmp_*
 scripts/symmetries/logs/
+
+# Build artifacts (replay package tarball)
+*.tar.gz
