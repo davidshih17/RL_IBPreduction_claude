@@ -41,7 +41,8 @@ Files in this directory:
 | `beam_search_utils.py`      | shared helpers (sector mask, non-masters, …) |
 | `save_replay_state.py`      | rebuild the reduced expression from a run's results |
 | `print_replay_terms.py`     | classify/print the final master expression |
-| `launch_hier_85_v7_fresh.sh`| a complete worked-example launcher |
+| `run_reduction.sh`          | **canonical launcher** — recommended config (§5), parameterized by integral |
+| `launch_hier_85_v7_fresh.sh`| exact reproducer of the v7_fresh **round-1** run (`pentagonbox` + `--no-paper-masters-only`) |
 
 ---
 
@@ -169,12 +170,19 @@ PYTHONUNBUFFERED=1 $PY -u $BASE/reduction/hierarchical_reduction.py \
   > $OUT/hierarchical.log 2>&1 &
 ```
 
-Watch progress with `tail -f $OUT/hierarchical.log` and `condor_q`. The run is
-done when the log prints `ASYNC REDUCTION COMPLETE` /
-`SUCCESS! All integrals reduced to masters.`
+This is the **recommended configuration**: the production `pentagonbox_8_5_v7_fresh`
+worker settings (1-CPU workers fanned out up to 1000-wide, straggler escalation
+disabled, `--resume` for crash recovery) **but with the 62-master
+`pentagonbox_nosym` topology + `--paper-masters-only`**, so the reduction
+terminates at the *unique* IBP+LI master basis (no path-dependent corners). The
+only deviation from the v7_fresh round-1 run is exactly those two flags — round-1
+used plain `pentagonbox` + `--no-paper-masters-only` (which completes but leaves
+an overcomplete, path-dependent corner basis; see §4). Watch with
+`tail -f $OUT/hierarchical.log` and `condor_q`; it's done when the log prints
+`ASYNC REDUCTION COMPLETE` / `SUCCESS! All integrals reduced to masters`.
 
-`launch_hier_85_v7_fresh.sh` is the same thing wired up for the (8,5) integral —
-copy it and change `INTEGRAL_STR` / `OUTDIR`.
+`run_reduction.sh` is exactly this command, parameterized by integral — copy it
+and set `INTEGRAL` / `OUT`.
 
 ---
 
@@ -194,7 +202,7 @@ ones that matter:
 | `--prime 1009` | finite-field prime (must match the model's training) |
 | `--paper-masters-only` | reduce to the topology's masters (default ON). §4 |
 | `--use-v7-worker` | use the current engine (recommended) |
-| `--v7-cpus 1` | **1** = cheap serial workers, `request_cpus=1`, many concurrent (best for fanning out). `8` = an 8-way fork pool per worker (`request_cpus=10`, ~22 GB peak) for a few heavy long-runners. |
+| `--v7-cpus 1` | **default 1** = cheap serial workers, `request_cpus=1`, no fork pool, single torch thread, flat 4 GB, many concurrent (best for fanning out — the production setting). `8` = an 8-way fork pool per worker (`request_cpus=10`, ~22 GB peak) for a few genuinely heavy long-runners. |
 | `--worker-memory-gb 4` | per-worker memory request (cluster has soft limits) |
 | `--max-concurrent 1000` | cap on simultaneous Condor workers |
 | `--straggler-timeout / --straggler2-timeout` | set huge (`1000000000`) to keep every worker at `--v7-cpus`; otherwise slow workers are escalated to more CPUs |

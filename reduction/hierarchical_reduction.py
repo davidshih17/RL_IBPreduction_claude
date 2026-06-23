@@ -113,7 +113,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                          checkpoint_time_seconds=300, resume_from=None,
                          dedup_beam_by_content=False,
                          use_delta_worker=False, memory_gb=None,
-                         use_v6_worker=False, use_v7_worker=False, v7_cpus=8):
+                         use_v6_worker=False, use_v7_worker=False, v7_cpus=1):
     """Create a Condor submit file for a single-integral one-step reduction.
 
     PAPER DEFAULTS (matches trianglebox-paper recipe):
@@ -417,11 +417,13 @@ def main():
                              'settings (SUCCESS_TOTAL total-weight single-step '
                              'success, (r,s) maxweight action-cap, GNU MKL + '
                              'affinity pin).')
-    parser.add_argument('--v7-cpus', type=int, default=8,
+    parser.add_argument('--v7-cpus', type=int, default=1,
                         help='CPUs per v7 worker (= n-threads = n-workers). '
-                             'Default 8 (8/8 fork pool, request_cpus=10). Set 1 '
-                             'for serial, no fork pool, request_cpus=1 — many '
-                             'cheap workers instead of few fat ones.')
+                             'Default 1 (serial, NO fork pool, single torch '
+                             'thread, request_cpus=1, flat 4GB) -- the production '
+                             'setting: many cheap workers fanned out wide. Set 8 '
+                             'only for an 8/8 fork pool (request_cpus=10, ~22GB '
+                             'peak) on a few genuinely heavy long-runners.')
     parser.add_argument('--worker-memory-gb', type=int, default=None,
                         help='Override per-worker memory request (GB). '
                              'Default scales with cpus (4 * cpus). For the '
