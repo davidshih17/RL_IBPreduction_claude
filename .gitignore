@@ -34,15 +34,18 @@ data/
 *.jsonl
 *.jsonl.gz
 
-# Training output (the published phase-1 model at checkpoints/best_model.pt
-# is committed; everything else under checkpoints/ is per-run output).
+# Training output: per-run checkpoints are ignored, EXCEPT the production model
+# used by every reduction launcher + the README (committed below).
 checkpoints/pentagonbox/
-checkpoints/pentagonbox_*/
+checkpoints/pentagonbox_*/*
 checkpoints/*/last.pt
 checkpoints/*/checkpoint_epoch*.pt
 checkpoints/*/final_model.pt
 checkpoints/*/best_model.pt
 smoke_checkpoints/
+# Production navigation model — referenced as --model-checkpoint everywhere.
+!checkpoints/pentagonbox_10x_loop_100/
+!checkpoints/pentagonbox_10x_loop_100/best_model.pt
 
 # Compiled extensions and Cython generated C (keep .pyx, not .c/.so)
 *.so
