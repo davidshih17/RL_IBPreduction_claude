@@ -255,8 +255,131 @@ queue
     return submit_file
 
 
+# NOTE: _compute_job_fields mirrors the per-job computation in
+# create_condor_submit above. If you change the worker CLI / memory / priority
+# logic there, mirror it here. (Kept separate so create_condor_submit -- the
+# straggler-resubmit path -- stays byte-identical and untouched.)
+def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
+                        max_steps, prime, topology_dir, paper_masters_only, cpus,
+                        beam_sort, checkpoint_path, checkpoint_interval,
+                        checkpoint_time_seconds, resume_from,
+                        dedup_beam_by_content, use_delta_worker, memory_gb,
+                        use_v6_worker, use_v7_worker, v7_cpus):
+    """Returns (worker_script, worker_args, cpus, memory, job_priority)."""
+    integral_str = ','.join(str(x) for x in integral)
+    if use_v7_worker:
+        cpus = v7_cpus + (2 if v7_cpus > 1 else 0)
+    paper_masters_flag = '' if paper_masters_only else ' --no-paper-masters-only'
+    n_workers_flag = f' --n_workers {cpus}' if cpus > 1 else ''
+    beam_sort_flag = f' --beam-sort {beam_sort}' if beam_sort != 'mixed' else ''
+    cp_flag = (f' --checkpoint-path {checkpoint_path}'
+               f' --checkpoint-interval {checkpoint_interval}'
+               f' --checkpoint-time-seconds {checkpoint_time_seconds}') if checkpoint_path else ''
+    resume_flag = f' --resume-from {resume_from}' if resume_from else ''
+    dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
+    level = sum(get_sector_mask(integral))
+    r, s = weight(integral)[:2]
+    job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
+    if memory_gb is not None:
+        if level >= 8:
+            memory = memory_gb
+        elif level == 7:
+            memory = max(8, memory_gb // 2)
+        elif level == 6:
+            memory = max(4, memory_gb // 4)
+        else:
+            memory = 4
+        if cpus > 1:
+            memory = max(memory, memory_gb)
+    else:
+        memory = 4 * cpus
+    if use_v7_worker:
+        if v7_cpus > 1:
+            memory = max(memory, 12)
+        else:
+            memory = memory_gb if memory_gb else 4
+    if use_v7_worker:
+        worker_script = 'onestep_worker_v7.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+                       f'{paper_masters_flag}{resume_flag}')
+    elif use_v6_worker:
+        worker_script = 'onestep_worker_v6.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}{cp_flag}{resume_flag}')
+    elif use_delta_worker:
+        worker_script = 'delta_onestep_worker.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}')
+    else:
+        worker_script = 'onestep_worker.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v'
+                       f'{paper_masters_flag}{n_workers_flag}{beam_sort_flag}'
+                       f'{cp_flag}{resume_flag}{dedup_flag}')
+    return worker_script, worker_args, cpus, memory, job_priority
+
+
+def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps,
+                        prime, topology_dir, paper_masters_only, beam_sort,
+                        checkpoint_interval, checkpoint_time_seconds,
+                        dedup_beam_by_content, use_delta_worker, use_v6_worker,
+                        use_v7_worker, v7_cpus, memory_gb):
+    """ONE submit file for a whole batch -> ONE condor_submit -> one cluster with
+    procs 0..N-1 in batch order. This collapses N submit RPCs into 1 (the schedd
+    load fix: a 75-job iteration becomes a single round-trip instead of 75).
+
+    batch: list of (integral, job_name, output_file, cpus, resume_from, is_re_entry).
+    Common attrs (universe/executable/request_disk/Requirements/+JobFlavour) are
+    set once and persist across queue statements; per-job attrs are re-set per
+    block. Returns the .sub path.
+    """
+    parts = [f"""universe = vanilla
+executable = {PYTHON_PATH}
+request_disk = 1GB
+Requirements = (TARGET.KFlops > 3000000)
++JobFlavour = "workday"
+"""]
+    for (integral, job_name, output_file, cpus, resume_from, _ire) in batch:
+        checkpoint_path = str(output_file) + '.checkpoint'
+        worker_script, worker_args, jcpus, memory, job_priority = _compute_job_fields(
+            integral, output_file, model_checkpoint, beam_width, max_steps, prime,
+            topology_dir, paper_masters_only, cpus, beam_sort, checkpoint_path,
+            checkpoint_interval, checkpoint_time_seconds, resume_from,
+            dedup_beam_by_content, use_delta_worker, memory_gb,
+            use_v6_worker, use_v7_worker, v7_cpus)
+        parts.append(f"""arguments = -u {REPO_DIR}/reduction/{worker_script}{worker_args}
+output = {work_dir}/logs/{job_name}.out
+error = {work_dir}/logs/{job_name}.err
+log = {work_dir}/logs/{job_name}.log
+request_cpus = {jcpus}
+request_memory = {memory}GB
+priority = {job_priority}
+queue
+""")
+    submit_file = work_dir / f'batch_{batch[0][1]}.sub'
+    with open(submit_file, 'w') as f:
+        f.write(''.join(parts))
+    return submit_file
+
+
 def submit_condor_job(submit_file):
-    """Submit a Condor job and return the cluster ID."""
+    """Submit ONE Condor job; return its 'cluster.proc' id ('C.0'). Used by the
+    straggler-resubmit path (disabled in production)."""
     try:
         result = subprocess.run(
             ['condor_submit', str(submit_file)],
@@ -264,15 +387,35 @@ def submit_condor_job(submit_file):
         )
         if result.returncode == 0:
             # Parse output like: "1 job(s) submitted to cluster 91346."
-            # Look for "cluster" followed by the ID (not "1 job(s)" which comes before)
             import re
             match = re.search(r'cluster\s+(\d+)', result.stdout, re.IGNORECASE)
             if match:
-                return match.group(1)
+                return f"{match.group(1)}.0"
         return None
     except Exception as e:
         print(f"Error submitting job: {e}")
         return None
+
+
+def submit_condor_batch(submit_file, expected_n):
+    """Submit a multi-job batch .sub. Returns (cluster_id_str, n_submitted).
+    condor_submit prints 'N job(s) submitted to cluster C'; the N jobs are procs
+    0..N-1 in file order."""
+    try:
+        result = subprocess.run(
+            ['condor_submit', str(submit_file)],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            import re
+            m = re.search(r'(\d+)\s+job\(s\)\s+submitted to cluster\s+(\d+)',
+                          result.stdout, re.IGNORECASE)
+            if m:
+                return m.group(2), int(m.group(1))
+        return None, 0
+    except Exception as e:
+        print(f"Error submitting batch: {e}")
+        return None, 0
 
 
 def query_job_start_times(cluster_ids):
@@ -284,22 +427,24 @@ def query_job_start_times(cluster_ids):
     """
     if not cluster_ids:
         return {}
+    # Keyed by 'cluster.proc' since batch submits put many jobs in one cluster.
+    # Query unique clusters (fewer args) and reconstruct 'C.P' from ProcId.
+    clusters = sorted({str(c).split('.')[0] for c in cluster_ids})
     try:
         result = subprocess.run(
-            ['condor_q'] + [str(c) for c in cluster_ids]
-                + ['-af', 'ClusterId', 'JobStartDate'],
+            ['condor_q'] + clusters + ['-af', 'ClusterId', 'ProcId', 'JobStartDate'],
             capture_output=True, text=True, timeout=30,
         )
         out = {}
         for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) != 2:
+            if len(parts) != 3:
                 continue
-            cid, start = parts
+            cid, pid, start = parts
             if start in ('undefined', '0'):
                 continue  # not yet started
             try:
-                out[cid] = int(start)
+                out[f"{cid}.{pid}"] = int(start)
             except ValueError:
                 continue
         return out
@@ -665,7 +810,10 @@ def main():
         # the JobStartDate query timed out it killed running workers anyway,
         # so different iterations applied different policies.)
         if pending:
-            cancelled_obsolete = 0
+            # Collect the obsolete jobs' cluster.proc ids and remove them in ONE
+            # condor_rm (a single schedd round-trip instead of one per job).
+            obsolete_ids = []
+            obsolete_integrals = []
             for integral in list(pending.keys()):
                 if integral in expr:
                     continue  # still needed
@@ -674,15 +822,17 @@ def main():
                     continue  # result already on disk — let normal handling take it
                 if not cluster_id:
                     continue
+                obsolete_ids.append(str(cluster_id))
+                obsolete_integrals.append(integral)
+            if obsolete_ids:
                 try:
-                    subprocess.run(['condor_rm', str(cluster_id)],
-                                   capture_output=True, text=True, timeout=10)
+                    subprocess.run(['condor_rm'] + obsolete_ids,
+                                   capture_output=True, text=True, timeout=120)
                 except Exception:
                     pass
-                del pending[integral]
-                cancelled_obsolete += 1
-            if cancelled_obsolete:
-                print(f"[Iter {iteration}] Cancelled {cancelled_obsolete} pending jobs "
+                for integral in obsolete_integrals:
+                    del pending[integral]
+                print(f"[Iter {iteration}] Cancelled {len(obsolete_integrals)} pending jobs "
                       f"(idle+running) whose integrals are no longer needed", flush=True)
 
         # Find non-masters that need reduction
@@ -699,8 +849,12 @@ def main():
             to_submit = sorted(to_submit, key=lambda i: tuple(-x for x in full_weight(i)))
             to_submit = set(to_submit[:available_slots])
 
-        # Submit new jobs
+        # Submit new jobs: build the WHOLE iteration's batch, then ONE
+        # condor_submit (one cluster, procs 0..N-1). This collapses a 75-job
+        # iteration into a single schedd round-trip instead of 75 -- the fix for
+        # the schedd saturation that a big cache's spiky submit rate caused.
         newly_submitted = 0
+        batch = []
         for integral in to_submit:
             if integral not in depth:
                 depth[integral] = 0  # Top-level integral from initial expression
@@ -724,41 +878,42 @@ def main():
                 resume_from = None
 
             output_file = work_dir / 'results' / f'{job_name}.pkl'
-            checkpoint_path = str(output_file) + '.checkpoint'
-            last_checkpoint[integral] = checkpoint_path
+            last_checkpoint[integral] = str(output_file) + '.checkpoint'
+            batch.append((integral, job_name, output_file, cpus, resume_from, is_re_entry))
+            total_jobs += 1   # reserve the async id (job_name embeds it)
 
-            submit_file = create_condor_submit(
-                work_dir, integral, job_name, output_file,
+        if batch and args.dry_run:
+            for (integral, job_name, output_file, cpus, resume_from, is_re_entry) in batch:
+                pending[integral] = (None, output_file, time.time(), cpus)
+                newly_submitted += 1
+        elif batch:
+            submit_file = create_batch_submit(
+                work_dir, batch,
                 args.model_checkpoint, args.beam_width, args.max_steps, args.prime,
                 topology_dir=args.topology,
-                paper_masters_only=args.paper_masters_only, cpus=cpus,
+                paper_masters_only=args.paper_masters_only,
                 beam_sort=args.beam_sort,
-                checkpoint_path=checkpoint_path,
                 checkpoint_interval=args.checkpoint_interval,
                 checkpoint_time_seconds=args.checkpoint_time_seconds,
-                resume_from=resume_from,
                 dedup_beam_by_content=args.worker_dedup_beam_by_content,
                 use_delta_worker=args.use_delta_worker,
                 use_v6_worker=args.use_v6_worker,
                 use_v7_worker=args.use_v7_worker, v7_cpus=args.v7_cpus,
                 memory_gb=args.worker_memory_gb,
             )
-
-            if args.dry_run:
-                pending[integral] = (None, output_file, time.time(), cpus)
-                total_jobs += 1
-                newly_submitted += 1
-            else:
-                cluster_id = submit_condor_job(submit_file)
-                if cluster_id:
-                    pending[integral] = (cluster_id, output_file, time.time(), cpus)
-                    total_jobs += 1
+            cluster_id, n_submitted = submit_condor_batch(submit_file, len(batch))
+            if cluster_id and n_submitted == len(batch):
+                for proc, (integral, job_name, output_file, cpus, resume_from, is_re_entry) in enumerate(batch):
+                    pending[integral] = (f"{cluster_id}.{proc}", output_file, time.time(), cpus)
                     newly_submitted += 1
                     if is_re_entry:
                         print(f"  RE-ENTRY: Re-submitted I{list(integral)} with {cpus} CPUs "
                               f"(resume={'yes' if resume_from else 'no'})", flush=True)
-                else:
-                    print(f"  WARNING: Failed to submit I{list(integral)}")
+            else:
+                # Whole batch not accepted -> none added to pending; they stay in
+                # to_submit and retry next iteration (correctness preserved).
+                print(f"  WARNING: batch submit failed (cluster={cluster_id}, "
+                      f"got {n_submitted}/{len(batch)}); will retry next iteration")
 
         if newly_submitted > 0:
             print(f"[Iter {iteration}] Submitted {newly_submitted} jobs")
@@ -778,8 +933,16 @@ def main():
         # Check for stragglers (jobs that have been RUNNING on Condor too long
         # — queue/idle wait time is excluded). Resubmit them with more CPUs.
         current_time = time.time()
-        pending_cluster_ids = [cid for (cid, _, _, _) in pending.values() if cid]
-        start_times = query_job_start_times(pending_cluster_ids)
+        # When stragglers are effectively disabled (huge timeouts, the production
+        # setting), skip the per-iteration JobStartDate condor_q entirely — it's
+        # one more schedd round-trip per iteration that buys nothing.
+        stragglers_enabled = (args.straggler_timeout < 10**8
+                              or args.straggler2_timeout < 10**8)
+        if stragglers_enabled:
+            pending_cluster_ids = [cid for (cid, _, _, _) in pending.values() if cid]
+            start_times = query_job_start_times(pending_cluster_ids)
+        else:
+            start_times = {}
         for integral, (cluster_id, output_file, submit_time, cpus) in list(pending.items()):
             # Job runtime is wall time since Condor *started* executing the job.
             # If the job is still queued (no JobStartDate yet) treat runtime as 0
