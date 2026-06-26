@@ -15,7 +15,7 @@ Strategy:
 
 Usage:
     python hierarchical_reduction.py \
-        --integral 1,1,1,1,1,1,-3 \
+        --integral=1,1,1,1,1,1,-3 \
         --output results/reduction_async.pkl \
         --work-dir /scratch/ibp_async
 """

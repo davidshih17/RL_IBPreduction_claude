@@ -36,7 +36,7 @@ INTEGRAL_STR="1,1,1,1,1,1,1,1,-5,0,0"
 set -x
 PYTHONUNBUFFERED=1 $PYTHON -u $BASE/reduction/hierarchical_reduction.py \
     --topology $TOPOLOGY \
-    --integral $INTEGRAL_STR \
+    --integral="$INTEGRAL_STR" \
     --output $OUTDIR/reduction.pkl \
     --work-dir $OUTDIR/work \
     --model-checkpoint $MODEL \

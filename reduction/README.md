@@ -157,7 +157,7 @@ mkdir -p $OUT/work
 
 PYTHONUNBUFFERED=1 $PY -u $BASE/reduction/hierarchical_reduction.py \
     --topology   $BASE/topology_input/pentagonbox_nosym \
-    --integral   $INTEGRAL \
+    --integral=$INTEGRAL \
     --output     $OUT/reduction.pkl \
     --work-dir   $OUT/work \
     --model-checkpoint $BASE/checkpoints/pentagonbox_10x_loop_100/best_model.pt \

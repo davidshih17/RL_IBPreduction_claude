@@ -70,7 +70,7 @@ Reduce a single trianglebox integral with the published checkpoint:
 ```bash
 python scripts/eval/onestep_worker.py \
     --topology topology_input/trianglebox \
-    --integral 2,1,2,1,2,2,-4 \
+    --integral=2,1,2,1,2,2,-4 \
     --model-checkpoint checkpoints/best_model.pt \
     --output reduction.pkl \
     --beam_width 20 \
@@ -137,7 +137,7 @@ for I in "${INTEGRALS[@]}"; do
     label=$(echo "$I" | tr ',' '_' | tr '-' 'm')
     python -u scripts/eval/hierarchical_reduction.py \
         --topology topology_input/trianglebox \
-        --integral $I --output results/reduction_${label}.pkl \
+        --integral=$I --output results/reduction_${label}.pkl \
         --work-dir work-dir/${label} \
         --model-checkpoint checkpoints/best_model.pt \
         --beam_width 20 --prime 1009 --paper-masters-only --beam-sort mixed \
@@ -230,7 +230,7 @@ Same as trianglebox, but with `--topology topology_input/pentagonbox` and an
 ```bash
 python scripts/eval/onestep_worker.py \
     --topology topology_input/pentagonbox \
-    --integral 1,0,1,0,1,1,-1,0,0,0,-1 \
+    --integral=1,0,1,0,1,1,-1,0,0,0,-1 \
     --model-checkpoint checkpoints/pentagonbox/best_model.pt \
     --output reduction.pkl \
     --beam_width 20 --prime 1009 -v

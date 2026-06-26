@@ -39,7 +39,7 @@ mkdir -p $OUTDIR/logs $OUTDIR/work/logs $OUTDIR/work/results
 set -x
 PYTHONUNBUFFERED=1 $PYTHON -u $BASE/reduction/hierarchical_reduction.py \
     --topology $TOPOLOGY \
-    --integral $INTEGRAL_STR \
+    --integral="$INTEGRAL_STR" \
     --output $OUTDIR/reduction.pkl \
     --work-dir $OUTDIR/work \
     --model-checkpoint $MODEL \

@@ -67,3 +67,5 @@ scripts/symmetries/logs/
 
 # Build artifacts (replay package tarball)
 *.tar.gz
+topology_input/fire_tables40_math_All.m
+topology_input/*/kira_*/
