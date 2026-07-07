@@ -61,6 +61,9 @@ EPOCHS=${EPOCHS:-20}
 BATCH_SIZE=${BATCH_SIZE:-128}
 MODEL_VARIANT=${MODEL_VARIANT:-full}
 NUM_WORKERS=${NUM_WORKERS:-4}
+# SHARDS_DIR override: point at a different packed dataset (e.g. the symmetry-enhanced
+# canonical-sector dataset data/pentagonbox_sym_packed). Default is the 10x baseline.
+SHARDS_DIR=${SHARDS_DIR:-data/pentagonbox_10x_packed}
 
 if [[ "$SMOKE" == "1" ]]; then
     OUTPUT_DIR=checkpoints/pentagonbox_10x_smoke
@@ -92,7 +95,7 @@ srun -l -u \
     --gpu-bind=none \
     bash training/nersc_perlmutter/srun_task.sh \
         --topology         topology_input/pentagonbox \
-        --shards_dir       data/pentagonbox_10x_packed \
+        --shards_dir       "$SHARDS_DIR" \
         --buffer_shards    4 \
         --output_dir       "$OUTPUT_DIR" \
         --batch_size       "$BATCH_SIZE" \
