@@ -2,7 +2,7 @@
 Sharded IterableDataset for SAILIR phase-2 pentagonbox training data.
 
 Per-shard files are produced by
-  scripts/data_gen/submit_preprocess_pentagonbox_10x_batched.sh
+  data-gen/submit_preprocess_pentagonbox_10x_batched.sh
 and live at
   <shards_dir>/shard_<N>/{train,val,test}.pt
 

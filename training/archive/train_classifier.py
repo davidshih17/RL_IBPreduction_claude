@@ -1,19 +1,13 @@
-"""Training script for the SAILIR IBP action classifier.
+"""
+Training script for IBP Action Classifier v5.
 
-Trains on packed-tensor shards produced by `../data-gen/preprocess_to_tensors.py`.
+Uses packed tensor format with offsets. Includes:
+- Target integral as input
+- Full substitution encoding (subs_raw)
 
-Two model variants are supported:
-  * `full`   — `IBPActionClassifier` with the subs encoder (see
-               `sailir/classifier.py`). The committed reference checkpoint
-               `checkpoints/pentagonbox_10x_loop_100/best_model.pt` was trained
-               with this variant.
-  * `nosubs` — `IBPActionClassifierNoSubs` with the subs path removed (see
-               `sailir/classifier_nosubs.py`). Recommended going forward:
-               matches `full` accuracy with ~40% fewer params and ~12% faster
-               steps (see `README.md`).
-
-DDP launching: this script is `torchrun`-aware. Set `LOCAL_RANK`/`RANK`/`WORLD_SIZE`
-(set automatically by `torchrun` / `srun --gpus-per-task=1`) and run as usual.
+Usage:
+    nohup python -u training/train_classifier.py \
+        --data_dir data/multisector_tensors_v2 > logs/train_v5.log 2>&1 &
 """
 
 import argparse
@@ -29,14 +23,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+sys.path.insert(0, str(Path(__file__).parent.parent / 'sailir'))
 from classifier import IBPActionClassifier
-from classifier_nosubs import IBPActionClassifierNoSubs
-
-MODEL_CLASSES = {
-    'full': IBPActionClassifier,
-    'nosubs': IBPActionClassifierNoSubs,
-}
 
 
 class PackedDatasetV5(Dataset):
@@ -152,18 +140,6 @@ def _collate(samples, n_indices, n_denominators):
     }
 
 
-def model_forward(model, batch):
-    """Call model with the standard positional args. Both `full` and `nosubs`
-    variants accept the same 13-arg signature; `nosubs` ignores the sub_*
-    tensors internally."""
-    return model(
-        batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
-        batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
-        batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
-        batch['sector_mask'], batch['target_integral'],
-    )
-
-
 def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_batches=None,
                 max_iters=None):
     """Run one training epoch. Returns RAW sums (not averages) so the caller
@@ -188,7 +164,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
         batch = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
 
-        logits, _ = model_forward(model, batch)
+        logits, _ = model(
+            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
+            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+            batch['sector_mask'], batch['target_integral']
+        )
 
         loss = F.cross_entropy(logits, batch['labels'])
         loss.backward()
@@ -230,7 +211,12 @@ def evaluate(model, dataloader, device, max_iters=None):
         if max_iters is not None and batch_idx >= max_iters:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
-        logits, _ = model_forward(model, batch)
+        logits, _ = model(
+            batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
+            batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
+            batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
+            batch['sector_mask'], batch['target_integral']
+        )
         loss = F.cross_entropy(logits, batch['labels'])
         bs = batch['labels'].size(0)
         total_loss += loss.item() * bs
@@ -278,12 +264,6 @@ def main():
     parser.add_argument('--n_expr_layers', type=int, default=2)
     parser.add_argument('--n_cross_layers', type=int, default=2)
     parser.add_argument('--n_subs_layers', type=int, default=2)
-    parser.add_argument('--model_variant', type=str, default='nosubs',
-                        choices=tuple(MODEL_CLASSES.keys()),
-                        help='full: original IBPActionClassifier (with subs encoder); '
-                             'nosubs: IBPActionClassifierNoSubs (subs path removed, recommended). '
-                             'Checkpoints from different variants are NOT interchangeable; use a '
-                             'distinct --output_dir per variant.')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prime', type=int, default=1009)
     parser.add_argument('--device', type=str, default='cuda')
@@ -305,21 +285,18 @@ def main():
     # DDP detection: torchrun sets LOCAL_RANK/RANK/WORLD_SIZE env vars.
     local_rank = int(os.environ.get('LOCAL_RANK', -1))
     ddp_enabled = local_rank >= 0
-    # Global rank — distinct from local_rank on multi-node (one local_rank==0
-    # per node, but exactly one global_rank==0 across the whole job).
-    global_rank = int(os.environ.get('RANK', 0))
 
-    # Build manifest on global rank 0 BEFORE CUDA is touched.
+    # Build manifest on rank 0 BEFORE CUDA is touched.
     # multiprocessing.Pool uses fork, which is safe pre-CUDA-init.
     # ~2-3 min one-time; cached to JSON for future runs.
-    if args.shards_dir and (not ddp_enabled or global_rank == 0):
+    if args.shards_dir and (not ddp_enabled or local_rank == 0):
         manifest_path = Path(args.shards_dir) / 'manifest.json'
         if not manifest_path.is_file():
-            print(f"[rank{global_rank}] Building manifest at {manifest_path} "
+            print(f"[rank{max(local_rank,0)}] Building manifest at {manifest_path} "
                   f"(one-time, ~2-3 min)...", flush=True)
             from sharded_dataset import build_manifest as _bm
             _bm(args.shards_dir)
-            print(f"[rank{global_rank}] Manifest built.", flush=True)
+            print(f"[rank{max(local_rank,0)}] Manifest built.", flush=True)
 
     if ddp_enabled:
         dist.init_process_group(backend='nccl')
@@ -345,7 +322,7 @@ def main():
             print(msg, flush=True)
 
     # Load topology to determine model dimensions.
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from sailir.topology import Topology
     topology = Topology.from_dir(args.topology)
     n_indices = topology.n_indices
@@ -353,7 +330,9 @@ def main():
     n_actions = topology.n_actions
 
     log("=" * 70)
-    log("SAILIR IBP action classifier — training")
+    log("IBP Action Classifier v5 Training")
+    log("  - Target as input")
+    log("  - Full substitution encoding")
     if ddp_enabled:
         log(f"  - DDP: rank {rank}/{world_size} on cuda:{local_rank}")
     log("=" * 70)
@@ -365,9 +344,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    collate = make_collate_fn(
-        n_indices=n_indices, n_denominators=n_denominators,
-    )
+    collate = make_collate_fn(n_indices=n_indices, n_denominators=n_denominators)
 
     if args.shards_dir is not None:
         # Sharded streaming mode — memory-bounded.
@@ -497,15 +474,13 @@ def main():
     ibp_env.init_from_topology(topology)
     ibp_env.set_prime(args.prime)
 
-    model_cls = MODEL_CLASSES[args.model_variant]
-    model = model_cls(
+    model = IBPActionClassifier(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
         n_subs_layers=args.n_subs_layers, prime=args.prime,
         n_indices=n_indices, n_denominators=n_denominators, n_ibp_ops=n_actions,
     )
     model = model.to(device)
-    log(f"Model variant: {args.model_variant} ({model_cls.__name__})")
     log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     if ddp_enabled:
