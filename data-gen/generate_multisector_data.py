@@ -523,6 +523,17 @@ def main():
     parser.add_argument('--restrict-sectors', type=str, default=None,
                         help='Comma-separated sector_ids to restrict scrambling to. '
                              'If omitted, all valid sectors are used.')
+    parser.add_argument('--restrict-sectors-file', type=str, default=None,
+                        help='File with a comma-separated sector_id list to restrict '
+                             'scrambling to (topology-agnostic). Used for the '
+                             'symmetry-enhanced dataset: point at the canonical-sector '
+                             'list from reduction/build_canonical_sectors_tkey.py '
+                             '(results/canonical_sectors_tkey.txt) so only ONE '
+                             'representative per clean-symmetry orbit is scrambled. '
+                             'REQUIRES matching inference-time canonicalization (map '
+                             'each integral to its _target_key canonical rep) or the '
+                             'model sees out-of-distribution sectors. Overrides '
+                             '--restrict-sectors if both given.')
     args = parser.parse_args()
 
     PRIME = args.prime
@@ -549,7 +560,12 @@ def main():
     print(f"Output: {args.output}", flush=True)
     print(f"Filter lateral sectors: {args.filter_lateral}", flush=True)
 
-    if args.restrict_sectors:
+    if args.restrict_sectors_file:
+        with open(args.restrict_sectors_file) as _f:
+            sector_list = [int(s) for s in _f.read().replace('\n', ',').split(',') if s.strip()]
+        print(f"Restricted to {len(sector_list)} sectors from file "
+              f"{args.restrict_sectors_file} (symmetry-enhanced canonical set)", flush=True)
+    elif args.restrict_sectors:
         sector_list = [int(s) for s in args.restrict_sectors.split(',')]
         print(f"Restricted to {len(sector_list)} sectors: {sector_list}", flush=True)
     else:
