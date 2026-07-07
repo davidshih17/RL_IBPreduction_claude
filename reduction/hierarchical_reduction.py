@@ -199,10 +199,7 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}'
-                       + (' --symmetry' if os.environ.get('SAILIR_SYMMETRY') == '1' else '')
-                       + (' --symmetry-perstep' if os.environ.get('SAILIR_SYMMETRY_PERSTEP') == '1' else '')
-                       + (' --canon' if os.environ.get('SAILIR_CANON') == '1' else ''))
+                       f'{paper_masters_flag}{resume_flag}')
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
@@ -308,10 +305,7 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}'
-                       + (' --symmetry' if os.environ.get('SAILIR_SYMMETRY') == '1' else '')
-                       + (' --symmetry-perstep' if os.environ.get('SAILIR_SYMMETRY_PERSTEP') == '1' else '')
-                       + (' --canon' if os.environ.get('SAILIR_CANON') == '1' else ''))
+                       f'{paper_masters_flag}{resume_flag}')
     elif use_v6_worker:
         worker_script = 'onestep_worker_v6.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''

@@ -9,8 +9,10 @@ relations that produce combinations are NOT used here (they are the action-space
 relations, not renames). This is the dedup canonicalization -- 1->1, no P_S expansion.
 
 CRITICAL: the order is `_target_key`, matching beam_search_v7 and symmetry_route, so
-the canonical basis is confluent with the reduction (the min-integer `rep_of` in
-canonical_sectors.pkl is a DIFFERENT order and must not be used for this).
+the canonical basis is confluent with the reduction. (The old min-integer `rep_of` /
+`canon()` / 139-sector treatment has been removed from the codebase — only this 174
+`_target_key` clean-orbit treatment, the one the successful symmetry inference uses,
+remains.)
 """
 import os, sys
 ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"

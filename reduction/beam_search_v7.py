@@ -514,11 +514,6 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     sol = solve_ibp_for(cached, target)
     if sol is None:
         return None
-    # Under _CANON the raw equation was already canonicalized at its source
-    # (ibp_env.set_raw_canonicalizer), so `cached` is canonical, apply_resolved_subs
-    # already substituted every reduced integral, and `sol` is canonical + fully
-    # resolved + target-free. No sol-canon / target-collect / re-resolve needed —
-    # those only existed to bridge the removed raw-vs-canonical seam.
     new_expr = apply_substitution_v5(
         state.expr, target, sol, target_sector, start_w12,
     )
@@ -880,99 +875,6 @@ def _select_actions(valid, target, aux_flat, max_actions, strategy):
     sel = np.argpartition(keys, max_actions)[:max_actions]
     sel.sort()                              # keep original order among the chosen
     return [valid[i] for i in sel]
-
-
-# ── Greedy sector-symmetry reduction (inference-only, opt-in) ──────────────
-# A sector symmetry is a deterministic relation I = sum c_k J_k oriented (by
-# SAILIR's _target_key) to eliminate the integral SAILIR would target. We apply
-# it greedily to a state's pivot BEFORE the model sees it: confluent, no search,
-# no retraining. Path entries are (target, _SYM_OP, sol) so replay re-applies the
-# stored sol directly (no IBP re-derivation). Guarded by SAILIR_SYMMETRY=1.
-_SYMMETRY = os.environ.get('SAILIR_SYMMETRY', '0') == '1'
-_SYM_OP = '__SYM__'
-_SYM_REDUCER = None
-_SYM_STEPS = 0          # total symmetry reductions applied (telemetry)
-# DIAGNOSTIC (default OFF — zero effect unless these env vars are set):
-#   SAILIR_SYMMETRY_PERSTEP=1 fires the symmetry pre-pass EVERY step (not just
-#     step 0), to test the per-step hypothesis;
-#   SAILIR_SYM_INSTRUMENT=1 logs per-step beam fingerprints to distinguish a
-#     LIVE-LOCK (repeat_states climbing) from a COMPUTE/MEMORY blowup.
-_SYM_PERSTEP = os.environ.get('SAILIR_SYMMETRY_PERSTEP', '0') == '1'
-_SYM_INSTRUMENT = os.environ.get('SAILIR_SYM_INSTRUMENT', '0') == '1'
-_SYM_SEEN = {}          # expr-fingerprint -> first step seen (instrument only)
-
-# ── Canonicalize-in-actions (SAILIR_CANON=1) ──────────────────────────────────
-# Every IBP action's sol is canonicalized (value-preserving) so the action emits
-# only CANONICAL integrals; the start expr is canonicalized too. The expression
-# therefore never contains a non-canonical integral, and replay/strip/masters all
-# operate on canonical expressions unchanged. Confluent incremental rule set.
-_CANON = os.environ.get('SAILIR_CANON', '0') == '1'
-_CANONIZER = None
-def _get_canonizer():
-    global _CANONIZER
-    if _CANONIZER is None:
-        from canonicalize import Canonicalizer
-        _CANONIZER = Canonicalizer()
-    return _CANONIZER
-
-# Action enumeration sector filter. The default 'subsector' filter drops any action
-# whose relation uses a propagator OUTSIDE the target's exact prop-set (blocks lateral
-# AND higher sectors). That is correct without canon (subsectors are ⊆ the target's
-# props), but WRONG under canon: canon RELABELS subsector integrals to a canonical
-# prop-set with different propagators (same or fewer count), so a legitimate relabeled
-# subsector trips the "outside" test and the whole action — including the clean
-# reduction — is dropped. Under canon we must instead block only STRICTLY HIGHER
-# sectors (all target props + extra), which is prop-COUNT based and canon-invariant.
-_ENUM_FILTER = 'higher_only' if _CANON else 'subsector'
-
-
-def _get_sym_reducer():
-    global _SYM_REDUCER
-    if _SYM_REDUCER is None:
-        from sailir_symmetry import SymmetryReducer
-        _SYM_REDUCER = SymmetryReducer(prime=ibp_env.PRIME)
-    return _SYM_REDUCER
-
-
-def _greedy_sym_reduce(s, env, target_sector, start_w12):
-    """Deterministically reduce s's pivot via sector symmetry until it is
-    symmetry-irreducible. Each reduction keeps resolved_subs consistent (so later
-    IBP actions resolve correctly) and records a (target, _SYM_OP, sol) path step.
-    Returns a new State_v5 (or s unchanged if nothing fired)."""
-    global _SYM_STEPS
-    R = _get_sym_reducer()
-    expr = s.expr
-    rs = s.resolved_subs if s.resolved_subs is not None else {}
-    path = s.path
-    n_sym = 0
-    while True:
-        nm = get_non_masters(expr, target_sector)
-        if not nm:
-            break
-        # Reduce ANY symmetry-reducible active integral (max-first for a
-        # deterministic order), NOT just the max pivot — symmetry is a free,
-        # confluent reduction, so every reducible active term should be taken.
-        target = sol = None
-        for cand in sorted(nm, key=_target_key):
-            sc = R.sol(cand)
-            if sc is not None:
-                target, sol = cand, sc
-                break
-        if target is None:
-            break                                  # no active integral is reducible
-        expr = apply_substitution_v5(expr, target, sol, target_sector, start_w12)
-        rs = add_sub_to_resolved_v5(rs, target, sol, start_w12)
-        path = path + [(target, _SYM_OP, sol)]
-        n_sym += 1
-        if n_sym > 100000:                         # safety; strict descent => never loops
-            break
-    if n_sym == 0:
-        return s
-    _SYM_STEPS += n_sym
-    nm = get_non_masters(expr, target_sector)
-    mw, tw = _mw_tw_from_nm(nm)
-    return State_v5(expr=expr, resolved_subs=rs, score=s.score, path=path,
-                    n_non_masters=len(nm), max_w12=mw, total_w12=tw, aux_flat=None)
 
 
 def beam_search_v5(env, model, start_expr, target_sector, start_w12,
@@ -1461,7 +1363,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             for target in tied:
                 valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
                     target, indirect_cache, s.resolved_subs,
-                    env.ibp_t, env.li_t, env.shifts, _ENUM_FILTER,
+                    env.ibp_t, env.li_t, env.shifts, 'subsector',
                     env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                 )
                 if (not _bounded_tabu_on
@@ -1613,47 +1515,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f'{n_orig_beam} → {n_macros} distinct expr', flush=True)
         # ──────────────────────────────────────────────────────────────────
 
-        # ── DIAGNOSTIC instrumentation (opt-in: SAILIR_SYM_INSTRUMENT=1) ──
-        # Fingerprint the beam at the TOP of each step and count states whose
-        # expr-fingerprint was already seen in an EARLIER step (a returned state
-        # => live-lock signature). With the [v6 step] line's t_step / mw /
-        # rs_vsz this separates a LIVE-LOCK from a COMPUTE/MEMORY blowup.
-        if _SYM_INSTRUMENT:
-            if step == resume_step:
-                _SYM_SEEN.clear()
-            _fps = [frozenset(s.expr.items()) for s in beam]
-            _rep = sum(1 for fp in _fps if fp in _SYM_SEEN)
-            for fp in _fps:
-                _SYM_SEEN.setdefault(fp, step)
-            print(f'[sym-instr step {step}] beam={len(beam)} '
-                  f'repeat_states={_rep} seen_total={len(_SYM_SEEN)} '
-                  f'sym_cumulative={_SYM_STEPS}', flush=True)
-
-        # ── Greedy sector-symmetry pre-reduction (opt-in, deterministic) ──
-        # Reduce each beam state's pivot via symmetry BEFORE the model machinery.
-        # Free (lookup + splice), no beam branching. A reduced state may already
-        # be drained (success), so re-check termination immediately.
-        # Symmetry only at the START (step 0): drain a symmetry-reducible start
-        # integral deterministically (the ~24% benefit). NOT every step — the
-        # beam search transiently RAISES weight via IBP, and firing symmetry on
-        # those raised integrals churns (horizontal moves vs. a weight-raising
-        # search). Reducible starts are exactly what the orchestrator dispatches.
-        if _SYMMETRY and (step == resume_step or _SYM_PERSTEP):
-            _sym_before = _SYM_STEPS
-            beam = [_greedy_sym_reduce(s, env, target_sector, start_w12)
-                    for s in beam]
-            if verbose and _SYM_STEPS > _sym_before:
-                print(f'[sym step {step}] +{_SYM_STEPS - _sym_before} symmetry '
-                      f'reductions (total {_SYM_STEPS})', flush=True)
-            winning = next((s for s in beam if _is_success(s, target_sector)), None)
-            if winning is not None:
-                best_state = winning
-                if verbose:
-                    print(f'[sym step {step}] drained after symmetry — DONE '
-                          f'(path_len={len(winning.path)}, sym_steps={_SYM_STEPS})',
-                          flush=True)
-                break
-
         # Build candidate list across all parents × valid actions
         candidates = []  # list of state_v5_child
         cand_metadata = []  # parallel list of (parent_state, target) for incremental aux
@@ -1732,16 +1593,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         env._raw_eq_cache,
                     )
                     new_aux = _v7_aux_pack(new_aux)  # dict cu -> PackedEq for storage
-                    # The dict-form indirect_cache from compute_*_with_aux has DICT
-                    # cu entries, which the PACKED enumerate kernel cannot consume
-                    # (it reads cached_obj.ids). Branch A feeds _aux_to_result(packed);
-                    # do the same here so a NON-EMPTY rebuild — e.g. after a mid-search
-                    # symmetry reduction sets aux_flat=None — hands the kernel PackedEq
-                    # entries, not dicts. Empty rebuild -> [] either way, so the step-0
-                    # path (the only place Branch B was previously exercised) is
-                    # byte-identical; this only changes the formerly-crashing non-empty
-                    # case. Cost: a reconstruction equal to Branch A's, on a rare path.
-                    indirect_cache = _aux_to_result(new_aux, env)
                     if _v5_prof:
                         _ct['aux_build_calls'] += 1
                     beam[parent_idx] = s._replace(aux_flat=new_aux)
@@ -1758,7 +1609,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     _t = time.time() if _v5_prof else 0
                     valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
                         target, indirect_cache, s.resolved_subs,
-                        env.ibp_t, env.li_t, env.shifts, _ENUM_FILTER,
+                        env.ibp_t, env.li_t, env.shifts, 'subsector',
                         env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                     )
                     if _v5_prof:
@@ -1850,7 +1701,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     for tgt in tied:
                         raw_valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
                             tgt, ic, s.resolved_subs,
-                            env.ibp_t, env.li_t, env.shifts, _ENUM_FILTER,
+                            env.ibp_t, env.li_t, env.shifts, 'subsector',
                             env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                         )
                         unblocked = []
@@ -1994,7 +1845,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         for tgt in tied:
                             raw_valid = _packed_cu.enumerate_valid_actions_with_indirect_cache_packed(
                                 tgt, ic, st.resolved_subs,
-                                env.ibp_t, env.li_t, env.shifts, _ENUM_FILTER,
+                                env.ibp_t, env.li_t, env.shifts, 'subsector',
                                 env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                             )
                             filtered = ([(op, dlt) for (op, dlt) in raw_valid
@@ -2414,33 +2265,6 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f't_step={time.time()-t_step:.1f}s '
                   f't_total={time.time()-t0:.1f}s',
                   flush=True)
-            if os.environ.get('SAILIR_TRACE') == '1':
-                # Full per-step trace: the best beam state's integrals + the
-                # action that produced it, plus the top candidates considered.
-                _nm = set(get_non_masters(best_in_beam.expr, target_sector))
-                _act = best_in_beam.path[-1] if best_in_beam.path else None
-                print(f'    [trace {step+1}] CHOSEN action: target={_act[0] if _act else None} '
-                      f'op={_act[1] if _act else None} delta={_act[2] if _act else None}', flush=True)
-                print(f'    [trace {step+1}] best.expr ({len(best_in_beam.expr)} terms; NM=non-master):', flush=True)
-                for _k in sorted(best_in_beam.expr):
-                    print(f'        {"NM" if _k in _nm else "  "} {_k}: {best_in_beam.expr[_k]}', flush=True)
-                _fp = frozenset(best_in_beam.expr.items())
-                print(f'    [trace {step+1}] best.expr fingerprint hash={hash(_fp)} '
-                      f'path_len={len(best_in_beam.path)}', flush=True)
-                # FULL BEAM DUMP: every beam state, sorted by progress key, with the
-                # action that produced it and its (compact) expr. Lets us diff the
-                # canon vs no-canon beams step by step and pinpoint divergence.
-                print(f'    [beam {step+1}] {len(beam)} states:', flush=True)
-                for _r, _s in enumerate(sorted(beam, key=_progress_key)):
-                    _a = _s.path[-1] if _s.path else None
-                    _e = {k: _s.expr[k] for k in sorted(_s.expr)}
-                    _rsk = sorted(_s.resolved_subs.keys())
-                    print(f'      #{_r:>2} act=(t={_a[0] if _a else None},'
-                          f'op={_a[1] if _a else None},d={_a[2] if _a else None}) '
-                          f'score={_s.score:.3f} mw={max_w12(_s.expr, target_sector)} '
-                          f'nm={_s.n_non_masters} expr={_e}', flush=True)
-                    print(f'          rs_keys={_rsk}', flush=True)
-                    print(f'          full_path={[ (t,op) for (t,op,d) in _s.path ]}', flush=True)
             if _v5_prof:
                 p1_t = sum(_p1.values())
                 p2_t = sum(_p2.values())
@@ -2643,13 +2467,6 @@ def replay_full_expr(start_expr, path, env):
     # local cache (just the path's ~len(path) raws), independent of the search.
     _full_raw_cache = {}
     for (target, ibp_op, delta) in path:
-        if ibp_op == _SYM_OP:
-            # Symmetry step: `delta` IS the stored sol (full, unstripped).
-            sol = delta
-            subs[target] = sol
-            from sailir.ibp_env import apply_substitution as _apply
-            expr = _apply(expr, target, sol)
-            continue
         seed = tuple(target[i] + delta[i] for i in range(ibp_env.N_INDICES))
         _rk = (ibp_op, seed)
         raw = _full_raw_cache.get(_rk)
@@ -2664,11 +2481,8 @@ def replay_full_expr(start_expr, path, env):
         sol = solve_ibp_for(cached, target)
         if sol is None:
             return None
-        # Raws are canonical at source under _CANON (set_raw_canonicalizer), so `sol`
-        # is already canonical + fully resolved + target-free — no per-step canon here.
         subs[target] = sol
-        # Apply substitution to expr (no stripping — full). sol is already canonical and
-        # target-free, so the accumulated expr stays canonical.
+        # Apply substitution to expr (no stripping — full)
         from sailir.ibp_env import apply_substitution as _apply
         expr = _apply(expr, target, sol)
     return expr, subs
@@ -2854,25 +2668,6 @@ def main():
     print(f'  target_sector = {target_sector}', flush=True)
 
     start_expr = {start_int: 1}
-    if _CANON:
-        # ROOT canonicalization: canonicalize every raw IBP equation at its source, so
-        # the ENTIRE action space + resolved_subs machinery lives in one (canonical)
-        # coordinate system. With this hook installed there is no raw-vs-canonical seam,
-        # so apply_action_v5 needs NO sol-canon / target-collect / re-resolve, and
-        # resolved_subs entries never become self-referential.
-        _cz = _get_canonizer()
-        ibp_env.set_raw_canonicalizer(_cz.canon_sol)
-        # Canonicalize the start (no-op when already canonical — the usual case,
-        # since every action emits canonical integrals). For a non-canonical
-        # single-integral top (e.g. 161->152) refresh start_int/target_sector to
-        # follow it (weight-preserving, so start_w12 is unchanged).
-        start_expr = _cz.canon_sol(start_expr)
-        if len(start_expr) == 1:
-            start_int = next(iter(start_expr))
-            target_sector = tuple(get_sector_mask(start_int))
-            print(f'  [canon] start -> {start_int}  target_sector={target_sector}', flush=True)
-        elif start_expr:
-            print(f'  [canon] start -> combination of {len(start_expr)} canonical integrals', flush=True)
 
     beam, best_state = beam_search_v5(
         env, model, start_expr, target_sector, start_w12,
