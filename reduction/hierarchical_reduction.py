@@ -199,7 +199,10 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}')
+                       f'{paper_masters_flag}{resume_flag}'
+                       + (' --symmetry' if os.environ.get('SAILIR_SYMMETRY') == '1' else '')
+                       + (' --symmetry-perstep' if os.environ.get('SAILIR_SYMMETRY_PERSTEP') == '1' else '')
+                       + (' --canon' if os.environ.get('SAILIR_CANON') == '1' else ''))
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
@@ -305,7 +308,10 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}')
+                       f'{paper_masters_flag}{resume_flag}'
+                       + (' --symmetry' if os.environ.get('SAILIR_SYMMETRY') == '1' else '')
+                       + (' --symmetry-perstep' if os.environ.get('SAILIR_SYMMETRY_PERSTEP') == '1' else '')
+                       + (' --canon' if os.environ.get('SAILIR_CANON') == '1' else ''))
     elif use_v6_worker:
         worker_script = 'onestep_worker_v6.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
@@ -574,6 +580,15 @@ def main():
                              'Default scales with cpus (4 * cpus). For the '
                              'delta worker on heavy targets like (8,5), set '
                              'to 16 or 32 to leave room for the aux growth.')
+    parser.add_argument('--use-symmetry', action='store_true',
+                        help='DESIGN 1 symmetry routing: before dispatching a worker '
+                             'for an integral, try a strictly-lowering symmetry '
+                             'rewrite (reduction/symmetry_route.py). If reducible, '
+                             'route it for FREE (cache entry, no worker) and cascade '
+                             'the symmetry descent until only survivors (corners / '
+                             'asymmetric integrals) remain. Value-preserving (rules '
+                             'are GF(p) combos of exact symmetry identities); the '
+                             'master combination is unchanged. Requires --prime 1009.')
     parser.add_argument('--resume', action='store_true',
                         help='Resume: on startup, scan work_dir/results/*.pkl and '
                              'load each completed worker as a cache entry. Then '
@@ -656,6 +671,11 @@ def main():
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
     straggler2_integrals = set()  # integrals that have hit the second-level escalation
+    sym_memo = {}                 # integral -> symmetry rule (or None); Design 1 routing
+    n_symmetry_routed = 0         # cumulative count of integrals routed free by symmetry
+    if args.use_symmetry and args.prime != 1009:
+        raise SystemExit('--use-symmetry requires --prime 1009 (symmetry_route/canonicalize '
+                         'transforms are built at p=1009).')
 
     # --resume: scan work_dir/results/*.pkl, load each successful worker output
     # as a cache entry. Apply substitutions to start_expr to recover current expr.
@@ -797,6 +817,34 @@ def main():
         # Apply all cached substitutions to the expression
         old_size = len(expr)
         expr = apply_substitutions(expr, cache, args.prime)
+
+        # DESIGN 1 symmetry routing: reduce every symmetry-reducible non-master for
+        # FREE (strictly-lowering rewrite -> cache, no worker) and cascade the
+        # symmetry descent until only survivors (corners / asymmetric integrals)
+        # remain; the normal worker dispatch below then handles those. P_S is linear
+        # so this only adds cache entries -- apply_substitutions is unchanged.
+        # Value-preserving: every rule is a GF(p) combination of exact symmetry
+        # identities, so the final master combination is identical to the baseline.
+        if args.use_symmetry:
+            from symmetry_route import symmetry_rule
+            routed_this_iter = 0
+            while True:
+                cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
+                routed = 0
+                for I in cand:
+                    if I not in sym_memo:
+                        sym_memo[I] = symmetry_rule(I)
+                    rule = sym_memo[I]
+                    if rule is not None:            # {} (symmetry-zero) or strictly-lower rewrite
+                        cache[I] = rule; routed += 1
+                if not routed:
+                    break
+                routed_this_iter += routed
+                expr = apply_substitutions(expr, cache, args.prime)
+            if routed_this_iter:
+                n_symmetry_routed += routed_this_iter
+                print(f"[Iter {iteration}] symmetry-routed {routed_this_iter} integrals free "
+                      f"({n_symmetry_routed} cumulative)", flush=True)
 
         # Count cache hits (integrals that were substituted)
         # This is approximate - we count how many integrals were removed
@@ -1232,6 +1280,9 @@ def main():
     print(f'Peak memory (max worker per-CPU): {max_worker_memory_per_cpu_kb/1024:.1f} MB ({max_worker_memory_per_cpu_kb} KB)')
     print()
     print(f'Final expression: {len(masters)} masters, {len(non_masters)} non-masters')
+    if args.use_symmetry:
+        print(f'Symmetry routing: {n_symmetry_routed} integrals reduced FREE (no worker); '
+              f'{total_jobs} worker jobs dispatched.')
 
     if non_masters:
         print(f'\nWARNING: {len(non_masters)} non-masters remaining!')
@@ -1255,6 +1306,7 @@ def main():
         'final_expr': expr,
         'cache': cache,
         'total_jobs': total_jobs,
+        'n_symmetry_routed': n_symmetry_routed,
         'total_steps': total_steps,
         'elapsed_time': elapsed,
         'total_worker_time': total_worker_time,

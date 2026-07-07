@@ -196,6 +196,49 @@ def eval_coeff(coeff_str, seed):
         return 0
 
 
+# Root canonicalization hook. When set (by beam_search under SAILIR_CANON), EVERY
+# raw IBP equation is canonicalized the instant it is generated, so the entire action
+# space / resolved_subs machinery operates in ONE (canonical) coordinate system. This
+# removes the raw-vs-canonical seam that otherwise lets reduced integrals slip through
+# apply_resolved_subs and makes resolved_subs entries self-referential. Injected as a
+# callable (dict -> dict) to avoid importing reduction.canonicalize here (circular).
+_RAW_CANON = None
+
+
+def set_raw_canonicalizer(fn):
+    """Install (or clear, with None) the root raw-equation canonicalizer."""
+    global _RAW_CANON
+    _RAW_CANON = fn
+
+
+def _strip_eq_w12(eq, min_w12):
+    """Re-apply get_raw_equation's own weight strip to a dict eq (used after canon,
+    since canon may surface lower-weight canonical terms that must stay stripped)."""
+    if min_w12 is None:
+        return eq
+    if len(min_w12) == 3:
+        m0, m1, abs0 = min_w12
+    else:
+        m0, m1 = min_w12
+        abs0 = None
+    out = {}
+    for I, c in eq.items():
+        w0 = 0
+        w1 = 0
+        for v in I:
+            if v > 0:
+                w0 += v
+            elif v < 0:
+                w1 -= v
+        if w0 < m0 or (w0 == m0 and w1 < m1):
+            continue
+        if abs0 is not None and w0 == m0 and w1 == m1:
+            if tuple(abs(x) for x in I) > abs0:
+                continue
+        out[I] = c
+    return out
+
+
 def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
     """Get raw IBP equation for given operator and seed.
 
@@ -230,6 +273,8 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
             if c != 0:
                 integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
                 eq[integral] = c
+        if _RAW_CANON is not None:
+            eq = _RAW_CANON(eq)          # min_w12 is None here → no re-strip
         return eq
     # mod-lower-weight: strip by weight BEFORE the expensive eval_coeff AND
     # before building the integral tuple. The weight (w1,w2)=(sum positive,
@@ -264,6 +309,8 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
         if c != 0:
             integral = tuple(seed[i] + shift[i] for i in range(N_INDICES))
             eq[integral] = c
+    if _RAW_CANON is not None:
+        eq = _strip_eq_w12(_RAW_CANON(eq), min_w12)   # re-strip: canon may lower weight
     return eq
 
 
@@ -1211,8 +1258,15 @@ def apply_resolved_subs_batch(raw_eqs, resolved_subs, verbose_timing=False):
         result = dict(raw)
         for integral in list(result.keys()):
             if integral in resolved_subs:
+                # `integral` is from a snapshot of result.keys(); an earlier sub in
+                # this same pass may have already cancelled it to 0 and deleted it
+                # (below). That never happens for IBP-only resolved_subs, but a
+                # mid-search symmetry substitution can introduce such a cross-
+                # cancellation. Absent key => coefficient 0 => nothing to substitute.
+                coeff = result.pop(integral, None)
+                if coeff is None:
+                    continue
                 total_subs_applied += 1
-                coeff = result.pop(integral)
                 for repl_integral, repl_coeff in resolved_subs[integral].items():
                     new_coeff = (coeff * repl_coeff) % PRIME
                     if repl_integral in result:

@@ -154,6 +154,44 @@ Outputs of interest:
 
 ---
 
+## 3a. Disabling symmetries — the no-sym basis SAILIR actually uses (CRITICAL)
+
+**SAILIR's search uses IBP + LI only — never sector symmetries.** So the
+`masters` file you ship MUST be the **no-symmetry** basis. Kira's *default* run
+applies sector symmetries and yields a *smaller*, symmetrized basis that SAILIR
+will NOT reach (e.g. pentagon-box: sym = **61**, no-sym = **62**). Training on
+the wrong basis silently corrupts everything downstream.
+
+**To get the no-sym basis, export `KIRA_NO_SYMMETRY=1` before the run**, using
+the **patched** `kira-3.1` binary:
+
+```bash
+export KIRA_NO_SYMMETRY=1            # <-- the actual no-sym switch
+export FERMATPATH=...
+/het/p4/dshih/jet_images-deep_learning/IBPreduction/kira/kira-3.1 jobs.yaml
+```
+
+The patch lives in `src/kira/trivial_sym.cpp` (`if (std::getenv("KIRA_NO_SYMMETRY")) return 1;`
+inside `skip_symmetry()`, making Kira skip ALL sector symmetries). The patched
+binary is the one installed as `kira-3.1` (original backed up as
+`kira-3.1.orig.bak`); rebuild with `SAILIR_phase2/archive/rebuild_kira_nosym.sh`.
+With no env var the binary behaves identically to stock Kira.
+
+Two traps to avoid (both cost real time):
+- **`run_symmetries: false` in `jobs.yaml` is INERT** — it does nothing. It is
+  NOT the switch. Only `KIRA_NO_SYMMETRY=1` works.
+- **Kira writes the symmetry files** (`sectormappings/<FAM>/{symmetries,
+  sectorSymmetries, sectorRelations}`) **regardless** of `KIRA_NO_SYMMETRY` —
+  the env var only changes whether they are USED, not generated. So the presence
+  of those files is NOT evidence symmetries were applied. The only reliable
+  check is the **master count** on a family where sym ≠ no-sym (pentagon-box
+  61 vs 62), or simply knowing this env-var mechanism.
+
+`topology_input/pentagonbox` is the sym (61) basis; `topology_input/pentagonbox_nosym`
+is the no-sym (62) basis SAILIR uses.
+
+---
+
 ## 4. Dropping into SAILIR
 
 Create `topology_input/<family_name>/`, copy the three files plus the

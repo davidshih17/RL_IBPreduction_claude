@@ -1,0 +1,130 @@
+#!/usr/bin/env python
+"""Design 1 routing layer: given an integral I, return its STRICTLY-LOWERING
+symmetry rewrite  I -> {lower individual integrals}  (value-preserving), or None
+if I is a symmetry survivor (must go to an IBP worker).
+
+Mechanism (reuses canonicalize's Kira-validated transforms):
+  * union-close {I} under every applicable (super-sector) symmetry, forming exact
+    value relations  K - image(K) = 0  (image via image_unsigned, no det sign);
+  * RREF pivoting on HIGHEST total-weight. Symmetry never raises weight, so I is
+    the max-weight element of its closure => if I is reducible it is the pivot and
+    its rule RHS is automatically strictly-lower total-weight.
+  * symmetry_rule(I) returns rules.get(I): {} means I is a symmetry-zero (I->0),
+    a non-empty dict is the strictly-lower rewrite, None means survivor.
+
+Every rule is a GF(p) combination of exact symmetry identities => the master
+combination is unchanged (verified by the A/B masters-equality gate).
+"""
+import os, sys
+ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
+sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
+from canonicalize import _transforms, image_unsigned, _reduce, P
+
+# NOTE on scaleless (trivial-sector) integrals: a symmetry relabeling can map a
+# nonzero integral onto a scaleless sub-sector integral (= 0), e.g. D1 D5 D6 ->
+# D5 D6 D8 (k1 only in (k1-k2)^2). We do NOT special-case these: under
+# --paper-masters-only they are not masters, so a scaleless survivor is dispatched
+# to an IBP worker which reduces it to 0 the SAME way the baseline does (verified:
+# worker(I[0,0,0,0,1,1,0,1]) -> {}). Symmetry alone can't kill a scaleless integral
+# (that needs the scaling symmetry / IBP), so we let IBP finish the job -- no
+# explicit zero-sector list. (Under --no-paper-masters-only scaleless corners are
+# wrongly treated as masters and the baseline only survives via mod-p cancellation,
+# which the symmetry merge breaks -- so ALWAYS use --paper-masters-only here.)
+
+
+def tkey(i):
+    """The WORKERS' total order = beam_search_v7._target_key = (-r, -s, |abs|).
+    SMALLER tkey == HIGHER in the ordering == the integral IBP eliminates first.
+    A valid reduction sends an integral to terms with strictly LARGER tkey (lower
+    in the ordering). symmetry_route MUST use this exact order, or its rewrites run
+    opposite to the workers on the |abs| tiebreak and the mixed cache cycles."""
+    return (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
+            tuple(abs(x) for x in i))
+
+
+def _build_rules(seeds, cap=20000):
+    """Orbit closure of `seeds` under all applicable symmetries, RREF pivoting on
+    the HIGHEST-in-ordering integral (smallest tkey) so every rule's RHS is strictly
+    LOWER in the ordering (larger tkey) -- same descent direction as the IBP workers,
+    which makes the combined cache a DAG (no cycles). Returns {pivot: {lower: coeff}}
+    or None if the closure exceeds `cap` (bail -> caller dispatches a worker)."""
+    seen = set(seeds); frontier = list(seeds); raw = []
+    while frontier:
+        K = frontier.pop()
+        for (M, c) in _transforms(K):
+            img = image_unsigned(K, M, c)
+            if img is None:
+                continue
+            rel = dict(img); rel[K] = (rel.get(K, 0) - 1) % P
+            rel = {k: v for k, v in rel.items() if v % P}
+            if rel:
+                raw.append(rel)
+            for J in img:
+                if J not in seen:
+                    if len(seen) >= cap:
+                        return None
+                    seen.add(J); frontier.append(J)
+    # pos increases as tkey DECREASES (highest-in-ordering -> largest pos), so
+    # max(pos) picks the integral the reduction should eliminate.
+    pos = {v: k for k, v in enumerate(sorted(seen, key=tkey, reverse=True))}
+    rules = {}
+    for rel in raw:
+        r = _reduce(rel, rules)
+        if not r:
+            continue
+        piv = max(r, key=lambda v: pos[v])                        # eliminate highest-in-ordering
+        co = r.pop(piv); inv = pow(co, P - 2, P)
+        newp = {k: (-v * inv) % P for k, v in r.items()}
+        for q in list(rules):
+            if piv in rules[q]:
+                cc = rules[q].pop(piv)
+                for w, cw in newp.items():
+                    rules[q][w] = (rules[q].get(w, 0) + cc * cw) % P
+                rules[q] = {k: v for k, v in rules[q].items() if v % P}
+        rules[piv] = newp
+    return rules
+
+
+def symmetry_rule(I):
+    """Symmetry rewrite for I that is strictly LOWER in the workers' ordering, or
+    None if I is a survivor. Return value:
+      {}                 -> I is a symmetry-zero (route I -> 0)
+      {lower: coeff,...}  -> rewrite into terms strictly lower in the ordering (route free)
+      None               -> survivor (dispatch an IBP worker)
+    I is routed only when it is the highest-in-ordering member of its orbit closure
+    (so it is a pivot) and every RHS term is strictly lower in the ordering -- the
+    same descent direction as the IBP workers, so no worker/symmetry cycle forms.
+    """
+    I = tuple(I)
+    rules = _build_rules({I})
+    if rules is None or I not in rules:
+        return None
+    tail = rules[I]
+    ki = tkey(I)
+    if all(tkey(k) > ki for k in tail):       # strictly LOWER in ordering (larger tkey); empty ok
+        return tail
+    return None
+
+
+if __name__ == "__main__":
+    from sailir import ibp_env
+    from sailir.topology import Topology
+    ibp_env.init_from_topology(Topology.from_dir(os.path.join(ROOT, "topology_input/pentagonbox_nosym")))
+    ibp_env.set_prime(1009)
+    tests = [
+        (2, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0),   # D2 present: must NOT route to I[1,1,2] (fake-M bug)
+        (2, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0),   # D2 absent: D1^2 D3 -> should route (D1<->D3)
+        (1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0),   # a plain 5-prop corner (likely survivor)
+        (1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0),   # top-sector corner (asymmetric -> survivor)
+    ]
+    for I in tests:
+        r = symmetry_rule(I)
+        if r is None:
+            print(f"  {I}  ->  SURVIVOR (worker)")
+        elif not r:
+            print(f"  {I}  ->  0  (symmetry-zero)")
+        else:
+            k = tkey(I)
+            lo = all(tkey(t) > k for t in r)     # lower in ordering (larger tkey)
+            terms = " + ".join(f"{c}*{t}" for t, c in list(r.items())[:3])
+            print(f"  {I}  ->  {terms}{' + ...' if len(r) > 3 else ''}   [lower-in-ordering={lo}]")

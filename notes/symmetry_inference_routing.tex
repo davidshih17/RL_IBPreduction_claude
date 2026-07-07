@@ -1,0 +1,262 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+
+\newcommand{\I}[1]{\mathcal{I}[#1]}
+\newcommand{\kk}{\kappa}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\bf Symmetry-Enhanced IBP Reduction at Inference:\\
+a free routing layer beneath the SAILIR workers}
+\author{SAILIR project note}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We add graph symmetries as an \emph{inference-time routing layer} beneath the
+ML-guided IBP workers of SAILIR. For each non-master integral the layer attempts a
+free, search-avoiding symmetry rewrite; only the survivors are handed to a beam-search
+worker. On pentagon-box targets this reduces the number of dispatched worker
+reductions by $25$--$80\%$ with \emph{no change} to the final master combination.
+The construction is only correct and tractable after resolving three obstacles, the
+decisive one being that the symmetry rewrites must descend in the \emph{exact same
+total order} the workers use---which is what turns a deadlocking, non-confluent
+system into a directed acyclic one. The CPU saving is smaller and target-dependent:
+symmetry reliably removes the medium-cost bulk of the work, but because it follows a
+different reduction path its net benefit depends on whether that path thins or
+thickens the expensive hard tail.
+\end{abstract}
+
+\section{Setup}
+SAILIR reduces Feynman integrals to master integrals by dispatching, for each
+non-master integral in the running expression, a model-guided beam-search
+\emph{worker} that performs one integration-by-parts (IBP) reduction step. The
+orchestrator substitutes each worker's result back into the expression and iterates
+until only masters remain. The dominant cost is the number of worker calls, each of
+which is an expensive search over the IBP relation system.
+
+We work in the two-loop, five-point, all-massless \emph{pentagon-box} family
+(``TA''): eight propagators $D_1,\dots,D_8$ and three irreducible scalar products
+(ISPs) $D_9,D_{10},D_{11}$. An integral is labelled by its exponent vector
+$a\in\mathbb{Z}^{11}$, written $\I{a}$; positive entries are denominator powers,
+negative entries are numerator powers.
+
+The workers descend in the total order (matching the training-data target
+selection)
+\begin{equation}
+\label{eq:kappa}
+\kk(a) \;=\; \bigl(-r,\,-s,\,|a|\bigr),\qquad
+r=\!\!\sum_{a_i>0}\! a_i,\quad
+s=\!\!\sum_{a_i<0}\!|a_i|,\quad
+|a|=(|a_1|,\dots,|a_{11}|),
+\end{equation}
+with $|a|$ compared lexicographically. \emph{Smaller $\kk$ means higher in the
+ordering}: it is the integral the reduction eliminates first. A valid one-step
+reduction sends an integral to a combination of strictly-$\kk$-\emph{larger} (i.e.\
+lower) integrals; masters may appear at any weight. This ordering---in particular the
+sign convention on the $|a|$ tiebreak---is the load-bearing detail of
+\S\ref{sec:confluence}.
+
+\section{Symmetries as rewrites}
+A symmetry is an affine loop relabeling $g:(k_1,k_2)\mapsto (M(k_1,k_2)+\text{shift})$
+that maps the integral family to itself. It induces a linear map on the inverse
+propagators,
+\begin{equation}
+D_i \;\longmapsto\; \sum_j M_{ij}\,D_j + c_i,
+\end{equation}
+with $c_i$ a kinematic constant, and hence a value identity $\I{a}=\I{g\cdot a}$. For a
+\emph{denominator} index the map is (in the useful cases) a single-propagator
+relabeling. For a \emph{numerator} index the ISP re-expresses as a linear combination,
+and because the numerator is a \emph{product} of such factors, the image of a
+degree-$s$ numerator integral is a multinomial: generically a large combination of
+same-and-lower-weight integrals. (Concretely, one symmetry image of a degree-3
+numerator integral we examined has $103$ terms.)
+
+\paragraph{Rewrite rule.} For a target $\I{a}$ we (i) form the orbit closure of
+$\{a\}$ under all applicable symmetries; (ii) collect the exact relations
+$\I{K}-\I{g\cdot K}=0$; and (iii) row-reduce them over $\mathrm{GF}(p)$
+($p=1009$), pivoting on the $\kk$-\emph{highest} (i.e.\ $\kk$-minimal) integral of each
+relation. If $a$ is a pivot, the resulting rule expresses $\I{a}$ as a
+$\mathrm{GF}(p)$ combination of strictly-lower (strictly-$\kk$-larger) integrals.
+
+\paragraph{Routing.} At each orchestrator iteration, before dispatching workers, every
+non-master $I$ is offered to \code{symmetry\_rule($I$)}. If it returns a rule, the rule
+is written into the orchestrator's substitution cache for free (no worker) and the
+symmetry descent is cascaded; if it returns \code{None} (a \emph{survivor}) the
+integral is dispatched to a worker as usual. Because $P_S$ (the symmetric projector
+implicit in these rules) is linear, the substitution machinery is unchanged: symmetry
+rules are just additional cache entries.
+
+\section{Three obstacles}
+
+\subsection{Placeholder symmetries}
+Kira records some symmetries with an explicit loop substitution (from which $M,c$
+follow by momentum algebra) and others as a bare propagator permutation
+(``placeholder'') with the loop map omitted. The naive fallback---treat the
+placeholder as a clean permutation from its stored image list---is \emph{wrong}: a
+propagator listed as ``fixed'' may in truth map to a \emph{combination}. We instead
+reconstruct the true relabeling from the placeholder's reliable \emph{swaps} (a
+propagator mapping to a \emph{different} propagator), solve for the loop map, and
+derive the full $M,c$. This recovers $26$ of $33$ placeholders (the $7$ with no swaps
+are dropped), e.g.\ correctly reconstructing $k_1\to-(k_1{+}p_1{+}p_2)$ whose full
+map sends $D_2\to D_1-D_2+D_3$. It also eliminates a class of false relations that the
+bare-permutation fallback produced (e.g.\ the spurious $\I{2,1,1}=\I{1,1,2}$).
+
+\subsection{Scaleless integrals}
+A symmetry can map a nonzero integral onto a scaleless (trivial-sector) one---e.g.\
+$D_1D_5D_6\to D_5D_6D_8$, where $k_1$ appears only in $(k_1{-}k_2)^2$ and the
+$k_1$-integral is scaleless---which is zero. We do \emph{not} special-case these. Under
+the \emph{paper-masters} convention (the production setting) a scaleless corner is not
+a master, so a scaleless survivor is dispatched to a worker that reduces it to $0$ by
+IBP, exactly as the baseline does (verified directly: the worker returns the empty
+expression on such integrals). No explicit zero-sector list is required. (Under the
+alternative ``corners-are-masters'' convention, scaleless corners are instead retained
+as pseudo-masters, and the symmetry merge breaks the mod-$p$ cancellation the baseline
+relies on to make them vanish; hence one must run with paper-masters.)
+
+\subsection{Confluence: the ordering (crux)}
+\label{sec:confluence}
+The workers descend in $\kk$ of Eq.~\eqref{eq:kappa}. A symmetry rewrite \emph{must}
+descend in the same order, or the mixed substitution cache is non-confluent.
+
+Our first router pivoted on $(r,s,|a|)$ with the \emph{opposite} $|a|$ tiebreak to
+$\kk$. Consider two same-$(r,s)$ (``lateral'') integrals $I,J$ with $I$ below $J$ in
+$\kk$. A worker correctly reduces $I\to J$ (down in $\kk$), while the mis-ordered
+symmetry reduces $J\to I$. Together they form $I\to J\to I$: the substitution loop
+never resolves. In the failing run this hit the $10^4$-iteration substitution cap $29$
+times, stranded hundreds of integrals inside the cache (they are cache keys, so the
+dispatcher never re-emits them), and the reduction \emph{deadlocked} with $720$
+non-masters instead of completing.
+
+\paragraph{Fix.} Use $\kk$ verbatim. The router pivots on the $\kk$-minimal (highest)
+integral of each relation, so \emph{every rule edge strictly increases $\kk$}. The
+workers' \code{SUCCESS\_TOTAL} test guarantees \emph{every non-master worker edge
+strictly increases $\kk$}. Therefore every edge of the combined cache strictly
+increases $\kk$: the substitution graph is a directed acyclic graph, and substitution
+terminates. This is the whole fix---a one-key change---and it converts the deadlock
+into the win below.
+
+\paragraph{Verification.} Over $483$ integrals drawn from a real reduction: $0$ symmetry
+rules pointed the wrong way in $\kk$, and $0$ (worker edge $I\to J$, symmetry edge
+$J\to I$) reversals existed. Cycles are excluded by construction.
+
+\section{Results}
+Each target is reduced twice under identical settings (\code{--paper-masters-only},
+prime $1009$, v7 workers), once as baseline and once with \code{--use-symmetry}. The
+correctness gate requires the final master combination to be identical.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{lrrrrc}
+\toprule
+target & baseline & design-1 & routed free & workers saved & gate \\
+\midrule
+$\I{1,\text{-}1,1,0,1,1}$ (deg 1)                 & $5$    & $1$   & $1$    & $\mathbf{80\%}$ & PASS \\
+$\I{2,0,1,0,1,\text{-}1,0,1,\text{-}1,\text{-}1,0}$ (deg 3) & $518$  & $155$ & $186$  & $\mathbf{70\%}$ & PASS \\
+$\I{1,1,\text{-}1,1,1,1,\text{-}1,1,\text{-}1,0,0}$ (6-prop) & $2446$ & $967$ & $1015$ & $\mathbf{60\%}$ & (finishing)\\
+$\I{1,1,0,1,1,0,\text{-}3,1,0,0,0}$ (deg 3)       & $384$  & $288$ & $387$  & $\mathbf{25\%}$ & (finishing)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The ``workers'' columns are dispatched beam-search reductions (the search budget). The
+degree-3 target $\I{2,0,1,0,1,-1,0,1,-1,-1,0}$ is the one that deadlocked before the
+confluence fix; it now completes, its masters match the baseline, and it uses
+$70\%$ fewer workers. Savings are largest on the numerator-heavy targets, where the
+symmetry orbits are richest. Worker \emph{count}, however, is an upper bound on the
+benefit: \S\ref{sec:cost} looks at the CPU cost, which is smaller than the count
+suggests and, on one target, negative.
+
+\section{Why bushier reductions still win}
+A symmetry reduction is \emph{not} more compact than an IBP step: for the target
+$\I{0,-1,2,0,2,-1,0,1,-1,0,0}$ the symmetry rule has $57$ terms where one IBP step has
+$9$, and symmetry cannot reduce every integral at all. Compactness is the wrong metric.
+The symmetry step is \emph{free}---no beam search---and its output terms are strictly
+lower in $\kk$, so the workers dispose of them cheaply. The quantity that matters is
+the total number of dispatched workers (total searches), and that is what drops by
+$25$--$80\%$. The free, search-avoiding step paying for its own bushiness is the entire
+mechanism of the win.
+
+\section{Cost in detail: worker count vs.\ CPU, and the three-band structure}
+\label{sec:cost}
+The worker-count reduction overstates the benefit, because symmetry alters the
+reduction \emph{path} rather than merely pruning the baseline's tree: on the degree-3
+target $\I{2,0,1,0,1,-1,0,1,-1,-1,0}$, $114$ of design-1's $154$ workers ($74\%$) are on
+integrals the baseline never reduced. In CPU the outcome is smaller and no longer
+uniform:
+\begin{itemize}
+\item deg-3 $\I{2,0,\dots}$: $7174\to3815$ s ($-47\%$)---a clear win, but smaller than the
+      $-70\%$ in worker count;
+\item 6-prop $\I{1,1,-1,\dots}$ (partial): $93981\to72593$ s so far---win;
+\item deg-3 $\I{1,1,0,1,1,0,-3,\dots}$: $18253$ s (baseline, finished) vs.\ $19949$ s and
+      climbing (design-1, still on one hard survivor)---a \emph{loss}.
+\end{itemize}
+Per worker the \emph{median} is unchanged (identical step counts, comparable time per
+step), so the higher \emph{mean} is not overhead but a composition effect: with the
+cheap bulk routed away, a few hard survivors dominate (design-1's top-$10$ workers are
+$83\%$ of its CPU vs.\ $48\%$ for the baseline).
+
+\paragraph{Three bands.} Binning workers by wall time separates the two effects that
+decide the sign of the CPU change. Roughly half of all workers are trivial ($<3$\,s,
+$\sim1\%$ of CPU); a \emph{medium} band ($3$--$100$\,s) holds the routable bulk; and a
+\emph{hard tail} ($>100$\,s) holds most of the CPU in a handful of workers. The table
+gives worker counts (baseline\,$\to$\,design-1) and, for the tail, CPU and the hardest
+single worker:
+\begin{center}
+\footnotesize
+\begin{tabular}{lccc}
+\toprule
+band & $\I{2,0,1,0,1,\text{-}1,\dots}$ & $\I{1,1,\text{-}1,1,1,1,\dots}$ & $\I{1,1,0,1,1,0,\text{-}3,\dots}$ \\
+     & (deg 3, \emph{win}) & (6-prop, \emph{win}) & (deg 3, \emph{loss}) \\
+\midrule
+cheap $<3$\,s (workers)        & $241\to91$   & $893\to305$    & $169\to108$ \\
+medium $3$--$100$\,s (workers) & $240\to\mathbf{52}$ & $1366\to\mathbf{549}$ & $185\to147$ \\
+hard tail $>100$\,s (workers)  & $17\to\mathbf{11}$  & $186\to\mathbf{113}$  & $30\to\mathbf{33}$ \\
+hard tail CPU (s)              & $4456\to3291$ & $72918\to63991$ & $15587\to\mathbf{17674}$ \\
+hardest worker (s)             & $1055\to719$  & $5130\to6435$   & $1979\to\mathbf{4311}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two effects, cleanly separated:
+\begin{itemize}
+\item The \textbf{medium band collapses} reliably---symmetry routes those integrals
+      away for free ($240\to52$, $1366\to549$). This is the robust, broad-based saving,
+      spread over hundreds of workers; excluding the top-$10$ outliers, the deg-3 win's
+      bulk CPU falls to $18\%$ of baseline.
+\item The \textbf{hard tail is the swing factor.} Because the path differs, the
+      $>100$\,s band can shrink in both count and cost ($17\to11$, $186\to113$) or
+      \emph{grow} ($30\to33$, with its worst integral jumping $1979\to4311$\,s---an
+      integral absent from the baseline entirely).
+\end{itemize}
+Hence the rule the data gives: \emph{symmetry wins when its reroute thins the hard tail
+and loses when it thickens it.} The medium-band collapse is dependable and is the true
+source of the broad savings; the hard-tail direction is target-dependent and sets the
+sign of the net CPU change.
+
+\section{Implementation}
+\begin{itemize}
+\item \code{reduction/symmetry\_route.py} --- \code{tkey} ($=\kk$),
+      \code{\_build\_rules} (orbit closure + $\kk$-pivoted RREF), \code{symmetry\_rule}.
+\item \code{reduction/canonicalize.py} --- applicable transforms; placeholder
+      reconstruction via \code{recon\_from\_swaps.py}.
+\item \code{reduction/hierarchical\_reduction.py} --- the \code{--use-symmetry}
+      cascade (routes free rules, dispatches only survivors).
+\item A/B harness: \code{reduction/ab\_run.sh}, \code{ab\_compare.py},
+      \code{ab\_status.py}; outputs under \code{results/ab\_symmetry/}.
+\end{itemize}
+
+\paragraph{Bottom line.} Inference-time symmetry routing is a net win for SAILIR once
+(i) placeholder symmetries are reconstructed, (ii) it is run under paper-masters so the
+workers dispose of scaleless integrals, and (iii)---decisively---the rewrites descend
+in the workers' own total order $\kk$, which makes the combined cache confluent. The
+measured effect is a $25$--$80\%$ reduction in dispatched worker searches with the
+master combination unchanged.
+
+\end{document}

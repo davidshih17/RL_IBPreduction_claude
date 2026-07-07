@@ -24,9 +24,11 @@
 set -e
 BASE=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
 
-# ---- change these two for your target ----
-INTEGRAL_STR="1,1,1,1,1,1,1,1,-5,0,0"                 # 11-int target (8 props + 3 ISPs)
-OUTDIR=$BASE/results/my_reduction                     # output dir (shared /het NFS, NOT /tmp)
+# ---- target: args $1=integral $2=outdir, else these defaults ----
+INTEGRAL_STR="${1:-1,1,1,1,1,1,1,1,-5,0,0}"           # 11-int target (8 props + 3 ISPs)
+OUTDIR="${2:-$BASE/results/my_reduction}"             # output dir (shared /het NFS, NOT /tmp)
+# (greedy sector symmetry: prefix the call with SAILIR_SYMMETRY=1 — the
+#  orchestrator forwards --symmetry to every worker. See README §11.)
 # ------------------------------------------
 
 PYTHON=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python

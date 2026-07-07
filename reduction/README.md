@@ -275,6 +275,41 @@ $PY $BASE/reduction/print_replay_terms.py  $OUT/replay_state.pkl
 - **`ModuleNotFoundError: sailir`**: run with the conda Python above and from a
   repo where `../sailir/` exists next to `reduction/`.
 
-> Legacy/experimental scripts (other worker engines, profiling, probes, the
-> Kira-symmetry tooling, one-off analyses) were moved to the top-level
-> `archive/` and are no longer maintained.
+---
+
+## 11. Standalone probes (one integral, one weight level)
+
+A **probe** is a single `beam_search_v7.py` run as **one Condor job** that reduces
+**one** integral by **one** weight level (`SAILIR_SUCCESS_TOTAL=1`) — *not* the
+orchestrator, so there is no chaining to masters. It's the tool for benchmarking
+the engine on a known-hard integral (wall-time, step count, peak memory).
+
+```bash
+# run_probe.sh <integral> <tag> [sym:0|1] [n_workers] [max_steps] [mem_gb]
+bash reduction/run_probe.sh '0,1,1,1,1,1,1,1,-4,0,0'  74_off  0      # baseline
+bash reduction/run_probe.sh '0,1,1,1,1,1,1,1,-4,0,0'  74_on   1      # + greedy symmetry
+```
+
+Each call writes a Condor submit + result under `results/probe_<tag>/`. Read:
+- `tail results/probe_<tag>/probe.out` — `t_total` and `SUCCESS`/path length,
+- `grep 'Memory (MB)' results/probe_<tag>/probe.log` — cgroup peak memory.
+
+Defaults match the success-only recipe (`pentagonbox` + `--no-paper-masters-only`,
+beam-width 40, 8/8 fork pool, `request_cpus = n_workers+2`). The four benchmark
+probes: `(7,4)=0,1,1,1,1,1,1,1,-4,0,0`, `(8,4)=-1,2,1,0,1,2,1,1,-3,0,0`,
+`longrunner=1,1,1,0,0,1,3,1,-2,-1,0`, `memhog=1,1,1,0,-2,1,1,1,0,0,0`.
+
+**Greedy sector symmetry (`sym=1`)** sets `SAILIR_SYMMETRY=1`, which turns on a
+deterministic, inference-only pre-reduction in `beam_search_v7`: before the model
+scores a pivot, if a sector-symmetry relation can eliminate it (oriented by the
+same `_target_key` total order), it is applied for free (lookup + splice), so the
+model only ever sees symmetry-irreducible pivots. Validated against Kira's
+transform matrices; coefficients evaluated at the §3a kinematic point mod `prime`.
+The same flag exists on `onestep_worker_v7.py` (`--symmetry`) for orchestrator runs.
+
+---
+
+> Legacy/experimental scripts (other worker engines, profiling, one-off analyses)
+> were moved to the top-level `archive/` and are no longer maintained. The probe
+> recipe above supersedes the archived `probe_*.sh` scripts (which pointed at the
+> pre-reorg `scripts/eval/` paths).

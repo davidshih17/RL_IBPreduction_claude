@@ -47,6 +47,17 @@ os.environ['SAILIR_SUCCESS_TOTAL'] = '1'
 os.environ['SAILIR_ACTION_SELECT'] = 'maxweight'
 # SAILIR_BEAM_TOTAL intentionally absent -> (r,s) beam + (r,s) maxweight.
 
+# ── greedy sector-symmetry (opt-in): beam_search_v7 reads SAILIR_SYMMETRY at
+#    module import, so set it from --symmetry BEFORE importing bs7. Peek sys.argv
+#    the same way --v7-cpus is peeked below. ──
+if '--symmetry' in sys.argv:
+    os.environ['SAILIR_SYMMETRY'] = '1'
+if '--symmetry-perstep' in sys.argv:        # per-step implies symmetry on
+    os.environ['SAILIR_SYMMETRY'] = '1'
+    os.environ['SAILIR_SYMMETRY_PERSTEP'] = '1'
+if '--canon' in sys.argv:                   # canonicalize-in-actions
+    os.environ['SAILIR_CANON'] = '1'
+
 # ── argv injection so beam_search_v7's import-time _cap_incidental_threads()
 #    sees the production 8/8 config and applies thread-caps + 8-core pin. It
 #    peeks sys.argv for --n-threads/--n-workers; our own parser uses
@@ -122,6 +133,15 @@ def main():
     p.add_argument('-v', '--verbose', action='store_true')
     p.add_argument('--paper-masters-only',
                    action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--symmetry', action='store_true',
+                   help='greedy sector-symmetry pre-reduction (inference-only; '
+                        'sets SAILIR_SYMMETRY=1 — see module top)')
+    p.add_argument('--symmetry-perstep', action='store_true',
+                   help='fire sector-symmetry EVERY step, not just step 0 '
+                        '(implies --symmetry; sets SAILIR_SYMMETRY_PERSTEP=1)')
+    p.add_argument('--canon', action='store_true',
+                   help='canonicalize-in-actions: every action emits only '
+                        'canonical integrals (sets SAILIR_CANON=1)')
     p.add_argument('--resume-from', default=None)
     # Accepted for CLI parity with onestep_worker_v6 (some ignored — v7 fixes them).
     p.add_argument('--n_workers', type=int, default=N_WORKERS)
