@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 """Symmetry canonicalization for the training/inference pipeline.
 
-canonical_rep(I) maps an integral to the LOWEST-total-lex-weight member of its
-clean-permutation orbit, using the WORKERS' total order `_target_key = (-r,-s,|abs|)`
-(smaller key = higher in the ordering = eliminated first). Two integrals related by a
-clean loop relabeling (value-equal single integrals) map to the same rep; the affine
-relations that produce combinations are NOT used here (they are the action-space
-relations, not renames). This is the dedup canonicalization -- 1->1, no P_S expansion.
+canonical_rep(I) maps an integral to the SURVIVOR of its clean-permutation orbit --
+the member the reduction keeps -- using the WORKERS' total order
+`_target_key = (-r,-s,|abs|)`. The reduction eliminates the SMALLEST `_target_key`
+first (highest in the ordering) and sends it to strictly-LARGER `_target_key` terms,
+so the survivor is the `_target_key`-MAXIMAL member (== the fixed point `symmetry_route`
+routes every other orbit member to). Two integrals related by a clean loop relabeling
+(value-equal single integrals) map to the same rep; the affine relations that produce
+combinations are NOT used here (they are the action-space relations, not renames).
+This is the dedup canonicalization -- 1->1, no P_S expansion.
 
 CRITICAL: the order is `_target_key`, matching beam_search_v7 and symmetry_route, so
 the canonical basis is confluent with the reduction. (The old min-integer `rep_of` /
@@ -22,7 +25,8 @@ from canonicalize import _transforms, image_unsigned, P
 
 def tkey(i):
     """Workers' total order = beam_search_v7._target_key = (-r, -s, |abs|).
-    SMALLER key == higher in the ordering == lower total-lex-weight rep to pick."""
+    SMALLER key == higher in the ordering == eliminated first. The canonical rep to
+    pick is the MAXIMUM (the survivor), not the minimum."""
     return (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
             tuple(abs(x) for x in i))
 
@@ -52,12 +56,20 @@ def clean_orbit(I, cap=4000):
 
 
 def canonical_rep(I):
-    """Lowest-total-lex-weight (= _target_key-minimal) member of I's clean orbit.
+    """The `_target_key`-MAXIMAL member of I's clean orbit = the SURVIVOR the reduction
+    keeps (symmetry_route routes every other orbit member TO this one). The reduction
+    eliminates the SMALLEST _target_key first and sends it to strictly-LARGER _target_key
+    (lower-weight) terms, so the surviving canonical form is the MAXIMUM, not the minimum.
     Idempotent. Falls back to I itself if the orbit is a singleton or exceeds cap."""
     I = tuple(I)
     if I in _memo:
         return _memo[I]
     orb = clean_orbit(I)
-    rep = I if orb is None else min(orb, key=tkey)
+    # Survivor = _target_key-MAXIMAL member. `_target_key` uses |abs| and so TIES
+    # integrals differing only in sign pattern (e.g. [1,0,-1,..] vs [-1,0,1,..]); those
+    # are reduction-equivalent, so the choice among them only needs to be DETERMINISTIC
+    # (else canonical_rep is non-idempotent). Append the signed tuple to break ties.
+    # Corners have distinct |abs| (no ties), so this never changes the corner result.
+    rep = I if orb is None else max(orb, key=lambda j: (tkey(j), j))
     _memo[I] = rep
     return rep

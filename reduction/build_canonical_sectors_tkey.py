@@ -23,7 +23,7 @@ from sailir import ibp_env
 from sailir.topology import Topology
 ibp_env.init_from_topology(Topology.from_dir(os.path.join(ROOT, "topology_input/pentagonbox")))
 ibp_env.set_prime(1009)
-from canonical_rep import clean_orbit, tkey
+from canonical_rep import canonical_rep
 
 NPROP = 8
 
@@ -42,8 +42,10 @@ def corner(mask):
 
 rep_of = {}
 for mask in range(1, 1 << NPROP):
-    orb = clean_orbit(corner(mask))
-    rep_of[mask] = mask if orb is None else sec_of(min(orb, key=tkey))
+    # Use canonical_rep as the SINGLE source of truth for "which orbit member survives"
+    # (== the symmetry_route survivor). Never reimplement min/max-on-tkey here: doing so
+    # once picked the anti-survivor (min instead of max) and silently mis-mapped sectors.
+    rep_of[mask] = sec_of(canonical_rep(corner(mask)))
 
 canonical = sorted(set(rep_of.values()))
 out = {"rep_of": rep_of, "canonical": canonical, "order": "_target_key = (-r,-s,|abs|)"}

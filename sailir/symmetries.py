@@ -277,6 +277,14 @@ class SymmetryGroup:
 
         Memoized when `order_key is default_order_key` (the common case).
         For a non-default order_key, the result is recomputed each call.
+
+        WARNING: this is a generic orbit-MINIMUM under a lex LABEL order
+        (default_order_key = (t,r,s,d,sector,integral)). It is NOT the reduction
+        canonical form. The symmetry-enhanced pipeline's canonical rep is the
+        `_target_key` SURVIVOR (reduction/canonical_rep.py) = the orbit MAXIMUM under
+        `_target_key`, verified against symmetry_route by
+        reduction/verify_canonical_rep.py. Do NOT use this method for that: `min`
+        with a reduction-style order picks the anti-survivor.
         """
         if order_key is default_order_key:
             hit = self._canon_cache.get(integral)
