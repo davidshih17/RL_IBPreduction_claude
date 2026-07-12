@@ -240,8 +240,39 @@ def evaluate_coefficient(coeff_str, seed):
         return 0
 
 
+# --- within-sector SYMMETRY ops (--sym-actions; production data-gen design,
+# 2026-07-11): the scramble/unscramble action space is IBP + LI + the current
+# sector's within-sector symmetry relations, on equal footing. A symmetry op
+# g at seed S contributes the exact value identity  S - image_g(S) = 0  as a
+# raw "equation" (zero-identity, same contract as IBP/LI raws), with the op
+# indexed AFTER the IBP+LI block and a single zero shift (seed = target).
+# SYM_OPS is set PER SECTOR by main(); op indices >= len(ibp)+len(li) are
+# sector-local. Within-sector relations never raise the sector or create
+# positive ISP powers, so all existing sector filters pass them unchanged.
+SYM_OPS = []          # list of (M, c) affine maps for the CURRENT sector
+_image_unsigned = None  # bound by main() under --sym-actions
+
+
+def get_sym_relation(g_idx, seed):
+    """Value identity seed - image_g(seed) = 0 as a raw-equation dict."""
+    M, c = SYM_OPS[g_idx]
+    img = _image_unsigned(tuple(seed), M, c)
+    if img is None:
+        return {}
+    eq = {tuple(seed): 1}
+    for J, co in img.items():
+        v = (eq.get(J, 0) - co) % PRIME
+        if v:
+            eq[J] = v
+        else:
+            eq.pop(J, None)
+    return eq
+
+
 def get_raw_equation(ibp_t, li_t, ibp_op, seed):
     n_ibp = len(ibp_t)
+    if SYM_OPS and ibp_op >= n_ibp + len(li_t):
+        return get_sym_relation(ibp_op - n_ibp - len(li_t), seed)
     if ibp_op >= n_ibp:
         template = li_t.get(ibp_op - n_ibp, [])
     else:
@@ -356,7 +387,16 @@ def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id,
             if not top_only:
                 continue
 
-            if bias_low_s_elim and len(top_only) > 1:
+            if SYM_OPS and ibp_op >= num_ops - len(SYM_OPS):
+                # SYMMETRY op: always eliminate the SEED itself (the natural
+                # "relabel seed into its image" move). Eliminating an image term
+                # instead would record an action the unscramble cannot re-derive
+                # (sym ops have only the zero shift: enumerable seeds are the
+                # target and substituted integrals) -> action_not_valid failures.
+                if seed not in raw or raw[seed] == 0 or seed not in top_only:
+                    continue
+                elim = seed
+            elif bias_low_s_elim and len(top_only) > 1:
                 # Weight by 1/(1+s) so low-s integrals are heavily preferred.
                 # weight(k) returns (r, s, |abs|); we use s = weight(k)[1].
                 w = [1.0 / (1 + weight(k)[1]) for k in top_only]
@@ -523,6 +563,20 @@ def main():
     parser.add_argument('--restrict-sectors', type=str, default=None,
                         help='Comma-separated sector_ids to restrict scrambling to. '
                              'If omitted, all valid sectors are used.')
+    parser.add_argument('--sym-actions', action='store_true',
+                        help='EXPERIMENTAL — DO NOT USE FOR PRODUCTION (verdict '
+                             '2026-07-11): adds within-sector symmetry relations to '
+                             'the scramble/unscramble action space (op indices after '
+                             'the IBP+LI block, zero shift). MEASURED: 25%% of '
+                             'scrambles fail replay validation (199/300 success vs '
+                             '274/300 control) because recorded symmetry moves are '
+                             'not always re-derivable in the (op, delta) action '
+                             'encoding; fixing this needs a redesigned action '
+                             'encoding and was judged not worth the trouble (the '
+                             'in-worker value of these relations measured marginal '
+                             'anyway — see the note). PRODUCTION data-gen = IBP+LI '
+                             'actions with --restrict-sectors-file '
+                             'results/canonical_sectors_tkey.txt ONLY.')
     parser.add_argument('--restrict-sectors-file', type=str, default=None,
                         help='File with a comma-separated sector_id list to restrict '
                              'scrambling to (topology-agnostic). Used for the '
@@ -591,6 +645,26 @@ def main():
     for li_idx in li_t:
         shifts[n_ibp + li_idx] = [s for s, _ in li_t[li_idx]]
 
+    # --sym-actions: bring up the symmetry engine (needs sailir.ibp_env configured)
+    # and the per-sector within-sector transform lists. Op indices num_ops..:
+    # sector-local symmetry relations, single zero shift (seed = target).
+    global _image_unsigned
+    _within = None
+    if args.sym_actions:
+        if args.prime != 1009:
+            raise SystemExit('--sym-actions requires --prime 1009 (symmetry engine).')
+        from sailir import ibp_env as _sie
+        _sie.init_from_topology(topology)
+        _sie.set_prime(args.prime)
+        _repo = str(Path(__file__).resolve().parent.parent)
+        sys.path.insert(0, str(Path(_repo) / 'reduction'))
+        from canonicalize import image_unsigned as _iu
+        from symmetry_route import _within_transforms
+        _image_unsigned = _iu
+        _within = _within_transforms
+        print(f"Symmetry actions: ON (within-sector relations join the action space)",
+              flush=True)
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     total_samples = 0
@@ -608,6 +682,18 @@ def main():
             sector_id = random.choice(sector_list)
             masters = get_masters_for_sector(sector_id)
 
+            # Per-sector symmetry ops (--sym-actions): rebind SYM_OPS + shifts.
+            global SYM_OPS
+            num_ops_here = num_ops
+            if _within is not None:
+                for k in [k for k in shifts if k >= num_ops]:
+                    del shifts[k]
+                SYM_OPS = _within(sector_id)
+                zero = tuple(0 for _ in range(N_INDICES))
+                for gi in range(len(SYM_OPS)):
+                    shifts[num_ops + gi] = [zero]
+                num_ops_here = num_ops + len(SYM_OPS)
+
             # Create random linear combination of masters
             start = {}
             master_coeffs = []
@@ -618,7 +704,7 @@ def main():
 
             # Scramble
             n_steps = random.randint(args.min_steps, args.max_steps)
-            scrambled, used_ibps = scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id,
+            scrambled, used_ibps = scramble(start, ibp_t, li_t, num_ops_here, n_steps, sector_id,
                                            filter_lateral=args.filter_lateral,
                                            bias_low_s_elim=args.bias_low_s_elim)
 
@@ -693,6 +779,10 @@ def main():
                     'scramble_id': scramble_idx,
                     'sector_id': sector_id,  # NEW: include sector for model conditioning
                     'sector_mask': list(get_sector_mask(sector_id)),  # NEW: 6-bit mask
+                    # op indices >= n_base_ops are the sector's within-sector
+                    # symmetry relations (--sym-actions); 0 when the flag is off
+                    'n_sym_ops': len(SYM_OPS) if _within is not None else 0,
+                    'n_base_ops': num_ops,
                     'step': iteration,
                     'target': list(target),
                     'target_weight': weight(target)[:2],

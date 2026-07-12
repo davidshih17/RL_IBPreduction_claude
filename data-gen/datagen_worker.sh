@@ -33,6 +33,16 @@ OUTPUT_FILE="${OUTPUT_DIR}/multisector_data_worker${WORKER_ID}.jsonl"
 echo "=== data-gen worker ${WORKER_ID}: topology=${TOPOLOGY}"
 echo "    seeds=[${START_SEED}, +${N_SCRAMBLES})  ->  ${OUTPUT_FILE}"
 
+# RESTRICT_FILE (optional env): comma-separated sector-list file. The CANONICAL
+# dataset (production design 2026-07-11) sets this to
+# results/canonical_sectors_tkey.txt so ONLY canonical sectors are scrambled —
+# the single change vs the original dataset. (Symmetry actions in data-gen were
+# tried and dropped; see --sym-actions help in generate_multisector_data.py.)
+EXTRA_ARGS=""
+if [ -n "${RESTRICT_FILE:-}" ]; then
+    EXTRA_ARGS="--restrict-sectors-file ${RESTRICT_FILE}"
+fi
+
 PYTHONUNBUFFERED=1 "${PYTHON}" -u data-gen/generate_multisector_data.py \
     --topology    "${SAILIR_DIR}/${TOPOLOGY}" \
     --ibp_path    "${SAILIR_DIR}/${TOPOLOGY}/IBP" \
@@ -40,6 +50,6 @@ PYTHONUNBUFFERED=1 "${PYTHON}" -u data-gen/generate_multisector_data.py \
     --n_scrambles ${N_SCRAMBLES} \
     --start_seed  ${START_SEED} \
     --output      "${OUTPUT_FILE}" \
-    --prime 1009 --min_steps 5 --max_steps 25
+    --prime 1009 --min_steps 5 --max_steps 25 ${EXTRA_ARGS}
 
 echo "worker ${WORKER_ID} done."
