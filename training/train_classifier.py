@@ -29,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'sailir'))
+sys.path.insert(0, str(Path(__file__).parent.parent / 'sailir'))
 from classifier import IBPActionClassifier
 from classifier_nosubs import IBPActionClassifierNoSubs
 
@@ -345,7 +345,7 @@ def main():
             print(msg, flush=True)
 
     # Load topology to determine model dimensions.
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from sailir.topology import Topology
     topology = Topology.from_dir(args.topology)
     n_indices = topology.n_indices
