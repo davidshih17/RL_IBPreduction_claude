@@ -22,13 +22,33 @@ ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
 from canonicalize import _transforms, image_unsigned, P
 
+# SAILIR_SECTOR_RANK=1 -> adopted sector-senior order (ORDERING.md). Must match
+# symmetry_route and the workers for the run. Default 0 = legacy.
+_SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
+if _SECTOR_RANK:
+    from sector_rank import RANK_IDX as _RANK_IDX
+
 
 def tkey(i):
     """Workers' total order = beam_search_v7._target_key = (-r, -s, |abs|).
     SMALLER key == higher in the ordering == eliminated first. The canonical rep to
-    pick is the MAXIMUM (the survivor), not the minimum."""
-    return (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
+    pick is the MAXIMUM (the survivor), not the minimum.
+
+    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
+    SECTOR RANK first, then (r,s), then |abs|. This function still implements the
+    LEGACY order (no sector component) and must migrate JOINTLY with beam_search_v7,
+    symmetry_route, and the data-gen target selection at the symmetry-enhanced
+    retrain — never alone (confluence requires one shared order everywhere).
+    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix)."""
+    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
             tuple(abs(x) for x in i))
+    if not _SECTOR_RANK:
+        return base
+    m = 0
+    for k in range(8):
+        if i[k] > 0:
+            m |= 1 << k
+    return (-_RANK_IDX[m],) + base
 
 
 _memo = {}

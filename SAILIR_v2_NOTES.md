@@ -416,3 +416,17 @@ Design docs:
 
 Verification:
 - `scripts/eval/v5_*.py` family (see §10 table)
+
+## DESIGN DECISION (2026-07-10): total order = SECTOR RANK, then (r,s), then |a|
+
+Sector rank takes precedence EVERYWHERE (worker success/target logic, symmetry router,
+canonicalization, training-data target selection). Authoritative statement + rank
+contract + reference implementation: `reduction/ORDERING.md`. Rationale: the legacy
+`κ=(-r,-s,|a|)` order leaks 2.6–15% of dispatched worker targets into NON-canonical
+sectors (|a| tiebreak compares permuted slots); sector-senior ordering gives the hard
+guarantee that only the 174 canonical sectors (results/canonical_sectors_tkey.pkl,
+gated by verify_canonical_rep.py) are ever dispatched. IBP compatibility: propagator
+count is the senior rank component (IBP never leaves the sector cone, so IBP steps
+always descend). MIGRATION NOT DONE: production still runs legacy κ; the switch must
+land JOINTLY (workers + router + canonical_rep + data-gen) at the symmetry-enhanced
+retrain — never one component alone (confluence).

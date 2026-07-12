@@ -13,7 +13,7 @@
 \title{\bf Symmetry-Enhanced IBP Reduction at Inference:\\
 a free routing layer beneath the SAILIR workers}
 \author{SAILIR project note}
-\date{2026-07-05}
+\date{2026-07-05, revised 2026-07-10}
 
 \begin{document}
 \maketitle
@@ -30,7 +30,12 @@ total order} the workers use---which is what turns a deadlocking, non-confluent
 system into a directed acyclic one. The CPU saving is smaller and target-dependent:
 symmetry reliably removes the medium-cost bulk of the work, but because it follows a
 different reduction path its net benefit depends on whether that path thins or
-thickens the expensive hard tail.
+thickens the expensive hard tail. The design has since been finalized
+(\S\ref{sec:pipeline}, normative): a sector-senior total order everywhere; a staged
+orchestrator pipeline (canonicalize the sector with one precomputed map $\to$ reduce
+within the canonical sector to lowest lex weight $\to$ queue survivors); and, at the
+retrain, within-sector symmetry relations joining the workers' action space on equal
+footing with IBP.
 \end{abstract}
 
 \section{Setup}
@@ -78,20 +83,399 @@ degree-$s$ numerator integral is a multinomial: generically a large combination 
 same-and-lower-weight integrals. (Concretely, one symmetry image of a degree-3
 numerator integral we examined has $103$ terms.)
 
-\paragraph{Rewrite rule.} For a target $\I{a}$ we (i) form the orbit closure of
-$\{a\}$ under all applicable symmetries; (ii) collect the exact relations
-$\I{K}-\I{g\cdot K}=0$; and (iii) row-reduce them over $\mathrm{GF}(p)$
-($p=1009$), pivoting on the $\kk$-\emph{highest} (i.e.\ $\kk$-minimal) integral of each
-relation. If $a$ is a pivot, the resulting rule expresses $\I{a}$ as a
-$\mathrm{GF}(p)$ combination of strictly-lower (strictly-$\kk$-larger) integrals.
+\paragraph{Rewrite rule (v1, superseded).} The first router formed, for each target,
+the orbit closure under \emph{all} applicable symmetries at once, collected the exact
+relations $\I{K}-\I{g\cdot K}=0$, and row-reduced them over $\mathrm{GF}(p)$
+($p=1009$), pivoting on the $\kk$-highest integral of each relation; a resolved target
+was routed for free (cache entry, no worker), cascaded, and survivors were dispatched.
+The results of \S\ref{sec:results} were measured with this router. It is
+\textbf{superseded} by the staged pipeline of \S\ref{sec:pipeline}, which factors the
+same identities into discrete steps; the monolithic closure is retained in the code
+(\code{symmetry\_rule}) only as a reference implementation for A/B gates.
 
-\paragraph{Routing.} At each orchestrator iteration, before dispatching workers, every
-non-master $I$ is offered to \code{symmetry\_rule($I$)}. If it returns a rule, the rule
-is written into the orchestrator's substitution cache for free (no worker) and the
-symmetry descent is cascaded; if it returns \code{None} (a \emph{survivor}) the
-integral is dispatched to a worker as usual. Because $P_S$ (the symmetric projector
-implicit in these rules) is linear, the substitution machinery is unchanged: symmetry
-rules are just additional cache entries.
+\section{A classification of the symmetries}
+\label{sec:classification}
+A symmetry is a relabeling of the loop momenta---a signed permutation of $(k_1,k_2)$,
+possibly composed with shifts by external momenta---that maps denominators to
+denominators. On the numerator slots (the ISPs, and any propagator absent from the
+sector) the induced action is in general only affine: a numerator slot maps to a linear
+combination of numerator slots, present denominators, and kinematic constants. Two
+independent classification axes organize all of them.
+
+\paragraph{Axis 1: slot action.}
+\begin{itemize}
+\item \textbf{Pure permutations}: denominators map to denominators \emph{and} each
+      numerator slot maps to a single numerator slot with coefficient $\pm1$ and no
+      constant (a monomial action). The value identity is one term: $\I{a}=\I{g\cdot a}$,
+      no debris.
+\item \textbf{Affine}: denominators still permute, but some numerator slot maps to a
+      genuine linear combination of numerator slots, \emph{present denominators}, and
+      constants. A degree-$s$ numerator then images to a multinomial combination; the
+      terms that hit a present denominator cancel a power of it and land strictly lower.
+\end{itemize}
+
+\paragraph{Axis 2: sector motion.}
+\begin{itemize}
+\item \textbf{Sector-changing}: the present propagators map onto a \emph{different}
+      propagator subset.
+\item \textbf{Within-sector}: the present propagators permute among themselves; the
+      integral stays in its sector, and any affine debris lands in its subsectors.
+\end{itemize}
+One relativity caveat: the sector-motion box is a property of the \emph{(symmetry,
+sector) pair}, not of the momentum map alone. The reflection
+$k_2\to-k_2-p_{123}$ swaps $D_5\leftrightarrow D_6$: applied at a sector containing both
+(with equal powers) it is within-sector; applied where only $D_5$ is present it is
+sector-changing.
+
+\paragraph{All four boxes are realized.} Classifying each Kira record at its own source
+sector (records whose denominator rows are not single propagators at their source sector
+are excluded there, though they still act at subsectors where the offending slot is a
+numerator):
+\begin{center}
+\footnotesize
+\begin{tabular}{lccl}
+\toprule
+box & \code{sectorSymmetries} (108) & \code{sectorRelations} (17) & example \\
+\midrule
+pure $\times$ within      & $2$  & $0$  & loop swap $k_1\leftrightarrow k_2$: $D_1{\leftrightarrow}D_5$, $D_4{\leftrightarrow}D_6$, $D_9{\to}D_7$, $D_{10}{\to}D_2$ \\
+pure $\times$ changing    & $0$  & $2$  & clean corner relabelings between sectors \\
+affine $\times$ within    & $85$ & $0$  & $k_2\to-k_2-p_{123}$: $D_{10}\to D_5{+}D_6{-}D_{10}+s_{23}{-}s_{45}$ \\
+affine $\times$ changing  & $0$  & $10$ & the bushy cross-sector rewrites of \S2 \\
+excluded at source        & $21$ & $5$  & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Operational roles.} The boxes do different jobs in SAILIR:
+\begin{itemize}
+\item \textbf{Pure maps} (either sector box) are the clean rewrites behind orbit
+      dedup and survivor routing: exact one-term identities, the basis of the $174$
+      clean corner orbits.
+\item \textbf{Affine $\times$ sector-changing} maps power the router's bushy rewrites
+      (\S2): the multinomial numerator expansion is why a free symmetry rule can have
+      $57$ terms and still win.
+\item \textbf{Affine $\times$ within-sector} maps are the sector's \emph{stabilizer}.
+      On the corner they act as the \emph{identity} (every denominator fixed), so they
+      carry no sector-mapping information and are invisible in any corner-orbit
+      picture; their entire nontrivial content is the affine action on numerators. They
+      are the mechanism of the numerator drop, below.
+\end{itemize}
+
+\paragraph{The drop identity ($\I{a}=-\I{a}+\text{lower}$).}
+Whenever the denominators leave a momentum line loose---no propagator on that line, one
+propagator (reflect through its base point), or several present with \emph{equal
+powers} (reflect through the midpoint, swapping them)---the sector admits a
+within-sector \emph{reflection}. Under it every numerator slot acquires a parity:
+\emph{even} if its momentum does not involve the reflected combination, \emph{odd} if
+it is linear in it, in which case the slot maps to $-(\text{itself}) + (\text{present
+denominators}) + (\text{constants})$; e.g.\ at sector $\{D_1,D_6\}$ the reflection
+fixing $D_6$ sends $D_7\to 2D_6-D_7$. If the numerator monomial is odd overall under
+one allowed reflection, the value identity reads
+\begin{equation}
+\I{a} \;=\; -\I{a} + (\text{strictly lower})\qquad\Longrightarrow\qquad
+\I{a}=\tfrac12\,(\text{strictly lower}):
+\end{equation}
+the integral reduces a full $(r,s)$ level for free, from a \emph{single} identity---no
+symmetrization or averaging is involved (and if such an odd reflection exists the group
+order is even, so no ``odd group order'' obstruction can arise). Across ten dropping
+examples studied explicitly, and all $48$ same-denominator numerator-monomial verdicts
+at their sectors, ``odd under one allowed reflection'' coincided exactly with the
+router's drop/survive decision, with one caveat: occasionally a slot maps to
+$-(\text{itself})$ \emph{plus other numerator slots} (e.g.\ $D_8\to-D_8+D_1+D_4$ at
+sector $\{D_5,D_6\}$), and then the verdict needs the small within-sector row reduction
+rather than pure parity multiplication.
+
+\section{THE PIPELINE (definitive design --- no alternative)}
+\label{sec:pipeline}
+This section is normative. The symmetry machinery enters the reduction in exactly the
+following places, in exactly this order, and in no other way. Per-step drop detectors,
+parity witnesses, per-step canonicalization passes, and the monolithic all-symmetry
+closure are all \textbf{rejected} designs, subsumed by the steps below.
+
+\paragraph{Structural basis.} IBP identities never connect lateral sectors: once a
+one-step worker receives a target in sector $S$, its entire reduction lives in the
+cone of $S$ (verified in code: the active expression is stripped to the target sector
+as each step is applied; all spillover is recovered by the final replay). Sectors are
+therefore a \emph{dispatch-time} choice, and all cross-sector symmetry work belongs to
+the orchestrator, never the worker.
+
+\paragraph{The orchestrator, per pending integral (discrete steps).}
+\begin{enumerate}
+\item \textbf{Canonicalize the sector} (sector-changing symmetries, pure and affine).
+      If the integral's sector is not canonical, apply the \emph{single precomputed
+      composite map} for that sector: $\I{a} = (\text{same-}(r,s)\text{ terms in the
+      canonical sector, denominator powers permuted}) + (\text{strictly lower
+      debris})$. One \code{image\_unsigned} call, no orbit closure, no row reduction.
+      Implementation: \code{reduction/sector\_canon\_maps.py} ($81$ maps, one per
+      non-canonical sector, gated corner-exact $81/81$).
+\item \textbf{Reduce within the canonical sector} (within-sector symmetries). Close
+      the integral's orbit under the sector-preserving maps only, row-reduce in the
+      shared order: the integral either rewrites to the \emph{lowest-lex-weight
+      representatives} of its within-sector orbit ($+$ lower debris), drops an entire
+      level (the $\I{a}=-\I{a}+\text{lower}$ identities live here), or survives.
+      Closures are small (no cross-sector explosion).
+\item \textbf{Queue the survivors} for the one-step workers. Survivors are, by
+      construction, canonical-sector integrals that are lowest in their within-sector
+      orbits.
+\end{enumerate}
+The orchestrator's cascade loop sequences the steps per integral automatically: a
+step-1 rewrite's canonical-sector terms become candidates on the next round, where
+step 2 takes them; nothing is dispatched until nothing more routes. Requirements: the
+sector-senior total order everywhere (\code{SAILIR\_SECTOR\_RANK=1},
+\code{reduction/ORDERING.md}) --- step 1's descent is guaranteed \emph{only} under it
+--- and \code{--use-symmetry --symmetry-staged} on the orchestrator
+(\code{symmetry\_route.staged\_rule}; the flag refuses to start otherwise).
+
+\paragraph{Implementation amendment (2026-07-11): the monolithic solve realizes the
+steps, with the canonical-sector property enforced as a hard guarantee.} The
+literal discrete-step implementation above was built, fully validated (identical
+routing coverage, all descent/sector gates clean, masters identical), and then
+\emph{measured to be $\sim1.5\times$ more expensive}: its locally-factored rules are
+bushier and shallower than the monolithic global solve's ($9.3$ vs $6.3$ mean RHS
+terms; $2.39$ vs $1.56$ same-$(r,s)$ terms per rule; on the m2 probe: $235$ vs $158$
+workers, orchestrator cache $515$ vs $329$ integrals). The step-1 composite map
+expands multinomially at every hop with none of the cross-relation cancellation the
+monolithic row reduction performs, and each materialized intermediate costs a routing
+call or a worker. The production router is therefore
+\code{symmetry\_route.canonical\_monolithic\_rule}: the monolithic all-symmetry row
+reduction, plus a fallback that \emph{enforces} the design's invariant --- if the
+solve leaves a non-canonical-sector integral unresolved, the integral is
+canonicalized by its composite map (proven descending under the sector-senior order),
+so \textbf{only canonical-sector integrals are ever emitted as survivors}, by
+construction rather than by observation. The discrete steps 1--3 above remain the
+normative \emph{semantics} of the routing layer; the staged implementation
+(\code{--symmetry-staged}) is retained as the reference realization for A/B gates.
+
+\paragraph{Canonical masters (part of the package).} Kira's paper masters are
+labeled in \emph{Kira's} preferred sectors, and exactly one pentagonbox master
+(sector $152$) sits in a sector our order does not pick as canonical ($161$). The
+pipeline therefore uses the \emph{symmetry-image of the paper basis in our canonical
+sectors} as its master set (\code{reduction/canonical\_masters.py}: $61\to61$
+masters, one relabeled, exact $1$-term coefficient-$1$ identity), with the dictionary
+back to Kira's basis applied to the final expression at output time only. Without
+this, the merged corner of the mismatched orbit is not a master, IBP cannot reduce it
+inside its cone, the identity to the real master ascends the order, and the
+dispatched worker runs forever --- the long-standing m1/m3 hang
+($\I{1,0,0,0,0,1,0,1,0,0,0}$, diagnosed 2026-07-11; it had silently blocked
+\emph{every} symmetry-arm run of m1/m3, including the pre-strip ones reported as
+``finishing'' in \S\ref{sec:results}).
+
+\paragraph{\textcolor{red}{LOCKED (2026-07-11): no symmetrization inside the
+one-step workers.}} Symmetry is applied at the \emph{orchestrator level only}. This
+was settled empirically, not by taste: a same-$(r,s)$ symmetry drop detector was
+implemented inside the worker (\code{SAILIR\_SYM\_DROP}: an active integral at the
+start's $(r,s)$ level whose within-sector image eliminates it into strictly-lower
+terms is stripped as a passenger; the router provably disposes of it from the
+replayed output, so the mechanism is sound --- masters identical on all A/B probes).
+It fired $352$ times across the m1/m2/m3 probes and \emph{shortened nothing}: m2
+$782$ vs $782$ steps (literally identical paths), m1 $-0.2\%$, m3 $-0.8\%$, while
+\emph{adding} worker CPU ($+60\%$ on m2's short workers, dominated by the per-worker
+symmetry-engine load). The dropped integrals sit off the critical path --- the beam's
+chosen eliminations never depended on them. Population measurements agree: $\sim8\%$
+of active-expression integrals and $\sim0.9\%$ of candidate-introduced integrals are
+below-threshold eliminable, and the winning-path drop-witness rate is $\approx0$
+($0/252$ step targets). Together with the pure-permutation census ($4/174$ canonical
+sectors, all order-$2$), the conclusion is uniform: \textbf{the orchestrator routing
+already extracts everything the symmetries give without the model's cooperation};
+in-worker symmetrization in any passive form (dedup, eager drops, witness stripping)
+is dead weight. The \code{SAILIR\_SYM\_DROP} flag remains in the code for
+retrain-era experiments only, with a do-not-enable banner recording this verdict.
+
+\paragraph{\textcolor{red}{LOCKED (2026-07-11): the retrain dataset = canonical
+sectors only; NO symmetry actions.}} The plan to add within-sector symmetry relations
+to the workers' action space was implemented in the data generator
+(\code{--sym-actions}: relations as extra ops after the IBP$+$LI block, zero shift)
+and \emph{dropped on measurement}: $25\%$ of scrambles fail replay validation
+($199/300$ success vs $274/300$ in a same-seed control), because a recorded symmetry
+move is not always re-derivable in the $(\mathrm{op},\delta)$ action encoding ---
+symmetry relations have no shift repertoire, so a relation seeded away from the
+eventual unscramble target is unreachable. Fixing this requires a redesigned action
+encoding, judged not worth the trouble given the marginal in-worker value measured
+above. \textbf{The production dataset therefore changes in exactly one way relative
+to the original: scrambles are restricted to the $174$ canonical sectors}
+(\code{submit\_datagen\_canonical.sh}, \code{--restrict-sectors-file}
+\code{results/canonical\_sectors\_tkey.txt}) --- matching the locked inference
+pipeline, where the hybrid router guarantees workers only ever receive
+canonical-sector targets. The canonical-masters convention holds in the generator
+automatically: non-canonical sectors are never scrambled, and canonical sectors
+without a Kira entry fall back to their corner, which \emph{is} the canonical master.
+The \code{--sym-actions} flag remains in the generator with a do-not-use banner
+recording this verdict.
+
+\section{Sector canonicalization: list, theorem, and measurements}
+\label{sec:canonicalization}
+This section holds the supporting facts for step 1 of \S\ref{sec:pipeline}: the
+definitive canonical sector list, the theorem that canonicalization is always possible
+and sector-only, and the measurements that motivated the sector-senior order.
+
+\paragraph{The canonical sector list (definitive).} The clean corner orbits partition
+the $255$ sectors into equivalence classes; the canonical representative of each class
+is its \emph{survivor} corner---the $\kk$-maximum, the member every other member
+reduces toward. This gives $\mathbf{174}$ canonical sectors ($1.47\times$ compression),
+stored in \code{results/canonical\_sectors\_tkey.pkl} (masks in
+\code{canonical\_sectors\_tkey.txt}), built by
+\code{reduction/build\_canonical\_sectors\_tkey.py} solely from
+\code{canonical\_rep} and gated by \code{reduction/verify\_canonical\_rep.py}
+(all $255$ corners: rep $=$ routing survivor; idempotent; orbit-invariant;
+$=\max_\kk$ of the orbit).
+
+\paragraph{Canonicalization is always possible and depends only on the sector.} Two
+facts make the design sound. \emph{(i) Power-independence (lemma):} whether a symmetry
+applies cleanly to $\I{a}$ depends only on $\mathrm{sector}(a)$: the cleanness condition
+(each denominator slot maps to a single propagator) is a per-slot property of the map
+and of \emph{which} slots are denominators, and powers ride along,
+$D_i^{a_i}\to D_{\pi(i)}^{a_i}$, with $\pi$ injective (an invertible relabeling keeps
+distinct momenta distinct). The image has the \emph{same denominator-power multiset},
+permuted; numerator slots never obstruct (the image of a nonzero quadratic under an
+invertible change of variables is nonzero). The equal-powers condition of
+\S\ref{sec:classification} governs only whether a map \emph{fixes} an integral (the
+drop witness), never applicability. \emph{(ii) Reachability (theorem):} composites of
+clean maps are clean and inverses of relabelings are relabelings, so ``same orbit'' is
+an equivalence relation, and one composite map per sector sends \emph{every} integral
+of that sector---arbitrary dots and numerators---to same-$(r,s)$ integrals in the
+canonical sector plus strictly-lower debris. Verified against the implemented record
+set: all $255$ sectors reach their representative through implemented transforms (no
+synthesized inverses needed), all $255$ composites map corners exactly, and a stress
+test of $1275$ random integrals (dots $1$--$4$, numerator powers $1$--$3$) had zero
+applicability failures, zero weight raises, zero leading-sector errors, and zero
+denominator-multiset changes (\code{analysis/verify\_sector\_canonicalization.py}).
+
+\paragraph{Current status: the $\kk$-router approximates this design but does not
+enforce it.} The production router (\S2) descends in $\kk$, not by sector. For
+\emph{corners} the two agree by construction (the gate above). For dotted and
+numerator-carrying integrals they can disagree: the $|a|$ tiebreak compares powers in
+\emph{permuted slots}, so the $\kk$-survivor of an orbit level is occasionally an
+integral in a \emph{non-canonical} sector, which is then dispatched. Measured on the
+post-strip A/B runs (dispatched worker targets in non-canonical sectors):
+\begin{center}
+\footnotesize
+\begin{tabular}{lcc}
+\toprule
+target & baseline & design-1 (\code{--use-symmetry}) \\
+\midrule
+m1 & $8/369$ ($2\%$)    & $12/455$ ($2.6\%$) \\
+m2 & $192/336$ ($57\%$) & $6/137$ ($4.4\%$)  \\
+m3 & $60/67$ ($90\%$)   & $33/222$ ($15\%$)  \\
+\bottomrule
+\end{tabular}
+\end{center}
+The routing concentrates dispatch onto canonical sectors dramatically (m2:
+$57\%\to4.4\%$) but leaks a few percent. A direct stress test confirms the leak is a
+property of the router, not of those particular targets: of $324$ random
+dotted/numerator integrals across all $81$ non-canonical sectors, the legacy router
+routes away $303$ but leaves $21$ ($6.5\%$) as survivors in non-canonical sectors.
+
+\paragraph{\textcolor{red}{DECISION (2026-07-10): the total order is SECTOR RANK
+first, then $(r,s)$, then lex-weight $|a|$.}}
+Sector rank takes precedence \emph{everywhere}: workers' success/target logic, the
+symmetry router, canonicalization, and training-data target selection. The rank
+contract: (i) a proper subsector ranks strictly below its parent (propagator count is
+the senior component---this is what keeps IBP steps descending, since IBP never leaves
+the sector cone); (ii) each clean orbit's canonical representative ranks strictly
+below its other members (this is what makes every sector-changing rewrite descend and
+gives the \emph{hard} guarantee that only the $174$ canonical sectors are ever
+dispatched); (iii) any stable completion to a total order. Reference implementation
+and full rationale: \code{reduction/ORDERING.md}. Deployment: the production code
+still runs the legacy $\kk=(-r,-s,|a|)$; because router and workers must share
+\emph{one} order (the confluence crux of \S\ref{sec:confluence}), the sector-senior
+order lands \emph{jointly} with the symmetry-enhanced data-gen and retrain---never
+one component alone.
+
+\paragraph{Two scope caveats.} The canonicalizing image is generally a
+\emph{combination} (the numerator expands through the sector change), so one
+non-canonical target becomes several canonical-sector targets at the same $(r,s)$:
+sector count shrinks, per-target worker count can grow. And canonicalization governs
+the \emph{dispatch} space only: passenger terms inside a worker's running expression
+still traverse non-canonical subsectors until they are themselves dispatched.
+
+\section{The symmetric projector \texorpdfstring{$P_S$}{PS}: formal structure}
+\label{sec:PS}
+Behind the rewrites sits a linear-algebra picture worth stating precisely: it pins
+down what ``$+\,$lower'' means, why $P_S$ is a genuine linear operator, and why a
+single operator handles a whole expression whose terms sit at different weights.
+
+\paragraph{Value identities hold for all symmetries, affine included.}
+Each symmetry is an affine change of the loop momenta $k\mapsto Mk+(\text{shift by
+external momenta})$. The linear part has $|\det M|=1$ and the shift is a translation,
+so the measure $d^Dk_1\,d^Dk_2$ is preserved and
+\begin{equation}
+\I{a}=T_g\,\I{a},\qquad T_g\,\I{a}:=\mathrm{image}_g(\I{a})
+\end{equation}
+is an exact \emph{value} identity for every $g$---clean or affine. The affine shift is
+exactly what turns a numerator scalar product into a linear combination plus a constant,
+$(k{+}q)^2\to(k{+}q{+}p)^2=(k{+}q)^2+[\text{linear}]+p^2$; a degree-$s$ numerator
+therefore images to a \emph{combination}, but shifting an integration variable never
+changes the value.
+
+\paragraph{Symmetrization and the coarse grading.}
+The $T_g$ are linear on the formal integral space $V$; so is their average, the
+symmetrization $S=\tfrac{1}{|G|}\sum_{g}T_g$. Grade $V=\bigoplus_w V_w$ by coarse
+weight $w=(r,s)$. A symmetry \emph{never raises} the coarse weight: denominators
+permute (so $r$ is fixed) and a degree-$s$ numerator is a product of factors each of
+degree $\le1$ (so $s$ cannot grow, and drops when a numerator hits a present
+propagator). Empirically $0$ of $9420$ image terms over a $1275$-integral sample raised
+$(r,s)$. Hence $S$ is block lower-triangular in this grading,
+$S\,V_w\subseteq\bigoplus_{w'\le w}V_{w'}$.
+
+\paragraph{$P_S$ is the block-diagonal part---linear, and a projector.}
+Define, with $\pi_w$ the projection onto $V_w$,
+\begin{equation}
+P_S=\sum_w \pi_w\,S\,\pi_w\ \ (\text{coarse-weight-preserving part of }S),\qquad N=S-P_S .
+\end{equation}
+As the diagonal part of a linear map, $P_S$ is linear; the residual $N$ (strictly
+weight-lowering) is linear too. Averaging the value identities and splitting by weight
+gives the identity used throughout,
+\begin{equation}
+\label{eq:PSsplit}
+\I{a}=S\,\I{a}=P_S\,\I{a}+N\,\I{a}=P_S\,\I{a}+(\text{strictly-lower coarse weight}).
+\end{equation}
+On each level the coarse-weight parts of the $T_g$ compose as a representation of $G$
+(the diagonal of a product of lower-triangular maps is the product of diagonals), so
+$P_S|_{V_w}=\tfrac1{|G|}\sum_g\mathrm{diag}(T_g)$ is the average of a representation and
+hence a projector onto the symmetric subspace: $P_S^2=P_S$.
+
+\paragraph{``$+\,$lower'' is coarse, not total-lex (the load-bearing caveat).}
+Eq.~\eqref{eq:PSsplit} decomposes by \emph{coarse} weight $(r,s)$ only; it is \emph{not}
+a descent in the full order $\kk$ of Eq.~\eqref{eq:kappa}. Within a fixed $(r,s)$ the
+symmetry images---and therefore $P_S\,\I{a}$ itself---contain integrals \emph{higher}
+than $\I{a}$ in $\kk$ (same $(r,s)$, smaller $|a|$): in the same sample $4333$ of $9420$
+image terms are $\kk$-higher than their source, \emph{all} at unchanged $(r,s)$. So
+$P_S\,\I{a}$ straddles $\I{a}$ in $\kk$, and one cannot simply ``replace $\I{a}$ by
+$P_S\,\I{a}$'' without risking an \emph{increase} in $\kk$---the deadlock of
+\S\ref{sec:confluence}. This is exactly why the router does not form $P_S$ but instead
+row-reduces the whole orbit in $\kk$-order, emitting a rule only when $\I{a}$ resolves
+entirely into strictly-$\kk$-lower terms.
+
+\paragraph{One operator for a whole expression.}
+Because $P_S$ and $N$ are single linear operators, block-diagonal in coarse weight, they
+act on an expression whose terms occupy \emph{different} weight levels by linearity,
+each term projected to its own level---no per-integral operator is required. That is
+what lets the reduction be a single linear substitution applied to the entire running
+expression at once, and is the precise content of the previous section's remark that
+``$P_S$ is linear, so the substitution machinery is unchanged.''
+
+\paragraph{Caveat on the projector property.}
+Which symmetries keep $\I{a}$ inside the family varies with $a$ (a relabeling can send
+another integral's denominator to a combination, which is not a standard integral). This
+leaves $P_S$ a single well-defined \emph{linear} operator---defined on each basis
+integral and extended linearly---but its clean projector identity $P_S^2=P_S$ is
+guaranteed only under a fixed applicable group, not necessarily across weight levels with
+differing applicability.
+
+\paragraph{$P_S$ is \emph{not} an orbit invariant under affine symmetries (limited
+utility).} One might hope that two integrals related by a symmetry share a projection,
+$P_S\I{a}=P_S\I{a'}$, so that symmetrized integrals could serve as canonical class
+representatives. This holds for \emph{pure} maps (composing with $g$ merely reshuffles
+the average) but \emph{fails} for affine ones: there $\I{a'}$ arises only as one
+\emph{branch term} of the multinomial image of $\I{a}$, and the projector identity
+constrains the whole combination, not its individual terms---branch-mates generically
+\emph{cancel} against each other rather than share a projection. The operative objects
+are therefore the value identities themselves, row-reduced in $\kk$-order
+(\S\ref{sec:classification}): the drop identity when the numerator is odd under a
+within-sector reflection, and the clean-orbit dedup for pure maps. $P_S$ is a summary of
+these, not a usable class function; its one remaining untapped use is expression-level
+compression onto the invariant subspace ($\text{expr}=P_S\,\text{expr}+\text{lower}$ by
+linearity), whose cost/benefit is unmeasured.
 
 \section{Three obstacles}
 
@@ -147,6 +531,7 @@ rules pointed the wrong way in $\kk$, and $0$ (worker edge $I\to J$, symmetry ed
 $J\to I$) reversals existed. Cycles are excluded by construction.
 
 \section{Results}
+\label{sec:results}
 Each target is reduced twice under identical settings (\code{--paper-masters-only},
 prime $1009$, v7 workers), once as baseline and once with \code{--use-symmetry}. The
 correctness gate requires the final master combination to be identical.

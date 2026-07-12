@@ -333,11 +333,117 @@ State_v5.__new__.__defaults__ = (None, None, None)  # max_w12, total_w12, aux_fl
 # that is a DIFFERENT loop — do not transplant its semantics onto this code.
 # ============================================================================
 
+# SAILIR_SECTOR_RANK=1 -> the adopted sector-senior order (reduction/ORDERING.md):
+# sector rank first, then (r,s), then |abs|. Under it the active bucket is
+# same-sector only: every subsector term is a passenger regardless of its (r,s),
+# because a proper subsector ranks strictly below its parent. _START_SECTOR is the
+# start integral's sector mask, set by the worker entrypoint before the search
+# (None -> legacy behavior even with the flag on, e.g. library users).
+# Must be set identically for orchestrator AND workers of a run (shared order).
+_SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
+_START_SECTOR = None
+if _SECTOR_RANK:
+    from sector_rank import RANK_IDX as _RANK_IDX
+
+# ============================================================================
+# SAILIR_SYM_DROP -- DO NOT ENABLE IN PRODUCTION. VERDICT LOCKED 2026-07-11.
+# ============================================================================
+# The same-(r,s) symmetry DROP DETECTOR: an active integral at the START's (r,s)
+# level whose within-sector image eliminates it into strictly-lower terms is
+# dropped from the active expression (passenger; the orchestrator router
+# provably disposes of it from the replayed output -- no cycle possible).
+#
+# It was implemented, validated (masters identical on m1/m2/m3), AND MEASURED
+# TO BE A NULL RESULT: the detector fired 352 times across the three A/B probes
+# yet shortened NOTHING (m2 782 vs 782 steps -- literally identical paths;
+# m1 -0.2%, m3 -0.8%), while ADDING worker CPU (+60% on m2's short workers,
+# dominated by the per-worker symmetry-engine load). The dropped integrals sit
+# off the critical path: the beam's chosen eliminations never depended on them.
+# Population measurements agree: ~8% of active-expression integrals and ~0.9%
+# of candidate-introduced integrals are below-threshold eliminable, and the
+# winning-path witness rate is ~0 -- the orchestrator routing already extracts
+# everything extractable without the model's cooperation.
+#
+# PRODUCTION POLICY (dshih): NO symmetrization / level-drop checking inside
+# one-step workers. Symmetry lives at the ORCHESTRATOR only
+# (canonical_monolithic_rule). Within-sector relations reach workers only as
+# ACTIONS at the retrain, where the model can play them deliberately.
+# This flag is kept solely for retrain-era experiments. See the note
+# (symmetry_inference_routing.tex) and analysis/logs/cmp_symdrop_v1.log.
+_SYM_DROP = os.environ.get('SAILIR_SYM_DROP', '0') == '1'
+_START_RS = None
+_START_INT = None
+_drop_wt = None
+_drop_memo = {}
+
+
+def _init_sym_drop(start_int):
+    """Set up the drop detector for this worker's target sector (call at startup,
+    after ibp_env init). Loads the within-sector transform list once."""
+    global _START_RS, _START_INT, _drop_wt
+    w = weight(start_int)
+    _START_RS = (w[0], w[1])
+    _START_INT = tuple(start_int)
+    from symmetry_route import _within_transforms
+    _drop_wt = _within_transforms(_sector_mask(start_int))
+
+
+def _has_drop_witness(integral):
+    """True iff some within-sector map yields a single value identity that
+    eliminates `integral` into strictly-lower-(r,s) terms: the image's same-level
+    part is either empty (I = lower), or exactly {I: c} with c != 1 (odd reflection
+    c = -1, or any (1-c)I = lower). Memoized."""
+    out = _drop_memo.get(integral)
+    if out is not None:
+        return out
+    from canonicalize import image_unsigned, P as _CP
+    out = False
+    for (M, c) in _drop_wt:
+        img = image_unsigned(integral, M, c)
+        if img is None:
+            continue
+        good = True
+        self_co = 0
+        for J, co in img.items():
+            wj = weight(J)
+            if (wj[0], wj[1]) == _START_RS:
+                if J != integral:
+                    good = False
+                    break
+                self_co = co % _CP
+        if good and self_co != 1:
+            out = True
+            break
+    _drop_memo[integral] = out
+    return out
+
+
+def _sector_mask(i):
+    m = 0
+    for k in range(8):
+        if i[k] > 0:
+            m |= 1 << k
+    return m
+
+
 def is_active(integral, start_w12):
-    """True iff integral's weight (w1, w2) is lex-≥ start_w12. Defines the
-    ACTIVE BUCKET for the single-step reduction (see the banner above)."""
+    """True iff integral is in the ACTIVE BUCKET for the single-step reduction
+    (see the banner above). Legacy: weight (w1, w2) lex-≥ start_w12. Sector-senior
+    (SAILIR_SECTOR_RANK=1 with _START_SECTOR set): additionally same sector as the
+    start — subsector terms are passengers at any (w1, w2). With SAILIR_SYM_DROP=1
+    (and _init_sym_drop called): integrals AT the start's (r,s) carrying the
+    symmetry drop witness are passengers too — the orchestrator router eliminates
+    them for free from the replayed output."""
+    if _SECTOR_RANK and _START_SECTOR is not None \
+            and _sector_mask(integral) != _START_SECTOR:
+        return False
     w = weight(integral)
-    return (w[0], w[1]) >= start_w12
+    if (w[0], w[1]) < start_w12:
+        return False
+    if _SYM_DROP and _drop_wt is not None and (w[0], w[1]) == _START_RS \
+            and integral != _START_INT and _has_drop_witness(integral):
+        return False
+    return True
 
 
 def strip_passenger(d, start_w12):
@@ -360,9 +466,18 @@ _START_TOTAL_KEY = None   # set in main() = _target_key(start_int)
 
 def _target_key(i):
     """Total-ordering key matching the training-data target selection:
-    (-r, -s, |abs|-tuple). Smaller = higher in the total ordering."""
+    (-r, -s, |abs|-tuple). Smaller = higher in the total ordering.
+
+    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
+    SECTOR RANK first, then (r,s), then |abs|. Default = LEGACY order;
+    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix). The flag
+    must be set identically for orchestrator + workers + symmetry_route +
+    canonical_rep of a run (the shared order keeps the substitution cache
+    acyclic)."""
     w = weight(i)
-    return (-w[0], -w[1], w[2])
+    if not _SECTOR_RANK:
+        return (-w[0], -w[1], w[2])
+    return (-_RANK_IDX[_sector_mask(i)], -w[0], -w[1], w[2])
 
 
 def _is_success(s, target_sector):

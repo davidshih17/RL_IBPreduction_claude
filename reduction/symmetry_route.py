@@ -20,6 +20,13 @@ ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
 from canonicalize import _transforms, image_unsigned, _reduce, P
 
+# SAILIR_SECTOR_RANK=1 -> the adopted sector-senior order (ORDERING.md): sector rank
+# first, then (r,s), then |abs|. Must be set identically for the orchestrator AND all
+# workers of a run (one shared order = confluence). Default 0 = legacy order.
+_SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
+if _SECTOR_RANK:
+    from sector_rank import RANK_IDX as _RANK_IDX
+
 # NOTE on scaleless (trivial-sector) integrals: a symmetry relabeling can map a
 # nonzero integral onto a scaleless sub-sector integral (= 0), e.g. D1 D5 D6 ->
 # D5 D6 D8 (k1 only in (k1-k2)^2). We do NOT special-case these: under
@@ -37,9 +44,24 @@ def tkey(i):
     SMALLER tkey == HIGHER in the ordering == the integral IBP eliminates first.
     A valid reduction sends an integral to terms with strictly LARGER tkey (lower
     in the ordering). symmetry_route MUST use this exact order, or its rewrites run
-    opposite to the workers on the |abs| tiebreak and the mixed cache cycles."""
-    return (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
+    opposite to the workers on the |abs| tiebreak and the mixed cache cycles.
+
+    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
+    SECTOR RANK first, then (r,s), then |abs| — it gives the HARD guarantee that
+    only canonical sectors are ever dispatched (legacy order leaks 2.6-15% of
+    dispatches into non-canonical sectors via the |abs| tiebreak). This function
+    still implements the LEGACY order; migrate JOINTLY with beam_search_v7,
+    canonical_rep, and data-gen at the retrain — never alone.
+    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix)."""
+    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
             tuple(abs(x) for x in i))
+    if not _SECTOR_RANK:
+        return base
+    m = 0
+    for k in range(8):
+        if i[k] > 0:
+            m |= 1 << k
+    return (-_RANK_IDX[m],) + base
 
 
 def _build_rules(seeds, cap=20000):
@@ -102,6 +124,168 @@ def symmetry_rule(I):
     tail = rules[I]
     ki = tkey(I)
     if all(tkey(k) > ki for k in tail):       # strictly LOWER in ordering (larger tkey); empty ok
+        return tail
+    return None
+
+
+# ============================================================================
+# STAGED routing (the adopted design, 2026-07-10): two discrete steps instead of
+# the monolithic all-symmetry closure above.
+#   step 1  sector-changing: non-canonical sector -> ONE precomputed composite map
+#           (sector_canon_maps) sends I to canonical-sector terms + lower debris.
+#   step 2  within-sector: canonical-sector integrals reduced to the lowest-lex
+#           representatives of their WITHIN-sector orbit (sector-preserving maps
+#           only), or dropped entirely (the I = -I + lower identities live here).
+#   step 3  survivors -> the one-step worker queue (caller).
+# REQUIRES the sector-senior order (SAILIR_SECTOR_RANK=1): step 1's rewrite is
+# strictly descending only when sector rank is the senior key.
+# ============================================================================
+_canon_maps = None
+_canon_set = None
+_within_cache = {}
+
+
+def _sector_of(i):
+    m = 0
+    for k in range(8):
+        if i[k] > 0:
+            m |= 1 << k
+    return m
+
+
+def _staged_init():
+    global _canon_maps, _canon_set
+    if _canon_maps is None:
+        assert _SECTOR_RANK, ("staged routing requires SAILIR_SECTOR_RANK=1 "
+                              "(step-1 descent is only guaranteed sector-senior)")
+        import sector_canon_maps, pickle
+        _canon_maps = sector_canon_maps.load()
+        with open(os.path.join(ROOT, "results/canonical_sectors_tkey.pkl"), "rb") as f:
+            _canon_set = set(pickle.load(f)["canonical"])
+
+
+def _within_transforms(S):
+    """Transforms that act WITHIN sector S: applicable at S and mapping the present
+    propagators onto themselves (single-prop rows). Cached per sector."""
+    if S in _within_cache:
+        return _within_cache[S]
+    pr = {i for i in range(8) if S >> i & 1}
+    probe = tuple(1 if i in pr else 0 for i in range(8)) + (0, 0, 0)
+    out = []
+    for (M, c) in _transforms(probe):
+        img_pr = set()
+        ok = True
+        for i in pr:
+            row = M.get(i, {})
+            if len(row) != 1:
+                ok = False; break
+            (j, _co), = row.items()
+            if j >= 8:
+                ok = False; break
+            img_pr.add(j)
+        if ok and img_pr == pr:
+            out.append((M, c))
+    _within_cache[S] = out
+    return out
+
+
+def _build_rules_within(I, S, cap=20000):
+    """_build_rules restricted to the within-sector maps of S (closure stays in the
+    cone of S, relations are within-sector value identities only)."""
+    seen = {I}; frontier = [I]; raw = []
+    wt = _within_transforms(S)
+    while frontier:
+        K = frontier.pop()
+        for (M, c) in wt:
+            img = image_unsigned(K, M, c)
+            if img is None:
+                continue
+            rel = dict(img); rel[K] = (rel.get(K, 0) - 1) % P
+            rel = {k: v for k, v in rel.items() if v % P}
+            if rel:
+                raw.append(rel)
+            for J in img:
+                if J not in seen:
+                    if len(seen) >= cap:
+                        return None
+                    seen.add(J); frontier.append(J)
+    pos = {v: k for k, v in enumerate(sorted(seen, key=tkey, reverse=True))}
+    rules = {}
+    for rel in raw:
+        r = _reduce(rel, rules)
+        if not r:
+            continue
+        piv = max(r, key=lambda v: pos[v])
+        co = r.pop(piv); inv = pow(co, P - 2, P)
+        newp = {k: (-v * inv) % P for k, v in r.items()}
+        for q in list(rules):
+            if piv in rules[q]:
+                cc = rules[q].pop(piv)
+                for w, cw in newp.items():
+                    rules[q][w] = (rules[q].get(w, 0) + cc * cw) % P
+                rules[q] = {k: v for k, v in rules[q].items() if v % P}
+        rules[piv] = newp
+    return rules
+
+
+def canonical_monolithic_rule(I):
+    """THE PRODUCTION ROUTER (2026-07-11, supersedes both plain symmetry_rule and
+    staged_rule as the default): the monolithic all-symmetry row reduction --
+    measured to emit ~1.5x more compact rules than the staged factoring (6.3 vs 9.3
+    RHS terms; m2: 158 vs 235 workers) -- PLUS the hard guarantee that only
+    CANONICAL-sector integrals are ever emitted as survivors: if the monolithic
+    solve leaves a non-canonical-sector integral unresolved (closure cap, exotic
+    orbit), fall back to its single composite canonicalization map, which is proven
+    strictly descending under the sector-senior order. Requires
+    SAILIR_SECTOR_RANK=1. Sector-0 (scaleless debris) integrals remain survivors
+    for IBP to dispose of, per the scaleless policy above."""
+    I = tuple(I)
+    r = symmetry_rule(I)
+    if r is not None:
+        return r
+    _staged_init()
+    S = _sector_of(I)
+    if S == 0 or S in _canon_set:
+        return None
+    M, c = _canon_maps[S]
+    img = image_unsigned(I, M, c)
+    ki = tkey(I)
+    assert img is not None and all(tkey(k) > ki for k in img), (
+        f"canonicalization fallback failed to descend for {list(I)} — "
+        f"sector-senior order violated?")
+    return img
+
+
+def staged_rule(I):
+    """The staged router. Same contract as symmetry_rule:
+      {} / {lower: coeff, ...}  -> free rewrite, strictly lower in the order
+      None                      -> survivor (canonical sector, within-orbit lowest)
+    Step 1 for non-canonical sectors (one composite map application); step 2 for
+    canonical sectors (within-sector orbit RREF). The orchestrator cascade re-offers
+    the RHS terms on later rounds, which sequences 1 -> 2 -> queue per integral."""
+    I = tuple(I)
+    _staged_init()
+    S = _sector_of(I)
+    ki = tkey(I)
+    if S not in _canon_set:
+        # step 1: canonicalize the sector with the single composite map
+        g = _canon_maps.get(S)
+        if g is None:
+            # S == 0: no denominators at all (scaleless, appears as cascade debris).
+            # Per the scaleless policy above: no special-casing — survivor, the IBP
+            # worker reduces it to 0 exactly like the baseline.
+            return None
+        M, c = g
+        img = image_unsigned(I, M, c)
+        if img is not None and all(tkey(k) > ki for k in img):
+            return img
+        return None            # cannot happen under sector-senior order; safe fallback
+    # step 2: within-sector reduction to the lowest-lex orbit representative
+    rules = _build_rules_within(I, S)
+    if rules is None or I not in rules:
+        return None
+    tail = rules[I]
+    if all(tkey(k) > ki for k in tail):
         return tail
     return None
 

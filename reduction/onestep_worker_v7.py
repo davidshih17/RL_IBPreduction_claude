@@ -155,6 +155,13 @@ def main():
     ibp_env.init_from_topology(topology)
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
+    if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
+        # Canonical-sector pipeline package: masters = symmetry-images of the paper
+        # masters in OUR canonical sectors (canonical_masters.py). Without this the
+        # merged corner of a Kira-mismatched orbit is unreducible and the worker
+        # hangs (the m1/m3 stuck-corner pathology).
+        from canonical_masters import apply_canonical_masters
+        apply_canonical_masters()
     env = IBPEnvironment()
 
     # v7 module globals that beam_search_v7.main() sets (replicate exactly).
@@ -176,6 +183,12 @@ def main():
     start_w = weight(start_int)
     start_w12 = (start_w[0], start_w[1])
     bs7._START_TOTAL_KEY = _target_key(start_int)         # SAILIR_SUCCESS_TOTAL=1
+    bs7._START_SECTOR = bs7._sector_mask(start_int)       # SAILIR_SECTOR_RANK=1 bucket
+    if os.environ.get('SAILIR_SYM_DROP', '0') == '1':
+        # DO NOT ENABLE IN PRODUCTION — measured null result (locked 2026-07-11):
+        # fired 352x on m1/m2/m3 A/B, shortened nothing, cost worker CPU.
+        # See the banner in beam_search_v7.py. Kept for retrain-era experiments.
+        bs7._init_sym_drop(start_int)                     # same-(r,s) drop detector
     if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0':
         ibp_env.set_raw_strip_threshold(start_w12)
     target_sector = tuple(get_sector_mask(start_int))
@@ -249,8 +262,10 @@ def main():
 
     if args.verbose:
         status = 'SUCCESS' if success else 'INCOMPLETE'
+        drops = sum(1 for v in bs7._drop_memo.values() if v) if bs7._drop_memo else 0
         print(f'[v7-worker] {status} in {elapsed:.2f}s path_len={n_steps} '
-              f'nm={best_state.n_non_masters} peak_rss={peak_rss_kb/1024:.0f}MB '
+              f'nm={best_state.n_non_masters} sym_drops={drops} '
+              f'peak_rss={peak_rss_kb/1024:.0f}MB '
               f'-> {args.output}', flush=True)
     return 0 if success else 1
 

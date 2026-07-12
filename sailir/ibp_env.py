@@ -652,6 +652,21 @@ def set_paper_masters_only(value):
     PAPER_MASTERS_ONLY = value
 
 
+def set_masters(masters):
+    """Replace the master basis (e.g. with the CANONICAL-sector images of the paper
+    masters under the symmetry pipeline — reduction/canonical_masters.py). Rebuilds
+    the per-sector lookups and invalidates the sector-tuple cache, mirroring
+    init_from_topology. The caller owns the dictionary back to the original basis."""
+    global MASTERS_SET, MASTERS_BY_SECTOR, MASTER_SECTORS, _MASTER_SECTOR_TUPLES_CACHE
+    _MASTER_SECTOR_TUPLES_CACHE = None
+    MASTERS_SET = frozenset(tuple(m) for m in masters)
+    by = {}
+    for m in MASTERS_SET:
+        by.setdefault(get_sector(m), []).append(m)
+    MASTERS_BY_SECTOR = by
+    MASTER_SECTORS = frozenset(by.keys())
+
+
 def is_corner_integral(integral):
     """Check if integral is a corner integral.
 

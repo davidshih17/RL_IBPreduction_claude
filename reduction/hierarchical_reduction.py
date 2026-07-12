@@ -233,13 +233,22 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
                        f'{paper_masters_flag}{n_workers_flag}{beam_sort_flag}'
                        f'{cp_flag}{resume_flag}{dedup_flag}')
 
+    # The total order must be SHARED by orchestrator and workers (ORDERING.md):
+    # when the orchestrator runs sector-senior (SAILIR_SECTOR_RANK=1), every
+    # worker it spawns must too. Condor does not inherit our env -> write it in.
+    # SAILIR_SYM_DROP propagates the same way but is NOT for production use —
+    # measured null result, locked 2026-07-11 (see beam_search_v7.py banner):
+    # symmetry lives at the orchestrator only; workers do NO symmetrization.
+    _envs = " ".join(f"{v}=1" for v in ("SAILIR_SECTOR_RANK", "SAILIR_SYM_DROP")
+                     if os.environ.get(v, '0') == '1')
+    env_line = f'environment = "{_envs}"\n' if _envs else ''
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
 arguments = -u {REPO_DIR}/reduction/{worker_script}{worker_args}
 output = {work_dir}/logs/{job_name}.out
 error = {work_dir}/logs/{job_name}.err
 log = {work_dir}/logs/{job_name}.log
-request_cpus = {cpus}
+{env_line}request_cpus = {cpus}
 request_memory = {memory}GB
 request_disk = 1GB
 Requirements = (TARGET.KFlops > 3000000)
@@ -348,9 +357,14 @@ def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps
     set once and persist across queue statements; per-job attrs are re-set per
     block. Returns the .sub path.
     """
+    # Shared total order + drop detector: propagate the flags to every worker
+    # (see create_condor_submit / ORDERING.md).
+    _envs = " ".join(f"{v}=1" for v in ("SAILIR_SECTOR_RANK", "SAILIR_SYM_DROP")
+                     if os.environ.get(v, '0') == '1')
+    env_line = f'environment = "{_envs}"\n' if _envs else ''
     parts = [f"""universe = vanilla
 executable = {PYTHON_PATH}
-request_disk = 1GB
+{env_line}request_disk = 1GB
 Requirements = (TARGET.KFlops > 3000000)
 +JobFlavour = "workday"
 """]
@@ -583,6 +597,14 @@ def main():
                              'asymmetric integrals) remain. Value-preserving (rules '
                              'are GF(p) combos of exact symmetry identities); the '
                              'master combination is unchanged. Requires --prime 1009.')
+    parser.add_argument('--symmetry-staged', action='store_true',
+                        help='Use the STAGED symmetry router (symmetry_route.staged_rule) '
+                             'instead of the monolithic all-symmetry closure: step 1 '
+                             'canonicalize the sector (one precomputed composite map), '
+                             'step 2 reduce within the canonical sector to the lowest-lex '
+                             'orbit representative, step 3 queue survivors for workers. '
+                             'Requires --use-symmetry and SAILIR_SECTOR_RANK=1 (the '
+                             'sector-senior order; see reduction/ORDERING.md).')
     parser.add_argument('--resume', action='store_true',
                         help='Resume: on startup, scan work_dir/results/*.pkl and '
                              'load each completed worker as a cache entry. Then '
@@ -650,6 +672,18 @@ def main():
     set_prime(args.prime)
     if args.paper_masters_only:
         set_paper_masters_only(True)
+    _canon_masters_dict = {}
+    if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
+        # Canonical-sector pipeline package (see canonical_masters.py): masters =
+        # symmetry-images of the paper masters in OUR canonical sectors. The
+        # dictionary translates the final expression back to Kira's basis at
+        # output time (exact 1-term identities; never a cache entry).
+        from canonical_masters import apply_canonical_masters
+        _canon_masters_dict = apply_canonical_masters()
+        if _canon_masters_dict:
+            print(f'Canonical masters: {len(_canon_masters_dict)} paper master(s) '
+                  f'relabeled into canonical sectors '
+                  f'{[list(k) for k in _canon_masters_dict]}')
 
     env = IBPEnvironment()
 
@@ -670,6 +704,12 @@ def main():
     if args.use_symmetry and args.prime != 1009:
         raise SystemExit('--use-symmetry requires --prime 1009 (symmetry_route/canonicalize '
                          'transforms are built at p=1009).')
+    if args.symmetry_staged:
+        if not args.use_symmetry:
+            raise SystemExit('--symmetry-staged requires --use-symmetry.')
+        if os.environ.get('SAILIR_SECTOR_RANK', '0') != '1':
+            raise SystemExit('--symmetry-staged requires SAILIR_SECTOR_RANK=1 (the '
+                             'sector-senior order; step-1 descent needs it — ORDERING.md).')
 
     # --resume: scan work_dir/results/*.pkl, load each successful worker output
     # as a cache entry. Apply substitutions to start_expr to recover current expr.
@@ -820,14 +860,25 @@ def main():
         # Value-preserving: every rule is a GF(p) combination of exact symmetry
         # identities, so the final master combination is identical to the baseline.
         if args.use_symmetry:
-            from symmetry_route import symmetry_rule
+            from symmetry_route import (symmetry_rule, staged_rule,
+                                        canonical_monolithic_rule)
+            # Production default (2026-07-11): monolithic solve + hard
+            # canonical-sector guarantee. --symmetry-staged keeps the staged
+            # reference implementation; legacy order (no SAILIR_SECTOR_RANK)
+            # falls back to the plain monolithic router.
+            if args.symmetry_staged:
+                _route = staged_rule
+            elif os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
+                _route = canonical_monolithic_rule
+            else:
+                _route = symmetry_rule
             routed_this_iter = 0
             while True:
                 cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
                 routed = 0
                 for I in cand:
                     if I not in sym_memo:
-                        sym_memo[I] = symmetry_rule(I)
+                        sym_memo[I] = _route(I)
                     rule = sym_memo[I]
                     if rule is not None:            # {} (symmetry-zero) or strictly-lower rewrite
                         cache[I] = rule; routed += 1
@@ -1284,6 +1335,15 @@ def main():
             print(f'  I{list(integral)} coeff={coeff} weight={weight(integral)[:2]}')
     else:
         print('\nSUCCESS! All integrals reduced to masters.')
+
+    # Translate canonical masters back to Kira's basis for the OUTPUT only (exact
+    # 1-term coefficient-1 identities; keeps final pkls comparable to baselines).
+    if _canon_masters_dict:
+        from canonical_masters import translate_to_kira
+        expr = translate_to_kira(expr, _canon_masters_dict)
+        masters = translate_to_kira(masters, _canon_masters_dict)
+        print(f'\n(final expression translated to the Kira master basis: '
+              f'{len(_canon_masters_dict)} relabelings)')
 
     print(f'\nFinal masters:')
     for integral, coeff in sorted(masters.items(), key=lambda x: (-weight(x[0])[0], x[0])):

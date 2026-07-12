@@ -2,10 +2,12 @@
 """Build the CLEAN-orbit canonical sector map in the workers' _target_key order.
 
 For each sector (bitmask over the 8 propagator slots), its canonical representative
-is the sector of the _target_key-MINIMUM corner in the sector's clean-permutation
-orbit (canonical_rep on the corner). Sectors related by a genuine loop relabeling
-share a rep; affine-only relations (corner -> combination) do NOT merge here (that
-is the inference routing's job, not canonicalization).
+is the sector of the SURVIVOR corner of the sector's clean-permutation orbit --
+the _target_key-MAXIMUM, i.e. the orbit member every other member reduces TOWARD
+(canonical_rep on the corner; see canonical_rep.py for the max-not-min invariant).
+Sectors related by a genuine loop relabeling share a rep; affine-only relations
+(corner -> combination) do NOT merge here (that is the inference routing's job,
+not canonicalization).
 
 Output: results/canonical_sectors_tkey.pkl = {
   'rep_of'      : {mask: canonical_mask},      # every 1..255 sector
