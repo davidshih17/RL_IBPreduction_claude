@@ -23,6 +23,7 @@ import random
 import json
 import argparse
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 # Make the SAILIR package importable when this script is run directly.
@@ -231,11 +232,20 @@ def parse_templates(path):
 
 def evaluate_coefficient(coeff_str, seed):
     """Eval coefficient at finite-field point. Indices a0..a{N-1} from `seed`,
-    plus topology kinematics (d + invariants) from KINEMATICS."""
-    ns = {f'a{i}': seed[i] for i in range(N_INDICES)}
-    ns.update(KINEMATICS)
+    plus topology kinematics (d + invariants) from KINEMATICS.
+
+    Rational-exact: 3-loop template coefficients contain DIVISION (e.g.
+    '1/2*a13' in gravity3L/IBP), which plain eval turns into floats and poisons
+    the mod-p arithmetic (pentagonbox templates never divided, so this was
+    latent). Evaluate over Fraction, then num * den^{-1} mod p."""
+    ns = {f'a{i}': Fraction(seed[i]) for i in range(N_INDICES)}
+    ns.update({k: Fraction(v) for k, v in KINEMATICS.items()})
     try:
-        return eval(coeff_str.replace('^', '**'), {"__builtins__": {}}, ns) % PRIME
+        fr = Fraction(eval(coeff_str.replace('^', '**'), {"__builtins__": {}}, ns))
+        den = fr.denominator % PRIME
+        if den == 0:
+            return 0
+        return (fr.numerator % PRIME) * pow(den, PRIME - 2, PRIME) % PRIME
     except Exception:
         return 0
 
