@@ -237,3 +237,15 @@ batch at `--batch_size 128`, ~26 min / epoch on `pentagonbox_10x_packed`
    |---|---:|---:|---:|
    | `full`   | 76 | 96.08% | 99.60% |
    | `nosubs` | 62 | 96.08% | 99.60% |
+
+---
+
+## 10. Trained models committed to this repo
+
+| Checkpoint dir | Variant | Data | val top-1 | Notes |
+|---|---|---|---:|---|
+| [`../checkpoints/pentagonbox_10x_loop_100/`](../checkpoints/pentagonbox_10x_loop_100/) | `full` | `pentagonbox_10x_packed` (all sectors) | 96.08% (E76) | the original production model; used for the published pentagon-box reductions |
+| [`../checkpoints/pentagonbox_canon10x_nosubs/`](../checkpoints/pentagonbox_canon10x_nosubs/) | `nosubs` | `pentagonbox_canon10x_packed` (**canonical sectors only**, symmetry-enhanced) | 96.98% (E54, `best_model.pt`) / **97.16%** (E99, `checkpoint_epoch99.pt`) | see that directory's README for loading instructions — it is the `nosubs` class, NOT interchangeable with `full` checkpoints |
+
+The canonical-sector restriction both converges faster (95.3% by E4) and
+plateaus ~1 pp higher than the all-sector baseline.
