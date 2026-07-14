@@ -88,13 +88,18 @@ LOG=logs/pentagonbox_10x_${LOG_TAG}_$(date +%Y%m%d_%H%M%S).log
   echo "  OUTPUT_DIR=$OUTPUT_DIR"
 } | tee -a "$LOG"
 
+# TOPOLOGY env override (default pentagonbox): the topology dir determines the
+# model dimensions (n_indices, n_denominators, n_actions) — it MUST match the
+# dataset in SHARDS_DIR. For gravity: TOPOLOGY=topology_input/gravity3L with
+# SHARDS_DIR=data/gravity3L_canon10x_packed.
+TOPOLOGY=${TOPOLOGY:-topology_input/pentagonbox}
 srun -l -u \
     --ntasks-per-node=4 \
     --gpus-per-task=1 \
     --cpus-per-task=32 \
     --gpu-bind=none \
     bash training/nersc_perlmutter/srun_task.sh \
-        --topology         topology_input/pentagonbox \
+        --topology         "$TOPOLOGY" \
         --shards_dir       "$SHARDS_DIR" \
         --buffer_shards    4 \
         --output_dir       "$OUTPUT_DIR" \

@@ -1,0 +1,13 @@
+kinematics:
+  incoming_momenta: [q, u1, u2]
+  outgoing_momenta: [ ]
+  momentum_conservation: [ ]
+  kinematic_invariants:
+    - [y, 0]            # y = u1.u2 (dimensionless; u1^2=u2^2=1)
+  scalarproduct_rules:
+    - [[q,q],  -1]
+    - [[u1,u1], 1]
+    - [[u2,u2], 1]
+    - [[u1,u2], y]
+    - [[q,u1],  0]
+    - [[q,u2],  0]

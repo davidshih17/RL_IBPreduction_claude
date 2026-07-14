@@ -1,0 +1,10 @@
+jobs:
+  - reduce_sectors:
+      reduce:
+        - {sectors: [1023], r: 11, s: 4}
+      select_integrals:
+        select_mandatory_list:
+          - [GR, target_integrals]
+      run_initiate: true
+      run_triangular: false
+      run_back_substitution: false
