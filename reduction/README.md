@@ -264,6 +264,48 @@ $PY $BASE/reduction/print_replay_terms.py  $OUT/replay_state.pkl
 
 ---
 
+## 9a. Meta-orchestrator — cascading a target LIST with cache reuse
+
+For reducing a long list of integrals (the pentagon-box `list_TA`: 1016 targets,
+996 after dropping the 20 with a positive ISP slot), driving `hierarchical_reduction`
+by hand one integral at a time does not scale. `meta_orchestrator.py` industrializes
+it:
+
+- **Weight-ordered cascade.** Processes the target list top-to-bottom
+  (`from_federica/list_TA_ispclean_by_weight`, heaviest first), launching one
+  `hierarchical_reduction.py` run per target under `results/meta_reduce/<target>/`.
+- **Cache cascade (the point).** Before each launch it merges the substitution
+  caches of ALL prior runs — completed *and* in-progress — into the new run's
+  `--resume-from` (via `merge_caches.py`). Every reduction stands on everything
+  computed so far, so lower-weight targets get progressively cheaper.
+  `count_cache_coverage.py` reports how much of the list an existing cache set
+  already covers (e.g. one (8,5) reduction alone covers ~19% of list_TA).
+- **Load-aware continuous submission.** A new target launches only when every
+  active run has fanned down to its long-pole phase (fewer than `NM_THRESHOLD`
+  remaining non-masters, held stable across polls), in bursts of up to
+  `LAUNCH_BATCH` while the Condor pool has more than `FREE_CPU_FLOOR` free CPUs,
+  capped at `MAX_ACTIVE` simultaneously-active orchestrators (each is a ~0.6 GB
+  login-node poller). All knobs — and the run settings (model checkpoint,
+  topology, `--no-paper-masters-only`) — sit at the top of the file; edit there.
+- **Restart-safe, launch-only.** On restart it re-discovers its own runs via each
+  dir's `target.txt`; it launches and monitors but never kills anything.
+
+```bash
+# run unattended in the background; everything streams to the log
+nohup python reduction/meta_orchestrator.py > logs/meta_orchestrator.log 2>&1 &
+
+# monitor the cascade
+python reduction/plot_cascade_progress.py
+```
+
+Companion tooling: `build_clean_cache.py` + `launch_cache_reuse_*.sh` (curated
+cache-reuse launches), `_pick_cache_target.py` (choose the next best target for
+coverage), and the `replay_list_TA_*.py` / `export_list_TA_reductions.py` family
+(replay every list target through the accumulated results and export the final
+reductions).
+
+---
+
 ## 10. Troubleshooting
 
 - **A worker runs forever / `Pending: 1` never drops** on a low corner integral:
