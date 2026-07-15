@@ -58,7 +58,7 @@ class IBPActionClassifierNoSubs(nn.Module):
     """
 
     def __init__(self, embed_dim=256, n_heads=4, n_expr_layers=2, n_cross_layers=2,
-                 n_subs_layers=2, prime=2147483647, n_indices=7, n_denominators=6,
+                 n_subs_layers=2, *, prime, n_indices=7, n_denominators=6,
                  n_ibp_ops=9, **kwargs):
         super().__init__()
         self.prime = prime

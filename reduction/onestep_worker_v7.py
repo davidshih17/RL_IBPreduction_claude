@@ -169,12 +169,37 @@ def main():
     bs7._V7_PACKED_RS_CACHE = {}
     bs7._PACKED_RS = (os.environ.get('SAILIR_PACKED_RS', '0') == '1')
 
-    model = IBPActionClassifier(
-        n_indices=topology.n_indices,
-        n_denominators=topology.n_denominators,
-        n_ibp_ops=topology.n_actions,
-    )
+    # Variant-aware model construction (checkpoints/<name>/README.md): the
+    # canon10x retrain is the `nosubs` variant (IBPActionClassifierNoSubs) —
+    # same forward call-site (sub_* args accepted and ignored), but it MUST be
+    # built with the training prime (1009): the coefficient encoder folds
+    # coeffs > p/2 to negatives via self.prime, and the constructor default
+    # (2^31-1) would silently break that. Older checkpoints (model_variant
+    # None) keep the exact legacy construction.
     ck = torch.load(args.model_checkpoint, map_location='cpu', weights_only=False)
+    _variant = (ck.get('args') or {}).get('model_variant')
+    if _variant == 'nosubs':
+        from sailir.classifier_nosubs import IBPActionClassifierNoSubs
+        model = IBPActionClassifierNoSubs(
+            prime=(ck.get('args') or {}).get('prime', args.prime),
+            n_indices=topology.n_indices,
+            n_denominators=topology.n_denominators,
+            n_ibp_ops=topology.n_actions,
+        )
+    else:
+        # BUG FIX 2026-07-15: prime was omitted here since the 2026-05-11 public
+        # release, silently constructing with the old default 2^31-1 while the
+        # model was TRAINED at prime=1009 — the coefficient sign-fold (residues
+        # > p/2 -> negatives) then never fired at inference, flipping 8.2% of
+        # top-1 decisions (analysis/probe_subs_sensitivity.py). `prime` is now a
+        # REQUIRED keyword in every classifier constructor: omission crashes at
+        # construction instead of degrading silently.
+        model = IBPActionClassifier(
+            prime=(ck.get('args') or {}).get('prime', args.prime),
+            n_indices=topology.n_indices,
+            n_denominators=topology.n_denominators,
+            n_ibp_ops=topology.n_actions,
+        )
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
 

@@ -2748,12 +2748,15 @@ def main():
     if _memprobe_mod is not None:
         _memprobe_mod.record_milestone('rss_after_env_kb')
 
+    # prime is REQUIRED (no default since the 2026-07-15 bug fix): take it from
+    # the checkpoint's own training args, falling back to the CLI prime.
+    ck = torch.load(args.model, map_location='cpu', weights_only=False)
     model = IBPActionClassifier(
+        prime=(ck.get('args') or {}).get('prime', args.prime),
         n_indices=topology.n_indices,
         n_denominators=topology.n_denominators,
         n_ibp_ops=topology.n_actions,
     )
-    ck = torch.load(args.model, map_location='cpu', weights_only=False)
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
     if _memprobe_mod is not None:

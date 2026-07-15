@@ -81,7 +81,7 @@ class CoefficientEncoder(nn.Module):
     Small values (|c| <= 31) get a learned lookup; larger values are encoded
     by (log magnitude, sign, mod-100, is-small) features.
     """
-    def __init__(self, embed_dim=64, prime=2147483647):
+    def __init__(self, embed_dim=64, *, prime):
         super().__init__()
         self.prime = prime
         self.half_prime = prime // 2
@@ -154,7 +154,7 @@ class FullSubstitutionEncoder(nn.Module):
     learned-query attention, combine, then run the per-substitution embeddings
     through a positional-encoded Transformer + a final attention pool.
     """
-    def __init__(self, embed_dim=256, max_index=20, min_index=-10, prime=2147483647,
+    def __init__(self, embed_dim=256, max_index=20, min_index=-10, *, prime,
                  n_heads=4, n_layers=2, max_subs=50, max_replacement_terms=20,
                  n_indices=7):
         super().__init__()
@@ -294,7 +294,7 @@ class TransformerExpressionEncoderWithTarget(nn.Module):
     terms by their embedding content (TARGET uses an integral-only embedding,
     regular terms use integral+coefficient).
     """
-    def __init__(self, embed_dim=256, max_index=20, min_index=-10, prime=2147483647,
+    def __init__(self, embed_dim=256, max_index=20, min_index=-10, *, prime,
                  n_heads=4, n_layers=2, max_terms=512, n_indices=7):
         super().__init__()
         self.embed_dim = embed_dim
@@ -431,7 +431,7 @@ class IBPActionClassifier(nn.Module):
     published weights works without modification.
     """
     def __init__(self, embed_dim=256, n_heads=4, n_expr_layers=2, n_cross_layers=2,
-                 n_subs_layers=2, prime=2147483647, n_indices=7, n_denominators=6,
+                 n_subs_layers=2, *, prime, n_indices=7, n_denominators=6,
                  n_ibp_ops=9, **kwargs):
         super().__init__()
         self.prime = prime
