@@ -246,6 +246,7 @@ batch at `--batch_size 128`, ~26 min / epoch on `pentagonbox_10x_packed`
 |---|---|---|---:|---|
 | [`../checkpoints/pentagonbox_10x_loop_100/`](../checkpoints/pentagonbox_10x_loop_100/) | `full` | `pentagonbox_10x_packed` (all sectors) | 96.08% (E76) | the original production model; used for the published pentagon-box reductions |
 | [`../checkpoints/pentagonbox_canon10x_nosubs/`](../checkpoints/pentagonbox_canon10x_nosubs/) | `nosubs` | `pentagonbox_canon10x_packed` (**canonical sectors only**, symmetry-enhanced) | 96.98% (E54, `best_model.pt`) / **97.16%** (E99, `checkpoint_epoch99.pt`) | see that directory's README for loading instructions — it is the `nosubs` class, NOT interchangeable with `full` checkpoints |
+| [`../checkpoints/gravity3L_canon10x_nosubs/`](../checkpoints/gravity3L_canon10x_nosubs/) | `nosubs` | `gravity3L_canon10x_packed` (**3-loop gravity**, canonical sectors) | 96.47% (E52, `best_model.pt`) | first non-pentagonbox model; topology `gravity3L` (n_indices=15). See that directory's README |
 
 The canonical-sector restriction both converges faster (95.3% by E4) and
-plateaus ~1 pp higher than the all-sector baseline.
+plateaus ~1 pp higher than the all-sector baseline (pentagonbox).
