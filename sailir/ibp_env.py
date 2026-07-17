@@ -187,10 +187,22 @@ def eval_coeff(coeff_str, seed):
     Binds a0..a{N-1} from `seed`, plus every kinematic invariant declared
     by the topology (e.g. 'd', 'm2', 'm3' for trianglebox; 'd', 's12', ...
     for pentagon-box). Returns 0 on eval failure (matching old behaviour).
+
+    Coefficients containing DIVISION (gravity3L IBP templates carry literal
+    '1/2' factors; pentagonbox/trianglebox have none) are evaluated exactly
+    over Fractions and reduced num * inv(den) mod PRIME — plain eval would
+    produce a float and silently poison the mod-p arithmetic. The '/'-free
+    hot path is unchanged (one C-level substring scan).
     """
     ns = {f'a{i}': seed[i] for i in range(N_INDICES)}
     ns.update(KINEMATICS)  # d + invariant symbols -> integer values
     try:
+        if '/' in coeff_str:
+            from fractions import Fraction
+            fns = {k: Fraction(v) for k, v in ns.items()}
+            fr = Fraction(eval(coeff_str.replace('^', '**'),
+                               {"__builtins__": {}}, fns))
+            return fr.numerator * pow(fr.denominator % PRIME, PRIME - 2, PRIME) % PRIME
         return eval(coeff_str.replace('^', '**'), {"__builtins__": {}}, ns) % PRIME
     except Exception:
         return 0

@@ -241,6 +241,11 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     # symmetry lives at the orchestrator only; workers do NO symmetrization.
     _envs = " ".join(f"{v}=1" for v in ("SAILIR_SECTOR_RANK", "SAILIR_SYM_DROP")
                      if os.environ.get(v, '0') == '1')
+    # SAILIR_TOPOLOGY is valued (not binary): propagate whenever set, so workers
+    # load the same sector-rank table / canonicalize provider (topo_config.py).
+    if os.environ.get('SAILIR_TOPOLOGY'):
+        _envs = (_envs + " " if _envs else "") + \
+            f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -361,6 +366,9 @@ def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps
     # (see create_condor_submit / ORDERING.md).
     _envs = " ".join(f"{v}=1" for v in ("SAILIR_SECTOR_RANK", "SAILIR_SYM_DROP")
                      if os.environ.get(v, '0') == '1')
+    if os.environ.get('SAILIR_TOPOLOGY'):
+        _envs = (_envs + " " if _envs else "") + \
+            f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     parts = [f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -669,6 +677,11 @@ def main():
     from sailir import ibp_env
     topology = Topology.from_dir(args.topology)
     ibp_env.init_from_topology(topology)
+    import topo_config as _tc
+    assert topology.n_denominators == _tc.N_DEN, (
+        f"topology has {topology.n_denominators} denominators but "
+        f"SAILIR_TOPOLOGY={os.environ.get('SAILIR_TOPOLOGY', 'pentagonbox')!r} "
+        f"configures {_tc.N_DEN} — set SAILIR_TOPOLOGY to match --topology")
     set_prime(args.prime)
     if args.paper_masters_only:
         set_paper_masters_only(True)

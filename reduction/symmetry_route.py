@@ -18,7 +18,13 @@ combination is unchanged (verified by the A/B masters-equality gate).
 import os, sys
 ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
-from canonicalize import _transforms, image_unsigned, _reduce, P
+# topology-keyed provider (SAILIR_TOPOLOGY, default pentagonbox = the original
+# 'canonicalize' momentum-engine module — behavior unchanged with the flag unset)
+import topo_config as _tc
+_cz = _tc.canonicalize_module()
+_transforms, image_unsigned, _reduce, P = (_cz._transforms, _cz.image_unsigned,
+                                           _cz._reduce, _cz.P)
+_N_DEN, _N_ISP = _tc.N_DEN, _tc.N_IND - _tc.N_DEN
 
 # SAILIR_SECTOR_RANK=1 -> the adopted sector-senior order (ORDERING.md): sector rank
 # first, then (r,s), then |abs|. Must be set identically for the orchestrator AND all
@@ -58,7 +64,7 @@ def tkey(i):
     if not _SECTOR_RANK:
         return base
     m = 0
-    for k in range(8):
+    for k in range(_N_DEN):
         if i[k] > 0:
             m |= 1 << k
     return (-_RANK_IDX[m],) + base
@@ -147,7 +153,7 @@ _within_cache = {}
 
 def _sector_of(i):
     m = 0
-    for k in range(8):
+    for k in range(_N_DEN):
         if i[k] > 0:
             m |= 1 << k
     return m
@@ -160,7 +166,7 @@ def _staged_init():
                               "(step-1 descent is only guaranteed sector-senior)")
         import sector_canon_maps, pickle
         _canon_maps = sector_canon_maps.load()
-        with open(os.path.join(ROOT, "results/canonical_sectors_tkey.pkl"), "rb") as f:
+        with open(_tc.CANON_PKL, "rb") as f:
             _canon_set = set(pickle.load(f)["canonical"])
 
 
@@ -169,8 +175,8 @@ def _within_transforms(S):
     propagators onto themselves (single-prop rows). Cached per sector."""
     if S in _within_cache:
         return _within_cache[S]
-    pr = {i for i in range(8) if S >> i & 1}
-    probe = tuple(1 if i in pr else 0 for i in range(8)) + (0, 0, 0)
+    pr = {i for i in range(_N_DEN) if S >> i & 1}
+    probe = tuple(1 if i in pr else 0 for i in range(_N_DEN)) + (0,) * _N_ISP
     out = []
     for (M, c) in _transforms(probe):
         img_pr = set()
@@ -180,7 +186,7 @@ def _within_transforms(S):
             if len(row) != 1:
                 ok = False; break
             (j, _co), = row.items()
-            if j >= 8:
+            if j >= _N_DEN:
                 ok = False; break
             img_pr.add(j)
         if ok and img_pr == pr:

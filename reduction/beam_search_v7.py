@@ -345,6 +345,11 @@ _START_SECTOR = None
 if _SECTOR_RANK:
     from sector_rank import RANK_IDX as _RANK_IDX
 
+# denominator count for _sector_mask (topology-keyed via SAILIR_TOPOLOGY,
+# default pentagonbox = 8, the historical hardwired value). main() asserts it
+# matches the loaded topology.
+from topo_config import N_DEN as _TC_N_DEN
+
 # ============================================================================
 # SAILIR_SYM_DROP -- DO NOT ENABLE IN PRODUCTION. VERDICT LOCKED 2026-07-11.
 # ============================================================================
@@ -420,7 +425,7 @@ def _has_drop_witness(integral):
 
 def _sector_mask(i):
     m = 0
-    for k in range(8):
+    for k in range(_TC_N_DEN):
         if i[k] > 0:
             m |= 1 << k
     return m
@@ -2735,6 +2740,10 @@ def main():
 
     topology = Topology.from_dir(args.topology)
     init_from_topology(topology)
+    assert topology.n_denominators == _TC_N_DEN, (
+        f"topology has {topology.n_denominators} denominators but "
+        f"SAILIR_TOPOLOGY={os.environ.get('SAILIR_TOPOLOGY', 'pentagonbox')!r} "
+        f"configures {_TC_N_DEN} — set SAILIR_TOPOLOGY to match --topology")
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
     env = IBPEnvironment()

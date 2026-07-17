@@ -153,6 +153,10 @@ def main():
     t0 = time.time()
     topology = Topology.from_dir(args.topology)
     ibp_env.init_from_topology(topology)
+    assert topology.n_denominators == bs7._TC_N_DEN, (
+        f"topology has {topology.n_denominators} denominators but "
+        f"SAILIR_TOPOLOGY={os.environ.get('SAILIR_TOPOLOGY', 'pentagonbox')!r} "
+        f"configures {bs7._TC_N_DEN} — set SAILIR_TOPOLOGY to match --topology")
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
     if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':

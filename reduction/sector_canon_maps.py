@@ -15,9 +15,14 @@ non-canonical sectors. Run this file directly to (re)build and gate:
 import os, sys, pickle
 ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
-from canonicalize import _transforms, image_unsigned, P, N
+# topology-keyed provider (SAILIR_TOPOLOGY, default pentagonbox — the cached
+# pentagonbox pkl is loaded as before, so production behavior is unchanged)
+import topo_config as _tc
+_cz = _tc.canonicalize_module()
+_transforms, image_unsigned, P, N = _cz._transforms, _cz.image_unsigned, _cz.P, _cz.N
+_N_DEN = _tc.N_DEN
 
-_PKL = os.path.join(ROOT, "results/sector_canon_maps.pkl")
+_PKL = _tc.CANON_MAPS_PKL
 
 
 def _compose(A, B):
@@ -43,31 +48,39 @@ _ID = ({i: {i: 1} for i in range(N)}, {})
 
 
 def _corner(mask):
-    return tuple(1 if mask >> k & 1 else 0 for k in range(8)) + (0, 0, 0)
+    return tuple(1 if mask >> k & 1 else 0 for k in range(_N_DEN)) \
+        + (0,) * (N - _N_DEN)
 
 
 def _sec(t):
-    return sum(1 << k for k in range(8) if t[k] > 0)
+    return sum(1 << k for k in range(_N_DEN) if t[k] > 0)
 
 
 def build():
-    from canonical_rep import canonical_rep
-    rep_mask = {m: _sec(canonical_rep(_corner(m))) for m in range(1, 256)}
-    # corner graph edges
+    # rep targets from the topology's canonical-sectors pkl — the SAME rep_of
+    # sector_rank uses, so composites and the rank order stay consistent
+    with open(_tc.CANON_PKL, "rb") as f:
+        rep_mask = pickle.load(f)["rep_of"]
+    n_masks = 1 << _N_DEN
+    # corner graph edges. Edge coefficients need not be 1: GR's LINEAR (eikonal)
+    # denominators legitimately produce coefficient -1 corner maps (reflections);
+    # image application carries the coefficient exactly, and _compose is affine
+    # over GF(P), so any nonzero coefficient composes correctly. (Pentagonbox
+    # edges are all coefficient 1 — the relaxation changes nothing there.)
     edges = {}
-    for m in range(1, 256):
+    for m in range(1, n_masks):
         out = []
         for (M, c) in _transforms(_corner(m)):
             img = image_unsigned(_corner(m), M, c)
             if img is None or len(img) != 1:
                 continue
             (J, co), = img.items()
-            if co % P != 1:
+            if co % P == 0:
                 continue
             out.append((_sec(J), (M, c)))
         edges[m] = out
     maps = {}
-    for m in range(1, 256):
+    for m in range(1, n_masks):
         tgt = rep_mask[m]
         if m == tgt:
             continue
@@ -109,18 +122,20 @@ def load():
 if __name__ == "__main__":
     from sailir import ibp_env
     from sailir.topology import Topology
-    ibp_env.init_from_topology(Topology.from_dir(os.path.join(ROOT, "topology_input/pentagonbox")))
+    ibp_env.init_from_topology(Topology.from_dir(_tc.TOPO_DIR))
     ibp_env.set_prime(1009)
     maps, rep_mask = build()
     with open(_PKL, "wb") as f:
         pickle.dump({"maps": maps}, f)
+    expect = sum(1 for m in range(1, 1 << _N_DEN) if rep_mask[m] != m)
     bad = 0
     for m, g in maps.items():
         img = image_unsigned(_corner(m), g[0], g[1])
         ok = img is not None and len(img) == 1 and next(iter(img)) == _corner(rep_mask[m])
         if not ok:
             bad += 1; print(f"  GATE FAIL sector {m}: corner image {img}")
-    print(f"non-canonical sectors with a composite map: {len(maps)} (expect 81)")
+    print(f"topology: {_tc.TOPOLOGY}")
+    print(f"non-canonical sectors with a composite map: {len(maps)} (expect {expect})")
     print(f"corner-exactness gate: {len(maps) - bad}/{len(maps)}")
     print(f"saved -> {_PKL}")
-    print("ALL PASS" if bad == 0 and len(maps) == 81 else "FAIL")
+    print("ALL PASS" if bad == 0 and len(maps) == expect else "FAIL")
