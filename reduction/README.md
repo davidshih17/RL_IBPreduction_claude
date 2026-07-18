@@ -5,6 +5,14 @@ integral to a basis of master integrals using a trained model to navigate the
 integration-by-parts (IBP) + Lorentz-invariance (LI) search, parallelised across
 a Condor cluster.
 
+The pipeline is **topology-general**: every family-specific structure (index
+count, sector masks, symmetry transforms, canonical sectors, master basis) is
+derived from the standard inputs under `topology_input/<family>/` and selected
+at run time with `SAILIR_TOPOLOGY=<family>`. Two families ship configured:
+`pentagonbox` (2 loops, 11 indices) and `gravity3L` (3 loops, 15 indices).
+**The symmetry-enhanced pipeline (§4b) is the production path**; the plain
+IBP+LI path (§4/§5) remains for the legacy pentagonbox baselines.
+
 It is the production entry point. The other phases live in `../data_gen/`
 (generate training data) and `../train/` (train the model); the shared core
 library used by all three is the `../sailir/` package (the model
@@ -63,9 +71,13 @@ Files in this directory:
   run as Condor jobs). The orchestrator runs interactively on the submit node;
   the per-integral `--work-dir` must be on a **shared filesystem** (under
   `results/` on `/het`), not node-local `/tmp`.
-- **The trained model**:
-  `checkpoints/pentagonbox_10x_loop_100/best_model.pt`
-- **A topology** under `topology_input/` (see §4).
+- **The trained model** (per topology; the `canon10x_nosubs` models are the
+  ones trained on the canonical-sector datasets the symmetry-enhanced pipeline
+  assumes):
+  - pentagonbox: `checkpoints/pentagonbox_canon10x_nosubs/best_model.pt`
+    (legacy IBP-only baselines used `checkpoints/pentagonbox_10x_loop_100/`)
+  - gravity3L: `checkpoints/gravity3L_canon10x_nosubs/best_model.pt`
+- **A topology** under `topology_input/` (see §4/§4b).
 
 Paths below assume the repo lives at
 `/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2` (referred to as `$BASE`).
@@ -77,40 +89,35 @@ are yours to set.
 
 ## 3. The integral format
 
-An integral is **11 comma-separated integers** — the propagator/ISP powers of
-the pentagon-box (TA) family:
+An integral is **N comma-separated integers** — the propagator/ISP powers of
+the family, N = the number of propagators in
+`topology_input/<family>/integralfamilies.yaml`:
 
-```
- a0  a1  a2  a3  a4  a5  a6  a7   a8  a9  a10
- └────── 8 propagators (denominators) ──────┘  └─ 3 ISPs (numerators) ─┘
-```
+- **pentagonbox**: 11 ints = 8 denominators + 3 ISPs
+  (`1,1,1,1,1,1,1,1,-5,0,0` is the top sector with an ISP to the 5th power —
+  the "(8,5)" integral).
+- **gravity3L**: 15 ints = 10 denominators + 5 ISPs
+  (e.g. `1,1,1,1,1,1,1,1,1,1,-2,0,0,0,-2` from the FIRE benchmark list).
 
-- Positions **0–7** are the 8 physical propagators (`k1`, `k1+p1`, `k1+p1+p2`,
-  `k1+p1+p2+p3`, `k2`, `k2+p1+p2+p3`, `k2+p1+p2+p3+p4`, `k1−k2`).
-- Positions **8–10** are the 3 irreducible scalar products (always ≤ 0).
-- A **positive** index = propagator power (dots when > 1); a **negative** index
-  = numerator (ISP) power.
-
-Example: `1,1,1,1,1,1,1,1,-5,0,0` is the top sector with an ISP to the 5th power
-(the "(8,5)" integral).
+A **positive** index = propagator power (dots when > 1); a **negative** index
+= numerator (ISP) power. Denominator slots always come first (the sector mask
+is the bit pattern of the positive denominator slots).
 
 ---
 
 ## 3a. Kinematics (the finite-field point) — RECORD
 
 SAILIR reduces over the finite field `GF(prime)` at a **single fixed numeric
-point**: the spacetime dimension `d` and the five Mandelstam invariants are
-assigned specific integers. These are **deterministic, not random** —
+point**: the spacetime dimension `d` and the kinematic invariants are assigned
+specific integers. These are **deterministic, not random** —
 `Topology.from_dir` assigns the first N primes from
 `[31, 47, 53, 59, 61, 67, 71, 73, 79, 83]` to the N invariants in order, with
-`d = 41`. For the pentagon-box (TA) family the point is:
+`d = 41`:
 
-| symbol | value |   | symbol | value |
-|--------|------:|---|--------|------:|
-| `d`    | **41** | | `s34` | **53** |
-| `s12`  | **31** | | `s45` | **59** |
-| `s23`  | **47** | | `s51` | **61** |
-| prime (`GF`) | **1009** | | | |
+- **pentagonbox** (5 invariants): `s12=31, s23=47, s34=53, s45=59, s51=61`
+- **gravity3L** (1 invariant): `y=31`
+- prime (`GF`) = **1009** for both (the models are trained at this prime; the
+  symmetry stores are evaluated at this point).
 
 **The same point is used for all three phases** — data-gen reads
 `topology.kinematics_values`, training learns on data generated there, and
@@ -123,29 +130,121 @@ exactly this phase-space point mod 1009. Reproduce/inspect the values with
 
 ## 4. Choosing the master basis (important)
 
-SAILIR's search uses **IBP + LI only — not symmetry relations**. Two topologies
-ship with the repo:
+The one-step **workers** use IBP + LI only — symmetry relations live in the
+**orchestrator's routing layer** (§4b). That leaves two consistent ways to run:
 
-- **`topology_input/pentagonbox`** — Kira's **61**-master basis (derived *with*
-  sector symmetries). A handful of sub-sectors (e.g. sector 161,
-  `1,0,0,0,0,1,0,1,0,0,0`) reduce to a master *only* via the k1↔k2 loop-exchange
-  symmetry. Under `--paper-masters-only` against this basis, the orchestrator
-  **stalls** on those corners (a worker spins forever — they are irreducible by
-  IBP+LI alone).
+- **Symmetry-enhanced (production, §4b):** the paper basis (Kira's for
+  pentagonbox, FIRE's for gravity3L) is transformed into OUR canonical sectors
+  (`canonical_masters.py`), so `--paper-masters-only` terminates cleanly and
+  the final expression is translated back to the paper basis exactly at output
+  time.
 
-- **`topology_input/pentagonbox_nosym`** — the **62**-master IBP+LI-only basis
-  (the 61 + the symmetry-redundant corners, derived by running Kira with
-  symmetries disabled). With this basis `--paper-masters-only` **terminates
-  cleanly**. ← **recommended.**
-
-If you instead use `--no-paper-masters-only` with `pentagonbox`, the run also
-terminates, but the basis is overcomplete (it keeps every uncovered-sector
-corner as a "master"), so the answer is not unique. For a unique, terminating
-reduction, use **`pentagonbox_nosym` + `--paper-masters-only`**.
+- **Legacy IBP+LI-only (pentagonbox baselines only):** without the routing
+  layer, sub-sectors that reduce only via a symmetry stall under
+  `--paper-masters-only` against Kira's 61-master `pentagonbox` basis (the
+  m1/m3 hang, e.g. sector 161 `1,0,0,0,0,1,0,1,0,0,0`). The workaround is
+  **`topology_input/pentagonbox_nosym` + `--paper-masters-only`** (the
+  62-master IBP+LI-only basis — terminates, unique). `--no-paper-masters-only`
+  also terminates but leaves an overcomplete, path-dependent corner basis.
 
 ---
 
-## 5. Quick start — reduce a new integral
+## 4b. The symmetry-enhanced general-topology pipeline (PRODUCTION)
+
+Design: `ORDERING.md` (the sector-senior total order) + the red DECISION
+paragraphs in `../notes/symmetry_inference_routing.tex`. In one paragraph: all
+sectors related by symmetry are merged into orbits with one **canonical
+representative**; the total order ranks by **sector rank first**, then weight
+`(r, s)`, then `|abs|`; the orchestrator's router (`canonical_monolithic_rule`
+in `symmetry_route.py`) rewrites every integral into canonical sectors before
+dispatch, so workers (which do NO symmetrization) only ever see canonical
+sectors; the paper masters are transformed into canonical sectors and
+translated back at output time.
+
+**The symmetry engine is general** (`symmetry_engine2.py` + provider
+`canonicalize2.py`): every transform is derived from
+`integralfamilies.yaml` / `kinematics.yaml` / the Kira `sectormappings` files,
+verified numerically on explicit finite-field vector kinematics, and stored in
+`results/<family>_transforms_v2.pkl`. External symmetries (e.g. gravity's
+u1↔u2, q→−q, joint u-negation) are found automatically. One physics rule is
+baked into the provider and must not be relaxed: a **denominator may only map
+with coefficient exactly +1** ("clean-den") — sign-flipping maps of eikonal
+(linear) denominators are NOT value identities (empirically locked against
+677 FIRE-table comparisons; see `canonicalize_GR.py`'s docstring).
+
+**Run flags (set for the orchestrator AND inherited by every worker — the
+orchestrator writes them into the Condor submits):**
+
+```bash
+export SAILIR_TOPOLOGY=gravity3L      # topology key (topo_config.py)
+export SAILIR_SECTOR_RANK=1           # the sector-senior total order (required)
+# ... and pass --use-symmetry to hierarchical_reduction.py
+```
+
+**Quick start — symmetry-enhanced gravity3L reduction:**
+
+```bash
+PY=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
+BASE=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
+export SAILIR_TOPOLOGY=gravity3L SAILIR_SECTOR_RANK=1
+
+INTEGRAL="1,0,1,-1,1,1,1,0,1,1,-1,0,0,0,0"   # a 15-int gravity target
+OUT=$BASE/results/gr_reduce_example
+mkdir -p $OUT/work
+
+PYTHONUNBUFFERED=1 $PY -u $BASE/reduction/hierarchical_reduction.py \
+    --topology   $BASE/topology_input/gravity3L \
+    --integral=$INTEGRAL \
+    --output     $OUT/reduction.pkl \
+    --work-dir   $OUT/work \
+    --model-checkpoint $BASE/checkpoints/gravity3L_canon10x_nosubs/best_model.pt \
+    --beam_width 40 --max_steps 1000000 --prime 1009 \
+    --paper-masters-only --use-symmetry \
+    --use-v7-worker --v7-cpus 1 --worker-memory-gb 4 \
+    --max-concurrent 1000 \
+    --straggler-timeout 1000000000 --straggler2-timeout 1000000000 \
+    --check-interval 5 --resume \
+  > $OUT/hierarchical.log 2>&1 &
+```
+
+The same command with `SAILIR_TOPOLOGY=pentagonbox`, the pentagonbox topology
+dir and the `pentagonbox_canon10x_nosubs` checkpoint runs pentagonbox
+symmetry-enhanced. The 27-integral gravity benchmark list (difficulty-spread
+sample of the FIRE table) is `results/gr_benchmark_targets.txt`; the exact
+FIRE reductions for cross-checking are extracted by
+`analysis/extract_fire_oracle.py`.
+
+**Onboarding a NEW topology** (everything below is topology-keyed; register
+the family in `topo_config.py::_CFG` first — index counts, paths, store):
+
+```bash
+export SAILIR_TOPOLOGY=<family>
+# 1. inputs: topology_input/<family>/ with integralfamilies.yaml,
+#    kinematics.yaml, IBP, LI, masters (the paper basis), and a Kira
+#    sectormappings dir (sectorSymmetries + sectorRelations)
+# 2. verified transform store (gates every transform numerically):
+$PY reduction/symmetry_engine2.py topology_input/<family> \
+     <sectormappings_dir> results/<family>_transforms_v2.pkl 1009
+# 3. canonical sectors from the CLEAN-DEN orbits
+#    (template: build_canonical_sectors_GR_v2.py — edit the two path lines)
+# 4. composite canonicalization maps + canonical masters (run their gates):
+SAILIR_SECTOR_RANK=1 $PY reduction/sector_canon_maps.py
+SAILIR_SECTOR_RANK=1 $PY reduction/canonical_masters.py
+# 5. gates: reduction/sector_rank.py (rank contract) and, where an oracle
+#    exists (FIRE/Kira reduction tables), the router cross-check
+#    (template: smoke_gr_router_vs_oracle.py — 0 false zeros required)
+```
+
+For gravity3L all of steps 2–5 are already built, gated
+(`run_engine2_behavioral_gate.sh` — ALL PASS 2026-07-18) and committed; the
+per-file gates print `ALL PASS` when run directly.
+
+---
+
+## 5. Quick start — legacy IBP+LI-only pentagonbox run
+
+(For the production symmetry-enhanced path — any topology — use §4b. This
+section is kept for reproducing the pre-symmetry pentagonbox baselines.)
 
 ```bash
 PY=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
@@ -305,19 +404,24 @@ reductions).
 
 **Convention note:** the settings baked into the top of `meta_orchestrator.py`
 (model checkpoint, `--no-paper-masters-only`, no symmetry flags) date from the
-pre-symmetry-enhanced era. To run a cascade under the current production stack,
-update the launch block to add `--use-symmetry` and export `SAILIR_SECTOR_RANK=1`
-(see `ORDERING.md`), and switch to `--paper-masters-only` semantics consciously —
-the master-basis choice interacts with cache merging across targets (§4).
+pre-symmetry-enhanced era. To cascade under the production stack, update its
+launch block to the §4b configuration (`--use-symmetry`,
+`--paper-masters-only`, the canon10x checkpoint) and export
+`SAILIR_TOPOLOGY=<family> SAILIR_SECTOR_RANK=1` before launching — the
+master-basis choice interacts with cache merging across targets.
 
 ---
 
 ## 10. Troubleshooting
 
 - **A worker runs forever / `Pending: 1` never drops** on a low corner integral:
-  that corner reduces only via a symmetry SAILIR doesn't have (§4). Use
-  `topology_input/pentagonbox_nosym` (so the corner is a master), or
-  `--no-paper-masters-only`.
+  that corner reduces only via a symmetry. On the production path this is
+  solved by canonical masters (§4b) — check `SAILIR_SECTOR_RANK=1` and
+  `--use-symmetry` are actually set (worker logs echo the environment). On the
+  legacy path use `topology_input/pentagonbox_nosym` (§4). Also note: corners
+  of SCALELESS (Kira-trivial) sectors are genuinely zero but slow for the
+  model to kill — they only appear as benchmark targets, not as reduction
+  debris of nonzero integrals.
 - **Workers get held on Condor** (CPU/memory): check `--v7-cpus` vs
   `request_cpus` and `--worker-memory-gb`; `--v7-cpus 1` requests 1 CPU / 4 GB.
 - **`ModuleNotFoundError: sailir`**: run with the conda Python above and from a
@@ -347,13 +451,11 @@ beam-width 40, 8/8 fork pool, `request_cpus = n_workers+2`). The four benchmark
 probes: `(7,4)=0,1,1,1,1,1,1,1,-4,0,0`, `(8,4)=-1,2,1,0,1,2,1,1,-3,0,0`,
 `longrunner=1,1,1,0,0,1,3,1,-2,-1,0`, `memhog=1,1,1,0,-2,1,1,1,0,0,0`.
 
-**Greedy sector symmetry (`sym=1`)** sets `SAILIR_SYMMETRY=1`, which turns on a
-deterministic, inference-only pre-reduction in `beam_search_v7`: before the model
-scores a pivot, if a sector-symmetry relation can eliminate it (oriented by the
-same `_target_key` total order), it is applied for free (lookup + splice), so the
-model only ever sees symmetry-irreducible pivots. Validated against Kira's
-transform matrices; coefficients evaluated at the §3a kinematic point mod `prime`.
-The same flag exists on `onestep_worker_v7.py` (`--symmetry`) for orchestrator runs.
+**Greedy sector symmetry (`sym=1`)** sets `SAILIR_SYMMETRY=1`, an inference-only
+pre-reduction inside the worker. **Benchmarking only — NOT production**: the
+locked design (2026-07-11, measured null result; see the `SAILIR_SYM_DROP`
+banner in `beam_search_v7.py`) is that symmetry lives at the orchestrator's
+routing layer exclusively and workers do no symmetrization.
 
 ---
 

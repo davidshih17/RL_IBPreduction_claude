@@ -19,6 +19,14 @@ two configurations:
 - `topology_input/pentagonbox/` — 2-loop pentagon-box, TA family from Kira
   (8 propagators + 3 ISPs). See `topology_input/HOW_TO_DERIVE_FROM_KIRA.md`
   for how to derive a new topology's inputs.
+- `topology_input/gravity3L/` — 3-loop gravity (post-Minkowskian potential)
+  family, FIRE family 40 (10 propagators incl. linear/eikonal + 5 ISPs).
+
+**Production reduction runs** use the **symmetry-enhanced general-topology
+pipeline** — sector canonicalization, the sector-senior total order, canonical
+masters, and a general, numerically-gated symmetry engine — documented in
+[`reduction/README.md`](reduction/README.md) (§4b there is the entry point;
+the examples below reproduce the paper's plain IBP+LI runs).
 
 Each topology directory contains:
 
