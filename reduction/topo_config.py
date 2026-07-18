@@ -26,7 +26,11 @@ _CFG = {
         TOPO_DIR=os.path.join(ROOT, "topology_input/pentagonbox"),
         CANON_PKL=os.path.join(ROOT, "results/canonical_sectors_tkey.pkl"),
         CANON_MAPS_PKL=os.path.join(ROOT, "results/sector_canon_maps.pkl"),
+        # legacy momentum-engine provider stays PRODUCTION for pentagonbox
+        # until the general engine's pentagonbox gate is signed off
+        # (STORE_PKL is the general-engine store used by the gate scripts).
         CANONICALIZE_MOD='canonicalize',
+        STORE_PKL=os.path.join(ROOT, "results/pentagonbox_transforms_v2.pkl"),
     ),
     'gravity3L': dict(
         N_IND=15, N_DEN=10,
@@ -34,8 +38,15 @@ _CFG = {
         # v2 = clean-den convention (298 canonical sectors; the ing-based v1
         # pkl over-merged 6 sectors via flip maps — see canonicalize_GR.py)
         CANON_PKL=os.path.join(ROOT, "results/canonical_sectors_GR_v2.pkl"),
-        CANON_MAPS_PKL=os.path.join(ROOT, "results/sector_canon_maps_GR.pkl"),
-        CANONICALIZE_MOD='canonicalize_GR',
+        # PRODUCTION = the GENERAL engine (canonicalize2 + symmetry_engine2
+        # store), behavioral-gated 2026-07-18 (run_engine2_behavioral_gate.sh:
+        # orbits 1023/1023, canon maps 725/725, masters 45/23/1, router smoke
+        # 27/27, FIRE-oracle 0 false zeros). The GR-specific modules
+        # (symmetry_engine_GR / canonicalize_GR / sector_canon_maps_GR.pkl)
+        # are retained as the gated reference implementation only.
+        CANON_MAPS_PKL=os.path.join(ROOT, "results/sector_canon_maps_GR_engine2.pkl"),
+        CANONICALIZE_MOD='canonicalize2',
+        STORE_PKL=os.path.join(ROOT, "results/gravity3L_transforms_v2.pkl"),
     ),
 }
 if TOPOLOGY not in _CFG:
@@ -46,8 +57,12 @@ N_IND = _c['N_IND']
 N_DEN = _c['N_DEN']
 TOPO_DIR = _c['TOPO_DIR']
 CANON_PKL = _c['CANON_PKL']
-CANON_MAPS_PKL = _c['CANON_MAPS_PKL']
-CANONICALIZE_MOD = _c['CANONICALIZE_MOD']
+STORE_PKL = _c['STORE_PKL']
+# A/B-only overrides (behavioral gating of the general engine): swap the
+# canonicalize provider and redirect the composite-map cache so gate runs
+# never clobber production pkls. NOT for production runs.
+CANONICALIZE_MOD = os.environ.get('SAILIR_CANONICALIZE', _c['CANONICALIZE_MOD'])
+CANON_MAPS_PKL = os.environ.get('SAILIR_CANON_MAPS_PKL', _c['CANON_MAPS_PKL'])
 
 
 def canonicalize_module():
