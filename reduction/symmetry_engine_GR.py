@@ -113,27 +113,33 @@ def sp_action(a, b, p, y, swap_u=False, neg_q=False):
     u1.u2=y, q.u=0) so they are exact value identities when the propagators map
     into the family. S[new_sp_row, old_sp_col]; value(new sp) = S @ v + s0.
 
-    neg_q composition: the EXPLICIT q inside a propagator definition flips while
-    the loop shifts b_i q ride along with sigma(k_i) — so it is NOT absorbed by
-    flipping b (it changes the relative sign between the two)."""
+    The identity being built (verify_map checks it numerically):
+      D_g(phi(k); q, u1, u2)  ==  sum_h M[g][h] D_h(k; q', u1', u2') + c_g
+    with phi(k)_i = sum_j a_ij k_j + b_i q (REAL q) and (q', u') the relabeled
+    externals on the TARGET side. So S = S_phi @ R^{-1}: S_phi is the pure
+    loop-substitution action; R^{-1} relabels the COLUMN basis (kq columns get
+    s_q, ku1/ku2 columns swap) and leaves all constants untouched — the q -> -q
+    flip multiplies the kq columns of EVERY row (including the kk rows' shift
+    cross-terms) and never the q.q constants. Getting this wrong produced false
+    I = -I zeros (caught by the numeric gate, 2026-07-17)."""
     S = np.zeros((N_IND, N_IND), dtype=np.int64)
     s0 = np.zeros(N_IND, dtype=np.int64)
     sq = -1 if neg_q else 1
-    U1c, U2c = (KU2, KU1) if swap_u else (KU1, KU2)     # column source for u-rows
+    U1c, U2c = (KU2, KU1) if swap_u else (KU1, KU2)     # column target for u-rows
     for i in range(3):
         for j in range(i, 3):
             r = kk_idx(i, j)
             for l in range(3):
                 for m in range(3):
                     S[r, kk_idx(l, m)] += a[i][l] * a[j][m]
-                S[r, KQ(l)] += a[i][l] * b[j] + b[i] * a[j][l]
-            s0[r] -= b[i] * b[j]                       # q.q = -1
-        r = KQ(i)                                       # k_i.q -> sigma(k_i).(sq*q)
+                S[r, KQ(l)] += sq * (a[i][l] * b[j] + b[i] * a[j][l])
+            s0[r] -= b[i] * b[j]                       # q.q = -1 (R-invariant)
+        r = KQ(i)
         for l in range(3):
             S[r, KQ(l)] += sq * a[i][l]
-        s0[r] -= sq * b[i]                              # q.q = -1
+        s0[r] -= b[i]                                   # q.q = -1 (R-invariant)
         for l in range(3):
-            S[KU1(i), U1c(l)] += a[i][l]                # k_i.u1 -> sigma(k_i).u1'
+            S[KU1(i), U1c(l)] += a[i][l]                # ku columns swap under R
             S[KU2(i), U2c(l)] += a[i][l]
     return S % p, s0 % p
 
@@ -237,10 +243,12 @@ def targeted_search(present, ing, swap_u=False, neg_q=False):
                     for i in range(3):
                         row[3 * i + j] = mg[i]
                     rowsM.append(row); rhs.append(eps * mh[j])
-                row = [0] * 12                   # q component
+                row = [0] * 12                   # q component: phi(m_g) has
+                # q-coeff  sum_i (m_g)_i b_i + (m_g)_q ; the target momentum at
+                # relabeled externals has q-coeff  eps * s_q * (m_h)_q
                 for i in range(3):
                     row[9 + i] = mg[i]
-                rowsM.append(row); rhs.append(eps * mh[3] - sq * mg[3])
+                rowsM.append(row); rhs.append(eps * sq * mh[3] - mg[3])
             else:
                 _, vg, fg = LIN_DEN[g]
                 _, vh, fh = LIN_DEN[h]
@@ -290,6 +298,68 @@ def targeted_search(present, ing, swap_u=False, neg_q=False):
     return sols
 
 
+# ---------------------------------------------------------------------------
+# NUMERIC GROUND-TRUTH GATE: explicit GF(p) vector kinematics. Metric
+# diag(+,-,-,-,-,-); externals constructed exactly (u1.u1=u2.u2=1, u1.u2=y,
+# q.q=-1, q.u=0); loops random. Every stored transform must satisfy
+#   D_g(phi(k); q,u)  ==  sum_h M[g][h] D_h(k; q',u') + c_g   (all 15 slots)
+# on several random draws — this sees SIGN errors den signatures cannot.
+# ---------------------------------------------------------------------------
+_METRIC = np.array([1, -1, -1, -1, -1, -1], dtype=np.int64)
+
+
+def _vdot(u, v, p):
+    return int((u * v * _METRIC).sum() % p)
+
+
+def _kin_vectors(p, y, rng):
+    s2 = (y * y - 1) % p
+    s = next((r for r in range(p) if r * r % p == s2), None)
+    assert s is not None, f"y^2-1 not a QR mod {p} — choose another split"
+    u1 = np.array([1, 0, 0, 0, 0, 0], dtype=np.int64)
+    u2 = np.array([y, s, 0, 0, 0, 0], dtype=np.int64)
+    q = np.array([0, 0, 1, 0, 0, 0], dtype=np.int64)
+    assert (_vdot(u1, u1, p), _vdot(u2, u2, p), _vdot(u1, u2, p),
+            _vdot(q, q, p), _vdot(q, u1, p), _vdot(q, u2, p)) == \
+        (1, 1, y % p, (-1) % p, 0, 0)
+    return q, u1, u2
+
+
+def _props_at(k1, k2, k3, qv, u1v, u2v, p):
+    def sq(v):
+        return _vdot(v, v, p)
+    return [
+        sq(k1), sq(k2), sq(k3), sq((k1 + k2 + k3 - qv) % p),
+        2 * _vdot((k1 + k2) % p, u1v, p) % p,
+        -2 * _vdot(k1, u2v, p) % p,
+        -2 * _vdot((k1 + k2 + k3) % p, u2v, p) % p,
+        sq((k1 + k2) % p), sq((k1 + k2 - qv) % p), sq((k2 + k3) % p),
+        _vdot(k2, u2v, p), _vdot(k1, u1v, p), _vdot(k3, u1v, p),
+        _vdot(k1, k3, p), _vdot(k1, qv, p),
+    ]
+
+
+def verify_map(a, b, su, nq, ctx, rng, n_trials=4):
+    """True iff the derived (M, c) is an exact identity on random GF(p) vectors."""
+    p = ctx[0]; y = ctx[4]
+    M, c = transform_of(a, b, ctx, su, nq)
+    q, u1, u2 = _kin_vectors(p, y, rng)
+    qp = (-q) % p if nq else q
+    u1p, u2p = (u2, u1) if su else (u1, u2)
+    for _ in range(n_trials):
+        ks = [np.array([rng.randrange(p) for _ in range(6)], dtype=np.int64)
+              for _ in range(3)]
+        D = _props_at(*ks, qp, u1p, u2p, p)          # target side: relabeled ext
+        kp = [(sum(a[i][j] * ks[j] for j in range(3)) + b[i] * q) % p
+              for i in range(3)]
+        Dp = _props_at(*kp, q, u1, u2, p)            # source side: original ext
+        for g in range(N_IND):
+            rhs = (sum(int(M[g, j]) * D[j] for j in range(N_IND)) + int(c[g])) % p
+            if Dp[g] % p != rhs:
+                return False
+    return True
+
+
 def build_and_gate():
     from sailir.symmetries import parse_symmetries
     SYMDIR = os.path.join(ROOT, "topology_input/gravity3L/kira_validate/sectormappings/GR")
@@ -334,10 +404,12 @@ def build_and_gate():
     useful = int(((sigs >= 0).sum(axis=1) > 0).sum())
     print(f"maps with >=1 clean den slot (both points): {useful}/{n_maps}")
 
-    # ---- match records ----
+    # ---- match records; EVERY stored transform passes the numeric gate ----
+    import random as _random
+    _rng = _random.Random(20260717)
     by_sector = {}
     stats = dict(real_total=0, real_gate_fail=0, ph_total=0, ph_matched=0,
-                 ph_unmatched=[], real_grid_missing=0)
+                 ph_unmatched=[], numeric_fail=0)
     match_counts = []
     for r in recs:
         present = [g for g in range(N_DEN) if r.source_sector >> g & 1]
@@ -349,6 +421,10 @@ def build_and_gate():
             MP, cP = transform_of(*ab, ctxP)
             sP = den_signature(MP, cP, PROD[0])
             ok = all(sP[g] == ing[g] for g in present)
+            if ok and not verify_map(ab[0], ab[1], False, False, ctxP, _rng):
+                stats['numeric_fail'] += 1
+                ok = False
+                print(f"  NUMERIC FAIL (real) sector {r.source_sector}")
             if not ok:
                 stats['real_gate_fail'] += 1
                 print(f"  REAL-GATE FAIL sector {r.source_sector} "
@@ -363,12 +439,11 @@ def build_and_gate():
             for g in present:
                 cond &= (sigs[:, g] == ing[g])
             idx = np.nonzero(cond)[0]
-            match_counts.append(len(idx))
             cands = [maps[t] for t in idx]
             if not cands:
                 # coefficient-2 maps: targeted constraint solve per external
                 # variant, then VERIFY the den signature at both points
-                verified = []
+                found = []
                 for su, nq in VARIANTS:
                     for a, b in targeted_search(present, ing, su, nq):
                         MP, cP = transform_of(a, b, ctxP, su, nq)
@@ -376,16 +451,20 @@ def build_and_gate():
                         MC, cC = transform_of(a, b, ctxC, su, nq)
                         sC = den_signature(MC, cC, CHECK[0])
                         if all(sP[g] == ing[g] and sC[g] == ing[g] for g in present):
-                            verified.append((a, b, su, nq))
-                cands = verified
+                            found.append((a, b, su, nq))
+                cands = found
                 if cands:
                     stats['ph_targeted'] = stats.get('ph_targeted', 0) + 1
-            if not cands:
+            # numeric ground-truth gate — drops sign-consistent-but-false maps
+            verified = [m4 for m4 in cands if verify_map(*m4, ctxP, _rng)]
+            stats['numeric_fail'] += len(cands) - len(verified)
+            match_counts.append(len(verified))
+            if not verified:
                 stats['ph_unmatched'].append((r.source_sector,
                                               tuple(int(ing[g]) for g in present)))
                 continue
             stats['ph_matched'] += 1
-            for a, b, su, nq in cands:
+            for a, b, su, nq in verified:
                 MP, cP = transform_of(a, b, ctxP, su, nq)
                 Md, cd = to_dicts(MP, cP, PROD[0])
                 by_sector.setdefault(r.source_sector, []).append((Md, cd))
@@ -410,6 +489,8 @@ def build_and_gate():
     print(f"placeholder records: {stats['ph_total']} matched {stats['ph_matched']} "
           f"(of which via targeted solve: {stats.get('ph_targeted', 0)}), "
           f"unmatched {len(stats['ph_unmatched'])}")
+    print(f"numeric-gate rejections (sign-consistent but FALSE maps): "
+          f"{stats['numeric_fail']}")
     for s, ig in stats['ph_unmatched'][:20]:
         print(f"    UNMATCHED sector {s} ing_on_dens={ig}")
     print(f"transform store: {sum(1 for _ in by_sector)} sectors, {total} distinct transforms")

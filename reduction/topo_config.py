@@ -31,7 +31,9 @@ _CFG = {
     'gravity3L': dict(
         N_IND=15, N_DEN=10,
         TOPO_DIR=os.path.join(ROOT, "topology_input/gravity3L"),
-        CANON_PKL=os.path.join(ROOT, "results/canonical_sectors_GR.pkl"),
+        # v2 = clean-den convention (298 canonical sectors; the ing-based v1
+        # pkl over-merged 6 sectors via flip maps — see canonicalize_GR.py)
+        CANON_PKL=os.path.join(ROOT, "results/canonical_sectors_GR_v2.pkl"),
         CANON_MAPS_PKL=os.path.join(ROOT, "results/sector_canon_maps_GR.pkl"),
         CANONICALIZE_MOD='canonicalize_GR',
     ),
