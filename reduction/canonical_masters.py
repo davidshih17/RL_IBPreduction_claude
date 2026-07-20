@@ -74,18 +74,41 @@ def build():
             raise RuntimeError(f"master {list(m)} (sector {S}) has no canonical "
                                f"image: {img} — extend the canonical-masters "
                                f"scheme before proceeding")
-        # split image: the (unique) same-rank term in the canonical target sector
-        # vs strictly-lower-sector debris
+        # split image: same-rank terms in the canonical target sector vs
+        # strictly-lower-sector debris
         nb_S = bin(S).count("1")
         main = [(J, co) for J, co in img.items()
                 if bin(_sec(J)).count("1") == nb_S]
         debris = {J: co % P for J, co in img.items()
                   if bin(_sec(J)).count("1") < nb_S}
-        if len(main) != 1 or len(main) + len(debris) != len(img):
+        if len(main) + len(debris) != len(img):
             raise RuntimeError(f"master {list(m)} (sector {S}): image has "
-                               f"{len(main)} same-rank terms (need exactly 1): "
-                               f"{img} — extend the canonical-masters scheme")
-        (j, co), = main
+                               f"HIGHER-rank terms: {img}")
+        if len(main) > 1:
+            # numerator-carrying master whose relabel expands: designate the
+            # coefficient-1 DIRECT RELABEL as the master; every other term
+            # (same-rank included) goes into the debris entry of the output
+            # dictionary and must be supplied via debris_reductions at
+            # translation time.
+            direct = [(J, co) for J, co in main if co % P == 1]
+            if len(direct) == 1:
+                (j, co), = direct
+            else:
+                # no unique coefficient-1 relabel: designate the
+                # lexicographically smallest same-rank term (deterministic);
+                # the dictionary carries its coefficient exactly
+                j, co = sorted(main)[0]
+            for J, cJ in main:
+                if J != j:
+                    debris[J] = cJ % P
+            print(f"  [canonical_masters] {list(m)} -> designated relabel "
+                  f"{list(j)}; {len(main) - 1} same-rank term(s) moved to "
+                  f"debris", flush=True)
+        elif len(main) == 0:
+            raise RuntimeError(f"master {list(m)} (sector {S}): no same-rank "
+                               f"canonical image term: {img}")
+        else:
+            (j, co), = main
         if co % P == 0:
             raise RuntimeError(f"master {list(m)} (sector {S}): zero-coefficient "
                                f"main image term — record set inconsistent")

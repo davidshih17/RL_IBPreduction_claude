@@ -256,7 +256,15 @@ def canonical_monolithic_rule(I):
     M, c = _canon_maps[S]
     img = image_unsigned(I, M, c)
     ki = tkey(I)
-    assert img is not None and all(tkey(k) > ki for k in img), (
+    if img is None:
+        # The composite map is inapplicable to THIS integral — in practice a
+        # POSITIVE ISP power (the ISP as a denominator; a legitimate transient
+        # of IBP algebra, cf. pentagonbox's 20 non-ispclean list_TA entries):
+        # symmetry rows for ISP slots are combinations, so no clean rewrite
+        # exists. Survivor -> the IBP worker reduces it directly. This is the
+        # ONE sanctioned relaxation of the only-canonical-sectors guarantee.
+        return None
+    assert all(tkey(k) > ki for k in img), (
         f"canonicalization fallback failed to descend for {list(I)} — "
         f"sector-senior order violated?")
     return img
