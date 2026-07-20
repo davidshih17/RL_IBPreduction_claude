@@ -133,11 +133,15 @@ exactly this phase-space point mod 1009. Reproduce/inspect the values with
 The one-step **workers** use IBP + LI only — symmetry relations live in the
 **orchestrator's routing layer** (§4b). That leaves two consistent ways to run:
 
-- **Symmetry-enhanced (production, §4b):** the paper basis (Kira's for
-  pentagonbox, FIRE's for gravity3L) is transformed into OUR canonical sectors
-  (`canonical_masters.py`), so `--paper-masters-only` terminates cleanly and
-  the final expression is translated back to the paper basis exactly at output
-  time.
+- **Symmetry-enhanced (production, §4b):** the shipped basis must be KIRA'S
+  DEFAULT SYMMETRIC basis for the FULL family (top-sector dotted-target
+  recipe, `topology_input/HOW_TO_DERIVE_FROM_KIRA.md` §2/§3a) — NEVER a
+  table- or amplitude-scoped basis, which misses master slots in sectors the
+  cascades visit (the gravity3L FIRE-68 failure, 2026-07: workers ground
+  forever on missing-slot integrals). The basis is transformed into OUR
+  canonical sectors (`canonical_masters.py`), so `--paper-masters-only`
+  terminates cleanly; output can be translated to any external basis (e.g.
+  FIRE's) through exact dictionaries.
 
 - **Legacy IBP+LI-only (pentagonbox baselines only):** without the routing
   layer, sub-sectors that reduce only via a symmetry stall under

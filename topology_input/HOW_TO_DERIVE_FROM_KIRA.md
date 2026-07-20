@@ -154,13 +154,28 @@ Outputs of interest:
 
 ---
 
-## 3a. Disabling symmetries — the no-sym basis SAILIR actually uses (CRITICAL)
+## 3a. Which master basis to ship (CRITICAL — read this box first)
 
-**SAILIR's search uses IBP + LI only — never sector symmetries.** So the
-`masters` file you ship MUST be the **no-symmetry** basis. Kira's *default* run
-applies sector symmetries and yields a *smaller*, symmetrized basis that SAILIR
-will NOT reach (e.g. pentagon-box: sym = **61**, no-sym = **62**). Training on
-the wrong basis silently corrupts everything downstream.
+> **CURRENT PRODUCTION (symmetry-enhanced pipeline, `SAILIR_SECTOR_RANK=1` +
+> `--use-symmetry`): ship the SYMMETRIC basis — Kira's DEFAULT run (symmetries
+> ON), no env var, stock behavior.** The orchestrator's routing layer applies
+> the sector symmetries, so the reduction lands on the symmetric basis. The
+> basis is then relabeled into SAILIR's canonical sectors by
+> `reduction/canonical_masters.py` at run time. For gravity3L this is the
+> `kira_validate` run's 64-master basis. Do NOT ship an amplitude-scoped or
+> table-scoped basis (e.g. a FIRE table's masters): such a basis only covers
+> the sectors that particular target list visits, and SAILIR's cascades
+> lawfully wander into other sectors — workers then grind forever on
+> integrals whose master slot is missing (this exact failure cost days on
+> gravity3L, 2026-07: the FIRE-68 table basis lacked the sector-635 master).
+> A COMPLETE family basis from the top-sector dotted-target recipe of §2 is
+> required.
+
+**LEGACY pipeline only (plain IBP+LI, no `--use-symmetry`):** the search never
+applies sector symmetries, so the shipped `masters` file must be the
+**no-symmetry** basis, obtained as described below. Kira's default run yields
+a smaller symmetrized basis the legacy search cannot reach (pentagon-box:
+sym = **61**, no-sym = **62**).
 
 **To get the no-sym basis, export `KIRA_NO_SYMMETRY=1` before the run**, using
 the **patched** `kira-3.1` binary:
@@ -187,8 +202,9 @@ Two traps to avoid (both cost real time):
   check is the **master count** on a family where sym ≠ no-sym (pentagon-box
   61 vs 62), or simply knowing this env-var mechanism.
 
-`topology_input/pentagonbox` is the sym (61) basis; `topology_input/pentagonbox_nosym`
-is the no-sym (62) basis SAILIR uses.
+`topology_input/pentagonbox` is the sym (61) basis (used by the
+symmetry-enhanced pipeline); `topology_input/pentagonbox_nosym` is the no-sym
+(62) basis (legacy pipeline only).
 
 ---
 
