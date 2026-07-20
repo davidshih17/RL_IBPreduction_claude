@@ -133,6 +133,17 @@ implementation. The full pipeline is the safe choice.
 
 ## 3. Running Kira
 
+**EVERYTHING RUNS FULLY NUMERICALLY. NOTHING SYMBOLIC.** This Kira setup
+evaluates ALL variables (the dimension d and every kinematic invariant) at
+numeric values during system generation — one sample, prime-field arithmetic,
+NO rational reconstruction. This is the framework convention for every Kira
+run (master derivation, reductions, everything) and is what makes large
+systems tractable. Verify in any run's log: the lines
+`Prepare numerical values for the generation of the system` / `set numerics`,
+and `Algebraic reconstruction is switched off.` The invariant names in
+`kinematics.yaml` stay symbolic in the CONFIG — the numeric evaluation happens
+inside Kira; do not add reconstruction or symbolic-coefficient options.
+
 ```bash
 export FERMATPATH=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/fire/FIRE7/extra/fuel/extra/ferl64/fer64
 
